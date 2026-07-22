@@ -12,6 +12,11 @@
 
 import crypto from 'node:crypto';
 
+// Not a secret, despite the name — it only salts the typo-detecting checksum.
+// In the old desktop app this string WAS the security: the client validated keys
+// offline, so anyone who extracted it could mint working licences. That is no
+// longer true. A key now works only if a matching unclaimed row exists in the
+// access_keys table, which no client can read or write. Safe to publish.
 const SECRET = 'cf-pklball-lk-7x9m-2024';
 
 function generateKey() {
