@@ -39,14 +39,19 @@ create table if not exists players (
   payment       text not null default 'unpaid',
   -- When the player checked in at the desk. Used for session-duration on checkout.
   checked_in_at timestamptz not null default now(),
+  -- Set when staff check the player out (done for the day). NULL = currently
+  -- checked in / on the active roster. A checked-out player is kept, not deleted,
+  -- so the check-in autocomplete can bring them back next visit with their history.
+  checked_out_at timestamptz,
   created_at    timestamptz not null default now()
 );
 create index if not exists players_venue_idx on players (venue_id);
 
 -- Added after the first release — guarded so re-running the file over an existing
 -- database picks them up without erroring.
-alter table players add column if not exists payment       text not null default 'unpaid';
-alter table players add column if not exists checked_in_at timestamptz not null default now();
+alter table players add column if not exists payment        text not null default 'unpaid';
+alter table players add column if not exists checked_in_at  timestamptz not null default now();
+alter table players add column if not exists checked_out_at timestamptz;
 
 -- The live session: courts, queue, announcement, toggles — one JSON blob per venue.
 -- Ephemeral working state, rewritten constantly, read by the TV display.

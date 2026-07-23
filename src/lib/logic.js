@@ -83,6 +83,37 @@ export const estimateWait = (queueIndex, openPlayCourtsTotal, avgGameDurationMs)
   return Math.ceil((queueIndex + 1) / openPlayCourtsTotal) * avgGameDurationMs;
 };
 
+/* ─────────────────────────────────────────────
+   ROSTER AUTOCOMPLETE (spec §1, §4, §6, §7)
+   The roster is durable, so a returning player is already a row. These power the
+   "New player name…" field: as staff type, surface matching existing players so
+   one click re-checks them in — and an exact name never spawns a duplicate.
+   ───────────────────────────────────────────── */
+
+// Returning players whose name contains the typed query. Prefix matches rank
+// above mid-string ones, then alphabetical. Empty query → nothing (the dropdown
+// only appears once staff start typing). Capped so the list stays a glance.
+export const matchRoster = (players, query, limit = 6) => {
+  const q = (query ?? '').trim().toLowerCase();
+  if (!q) return [];
+  return players
+    .filter((p) => p.name.toLowerCase().includes(q))
+    .sort((a, b) => {
+      const ap = a.name.toLowerCase().startsWith(q);
+      const bp = b.name.toLowerCase().startsWith(q);
+      if (ap !== bp) return ap ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    })
+    .slice(0, limit);
+};
+
+// Exact (case-insensitive) name match. Used on Add/Enter to re-check-in a
+// returning player instead of creating a second account for the same person.
+export const findExactPlayer = (players, name) => {
+  const n = (name ?? '').trim().toLowerCase();
+  return n ? players.find((p) => p.name.toLowerCase() === n) : undefined;
+};
+
 // Snake-draft team balancing: [A,B,C,D] sorted best→worst → [A,D,B,C]
 // Team 1 = slots [0,1] = best+worst, Team 2 = slots [2,3] = 2nd+3rd.
 export const balancedGroup = (sortedPlayers) => {

@@ -10,6 +10,8 @@ import {
   paymentInfo,
   isPaid,
   PAYMENT_STATUSES,
+  matchRoster,
+  findExactPlayer,
 } from './lib/logic.js';
 
 /* ── fmtElapsed ─────────────────────────────── */
@@ -169,6 +171,63 @@ describe('payment status', () => {
     expect(isPaid('cash')).toBe(true);
     expect(isPaid('unpaid')).toBe(false);
     expect(isPaid(undefined)).toBe(false);
+  });
+});
+
+/* ── Roster autocomplete (spec §1, §4, §6, §7) ─────── */
+describe('matchRoster', () => {
+  const roster = [
+    { id: 1, name: 'Sarah',   skill: 'Advanced' },
+    { id: 2, name: 'Sara',    skill: 'Novice' },
+    { id: 3, name: 'Marissa', skill: 'Intermediate' }, // contains "sa" mid-string
+    { id: 4, name: 'Mike',    skill: 'Beginner' },
+  ];
+
+  it('returns nothing for an empty or whitespace query', () => {
+    expect(matchRoster(roster, '')).toEqual([]);
+    expect(matchRoster(roster, '   ')).toEqual([]);
+    expect(matchRoster(roster, null)).toEqual([]);
+  });
+
+  it('matches on a case-insensitive substring', () => {
+    const names = matchRoster(roster, 'SAR').map(p => p.name);
+    expect(names).toContain('Sarah');
+    expect(names).toContain('Sara');
+    expect(names).not.toContain('Mike');
+  });
+
+  it('ranks prefix matches above mid-string matches', () => {
+    // "sa" is a prefix of Sarah/Sara but only mid-string in Marissa.
+    const names = matchRoster(roster, 'sa').map(p => p.name);
+    expect(names.indexOf('Marissa')).toBe(names.length - 1);
+    expect(names.indexOf('Sara')).toBeLessThan(names.indexOf('Marissa'));
+  });
+
+  it('sorts alphabetically within the same match class', () => {
+    expect(matchRoster(roster, 'sa').slice(0, 2).map(p => p.name)).toEqual(['Sara', 'Sarah']);
+  });
+
+  it('caps the number of results', () => {
+    const many = Array.from({ length: 20 }, (_, i) => ({ id: i, name: `Al${i}`, skill: 'Novice' }));
+    expect(matchRoster(many, 'al', 6)).toHaveLength(6);
+  });
+});
+
+describe('findExactPlayer', () => {
+  const roster = [
+    { id: 1, name: 'Sarah' },
+    { id: 2, name: 'Mike' },
+  ];
+
+  it('finds an exact name ignoring case and surrounding space', () => {
+    expect(findExactPlayer(roster, '  sarah ')?.id).toBe(1);
+    expect(findExactPlayer(roster, 'MIKE')?.id).toBe(2);
+  });
+
+  it('returns undefined for a partial or absent name', () => {
+    expect(findExactPlayer(roster, 'Sar')).toBeUndefined();
+    expect(findExactPlayer(roster, 'Nobody')).toBeUndefined();
+    expect(findExactPlayer(roster, '')).toBeUndefined();
   });
 });
 
