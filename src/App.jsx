@@ -614,6 +614,43 @@ export default function App() {
     });
   };
 
+  // A drop landing on a specific person (rather than a group's empty space).
+  // Lets staff rearrange even when groups are full:
+  //   • dragged player is already queued → swap the two, wherever they sit (so two
+  //     full groups can trade a player each);
+  //   • dragged player is from the roster and the target group has room → just add;
+  //   • target group is full → the dragged player takes that person's slot and the
+  //     person they replaced goes back to the roster.
+  const dropOnQueuePlayer = (draggedId, targetId) => {
+    if (draggedId === targetId) return;
+    setQueue(prev => {
+      const targetGroup = prev.find(g => g.players.includes(targetId));
+      if (!targetGroup) return prev;
+      const draggedInQueue = prev.some(g => g.players.includes(draggedId));
+
+      if (draggedInQueue) {
+        // Exchange the two ids in place — handles same-group reorder and the
+        // two-full-groups swap identically, and never changes any group's size.
+        return prev.map(g => ({
+          ...g,
+          players: g.players.map(id =>
+            id === draggedId ? targetId : id === targetId ? draggedId : id),
+        }));
+      }
+
+      if (targetGroup.players.length < 4) {
+        return prev
+          .map(g => (g.id === targetGroup.id ? { ...g, players: [...g.players, draggedId] } : g));
+      }
+
+      // Full group + roster player → replace, target returns to the roster.
+      return prev.map(g =>
+        g.id === targetGroup.id
+          ? { ...g, players: g.players.map(id => (id === targetId ? draggedId : id)) }
+          : g);
+    });
+  };
+
   const resetSession = async () => {
     if (!confirm('Reset session? Clears courts, queue, stats, and announcements.')) return;
     const clearedCourts = courts.map(c => ({ ...c, match: null }));
@@ -925,6 +962,7 @@ export default function App() {
           setShowRental={setShowRental}
           removeFromQueue={removeFromQueue}
           movePlayerToQueueGroup={movePlayerToQueueGroup}
+          dropOnQueuePlayer={dropOnQueuePlayer}
           draggingPlayerId={draggingPlayerId}
           setDraggingPlayerId={setDraggingPlayerId}
           setFinishingCourt={setFinishingCourt}
@@ -1309,13 +1347,15 @@ function StaffView(props) {
     avgGameDurationMs, openPlayCourtCount,
     setSearch, setNewPlayerName, setNewPlayerSkill, setNewPlayerPayment,
     addPlayer, checkInExisting, onCheckoutPlayer, removePlayer, setPlayerPayment, togglePlayerInDraft, saveDraftGroup, autoGroup,
-    setShowAssign, setShowRental, removeFromQueue, movePlayerToQueueGroup,
+    setShowAssign, setShowRental, removeFromQueue, movePlayerToQueueGroup, dropOnQueuePlayer,
     draggingPlayerId, setDraggingPlayerId,
     setFinishingCourt, clearCourtCasual, markArrived, removeNoShow,
     addCourt, removeCourt, toggleCourtType, renameCourt, playerById,
   } = props;
 
   const [dragOverZone, setDragOverZone] = useState(null);
+  // The specific queued player a drag is hovering — the one who'll be swapped out.
+  const [dragOverPlayerId, setDragOverPlayerId] = useState(null);
 
   // Checked-out players stay in `players` for re-check-in but are not part of the
   // active roster: they're counted separately and shown in their own box below.
@@ -1431,7 +1471,7 @@ function StaffView(props) {
                       e.dataTransfer.effectAllowed = 'move';
                       requestAnimationFrame(() => setDraggingPlayerId(p.id));
                     }}
-                    onDragEnd={() => { _dragId = null; setDraggingPlayerId(null); setDragOverZone(null); }}
+                    onDragEnd={() => { _dragId = null; setDraggingPlayerId(null); setDragOverZone(null); setDragOverPlayerId(null); }}
                     className={`px-3.5 py-2.5 flex items-center gap-2.5 border-b border-zinc-800 last:border-0 transition ${
                       busy ? 'opacity-40' : 'hover:bg-zinc-800'
                     } ${inDraft ? 'bg-lime-950' : ''} ${
@@ -1606,11 +1646,12 @@ function StaffView(props) {
                       : canDrop ? 'border-lime-800'
                       : 'border-zinc-800'
                   }`}
-                  onDragOver={e => { if (!_dragId || !canDrop) return; e.preventDefault(); setDragOverZone(g.id); }}
+                  onDragOver={e => { if (!_dragId || !canDrop) return; e.preventDefault(); setDragOverZone(g.id); setDragOverPlayerId(null); }}
                   onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOverZone(null); }}
                   onDrop={e => {
                     e.preventDefault();
                     setDragOverZone(null);
+                    setDragOverPlayerId(null);
                     const id = _dragId || Number(e.dataTransfer.getData('text/plain'));
                     if (id && groupPlayers.length < 4 && !g.players.includes(id))
                       movePlayerToQueueGroup(g.id, id);
@@ -1645,7 +1686,9 @@ function StaffView(props) {
                     </button>
                   </div>
                   <div className="space-y-1 mb-3">
-                    {groupPlayers.map(p => (
+                    {groupPlayers.map(p => {
+                      const canSwapHere = !!_dragId && _dragId !== p.id;
+                      return (
                       <div
                         key={p.id}
                         draggable
@@ -1655,17 +1698,40 @@ function StaffView(props) {
                           e.dataTransfer.effectAllowed = 'move';
                           requestAnimationFrame(() => setDraggingPlayerId(p.id));
                         }}
-                        onDragEnd={() => { _dragId = null; setDraggingPlayerId(null); setDragOverZone(null); }}
-                        className={`flex items-center gap-2 text-sm rounded px-1 -mx-1 cursor-grab hover:bg-zinc-800/60 transition ${
-                          draggingPlayerId === p.id ? 'opacity-40' : ''
-                        }`}
-                        title="Drag to move to another group"
+                        onDragEnd={() => { _dragId = null; setDraggingPlayerId(null); setDragOverZone(null); setDragOverPlayerId(null); }}
+                        // Dropping ON a person targets them specifically — a swap
+                        // (or a replace if this group is full). stopPropagation keeps
+                        // the group's own "add to empty slot" drop from also firing.
+                        onDragOver={e => {
+                          if (!canSwapHere) return;
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setDragOverZone(null);
+                          setDragOverPlayerId(p.id);
+                        }}
+                        onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOverPlayerId(null); }}
+                        onDrop={e => {
+                          if (!canSwapHere) return;
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setDragOverPlayerId(null);
+                          setDragOverZone(null);
+                          const id = _dragId || Number(e.dataTransfer.getData('text/plain'));
+                          if (id && id !== p.id) dropOnQueuePlayer(id, p.id);
+                        }}
+                        className={`flex items-center gap-2 text-sm rounded px-1 -mx-1 cursor-grab transition ${
+                          dragOverPlayerId === p.id
+                            ? 'bg-lime-950 ring-1 ring-lime-600'
+                            : 'hover:bg-zinc-800/60'
+                        } ${draggingPlayerId === p.id ? 'opacity-40' : ''}`}
+                        title="Drag to another group — or onto a player to swap"
                       >
                         <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
                         <span className="flex-1 truncate">{p.name}</span>
                         <PaymentBadge payment={p.payment} dot title={`${p.name} — ${paymentInfo(p.payment).label}`} />
                       </div>
-                    ))}
+                      );
+                    })}
                     {groupPlayers.length < 4 && (
                       <div className={`text-xs italic ${canDrop ? 'text-lime-400' : 'text-amber-500'}`}>
                         {canDrop

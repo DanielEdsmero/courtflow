@@ -254,6 +254,28 @@ describe('Queue group management', () => {
     expect(updated[0].id).toBe(1);
     expect(updated[1].id).toBe(3);
   });
+
+  // Mirrors dropOnQueuePlayer's swap branch: exchange two ids wherever they sit.
+  const swap = (queue, a, b) =>
+    queue.map(g => ({ ...g, players: g.players.map(id => (id === a ? b : id === b ? a : id)) }));
+
+  it('swaps two players between full groups, preserving both slots', () => {
+    const queue = [makeGroup(1, [1, 2, 3, 4]), makeGroup(2, [5, 6, 7, 8])];
+    const updated = swap(queue, 2, 6); // trade player 2 (grp 1) with player 6 (grp 2)
+    expect(updated[0].players).toEqual([1, 6, 3, 4]);
+    expect(updated[1].players).toEqual([5, 2, 7, 8]);
+  });
+
+  it('keeps every group at its original size after a swap', () => {
+    const queue = [makeGroup(1, [1, 2, 3, 4]), makeGroup(2, [5, 6, 7, 8])];
+    const updated = swap(queue, 1, 8);
+    expect(updated.map(g => g.players.length)).toEqual([4, 4]);
+  });
+
+  it('reorders within a single group when both ids share it', () => {
+    const queue = [makeGroup(1, [1, 2, 3, 4])];
+    expect(swap(queue, 1, 3)[0].players).toEqual([3, 2, 1, 4]);
+  });
 });
 
 /* ── Win/loss tracking ──────────────────────── */
