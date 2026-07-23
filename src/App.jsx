@@ -595,11 +595,23 @@ export default function App() {
 
   const removeFromQueue = (groupId) => setQueue(prev => prev.filter(g => g.id !== groupId));
 
-  const addPlayerToQueueGroup = (groupId, playerId) => {
-    setQueue(prev => prev.map(g => {
-      if (g.id !== groupId || g.players.includes(playerId) || g.players.length >= 4) return g;
-      return { ...g, players: [...g.players, playerId] };
-    }));
+  // Add a player to a queue group — and pull them out of whatever group they were
+  // in, so queue members are freely interchangeable: drag someone from group #1
+  // into group #2 and they move rather than duplicate. Also handles the plain
+  // roster→queue drop (the player isn't in any group, so nothing is removed).
+  // A group emptied by the move is dropped from the queue.
+  const movePlayerToQueueGroup = (groupId, playerId) => {
+    setQueue(prev => {
+      const target = prev.find(g => g.id === groupId);
+      if (!target || target.players.includes(playerId) || target.players.length >= 4) return prev;
+      return prev
+        .map(g => {
+          if (g.id === groupId) return { ...g, players: [...g.players, playerId] };
+          if (g.players.includes(playerId)) return { ...g, players: g.players.filter(x => x !== playerId) };
+          return g;
+        })
+        .filter(g => g.players.length > 0);
+    });
   };
 
   const resetSession = async () => {
@@ -912,7 +924,7 @@ export default function App() {
           setShowAssign={setShowAssign}
           setShowRental={setShowRental}
           removeFromQueue={removeFromQueue}
-          addPlayerToQueueGroup={addPlayerToQueueGroup}
+          movePlayerToQueueGroup={movePlayerToQueueGroup}
           draggingPlayerId={draggingPlayerId}
           setDraggingPlayerId={setDraggingPlayerId}
           setFinishingCourt={setFinishingCourt}
@@ -1297,7 +1309,7 @@ function StaffView(props) {
     avgGameDurationMs, openPlayCourtCount,
     setSearch, setNewPlayerName, setNewPlayerSkill, setNewPlayerPayment,
     addPlayer, checkInExisting, onCheckoutPlayer, removePlayer, setPlayerPayment, togglePlayerInDraft, saveDraftGroup, autoGroup,
-    setShowAssign, setShowRental, removeFromQueue, addPlayerToQueueGroup,
+    setShowAssign, setShowRental, removeFromQueue, movePlayerToQueueGroup,
     draggingPlayerId, setDraggingPlayerId,
     setFinishingCourt, clearCourtCasual, markArrived, removeNoShow,
     addCourt, removeCourt, toggleCourtType, renameCourt, playerById,
@@ -1493,7 +1505,10 @@ function StaffView(props) {
                 dragOverZone === 'builder' ? 'bg-lime-950/30 ring-2 ring-lime-600' : ''
               }`}
               onDragOver={e => {
-                if (!_dragId || draftGroup.length >= 4 || draftGroup.includes(_dragId)) return;
+                // The builder takes available roster players only — a player
+                // already in a queue group can be moved group-to-group, but not
+                // dropped back here, so don't invite it.
+                if (!_dragId || busyPlayerIds.has(_dragId) || draftGroup.length >= 4 || draftGroup.includes(_dragId)) return;
                 e.preventDefault();
                 setDragOverZone('builder');
               }}
@@ -1598,7 +1613,7 @@ function StaffView(props) {
                     setDragOverZone(null);
                     const id = _dragId || Number(e.dataTransfer.getData('text/plain'));
                     if (id && groupPlayers.length < 4 && !g.players.includes(id))
-                      addPlayerToQueueGroup(g.id, id);
+                      movePlayerToQueueGroup(g.id, id);
                   }}
                 >
                   <div className="flex items-center justify-between mb-2">
@@ -1631,7 +1646,21 @@ function StaffView(props) {
                   </div>
                   <div className="space-y-1 mb-3">
                     {groupPlayers.map(p => (
-                      <div key={p.id} className="flex items-center gap-2 text-sm">
+                      <div
+                        key={p.id}
+                        draggable
+                        onDragStart={e => {
+                          _dragId = p.id; // synchronous — readable by dragover handlers immediately
+                          e.dataTransfer.setData('text/plain', String(p.id));
+                          e.dataTransfer.effectAllowed = 'move';
+                          requestAnimationFrame(() => setDraggingPlayerId(p.id));
+                        }}
+                        onDragEnd={() => { _dragId = null; setDraggingPlayerId(null); setDragOverZone(null); }}
+                        className={`flex items-center gap-2 text-sm rounded px-1 -mx-1 cursor-grab hover:bg-zinc-800/60 transition ${
+                          draggingPlayerId === p.id ? 'opacity-40' : ''
+                        }`}
+                        title="Drag to move to another group"
+                      >
                         <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
                         <span className="flex-1 truncate">{p.name}</span>
                         <PaymentBadge payment={p.payment} dot title={`${p.name} — ${paymentInfo(p.payment).label}`} />
