@@ -12,7 +12,7 @@ import { supabase } from './lib/supabase';
 import { loadSession, createSessionSync } from './lib/session';
 import {
   listPlayers, createPlayer, deletePlayer, updatePlayerPhoto,
-  updatePlayerPayment, recordResult, resetAllStats, recordMatchHistory,
+  updatePlayerPayment, recheckInPlayer, checkOutPlayer, recordResult, resetAllStats, recordMatchHistory,
 } from './lib/players';
 import { uploadPhoto } from './lib/photos';
 
@@ -20,7 +20,7 @@ import { uploadPhoto } from './lib/photos';
 // Supabase client. Re-exported here because existing callers import from App.
 import {
   SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, fmtDuration, estimateWait, balancedGroup,
-  defaultCourts, hydrateCourts,
+  defaultCourts, hydrateCourts, matchRoster, findExactPlayer,
   PAYMENT_STATUSES, PAYMENT_ORDER, paymentInfo, isPaid,
 } from './lib/logic';
 export { SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, estimateWait, balancedGroup };
@@ -186,8 +186,9 @@ export default function App() {
   const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [showActivityLog, setShowActivityLog] = useState(false);
   const [finishingCourt, setFinishingCourt]   = useState(null);
-  // Snapshot of a just-ended court session awaiting the checkout screen (spec §3).
-  const [checkoutData, setCheckoutData]       = useState(null);
+  // Id of the player being checked out (spec §3). Checkout is a roster action —
+  // a person leaving for the day — not something a court ending triggers.
+  const [checkoutPlayerId, setCheckoutPlayerId] = useState(null);
   const [showAssign, setShowAssign]           = useState(null);
   const [showRental, setShowRental]           = useState(null);
   const [showAnnouncementBar, setShowAnnouncementBar] = useState(false);
@@ -272,17 +273,9 @@ export default function App() {
       };
       setHistory(h => [entry, ...h]);
       recordMatchHistory(venueId, { ...entry, courtName: c.name });
-      // Timer-expiry is an automatic checkout — log it (no modal, staff may be
-      // away), but unpaid players stay flagged red in the roster regardless.
-      c.match.players.forEach(id => {
-        const p = players.find(pl => pl.id === id);
-        if (!p) return;
-        logEvent({
-          type: 'checkout', playerName: p.name, courtName: c.name,
-          checkedInAt: p.checkedInAt, checkoutAt: now,
-          sessionMs: now - p.checkedInAt, payment: p.payment, autoEnded: true,
-        });
-      });
+      // The timer running out just frees the court — the players go back to the
+      // roster, still checked in. Checking out (leaving for the day) is a separate
+      // roster action, so nothing is logged or finalised here.
     });
     setCourts(prev => prev.map(c =>
       expired.find(e => e.id === c.id) ? { ...c, match: null } : c
@@ -342,11 +335,41 @@ export default function App() {
   const logEvent = (entry) =>
     setAuditLog(prev => [{ id: `${Date.now()}-${Math.random()}`, at: Date.now(), ...entry }, ...prev].slice(0, MAX_AUDIT));
 
+  // Re-check-in a returning player (spec §1, §4). They're already a roster row —
+  // keep their skill/W/L/photo, just start a fresh session: new checked-in time
+  // and this visit's payment (the picker, unpaid by default). Optimistic, with a
+  // rollback, and a check-in logged so the activity log reads the same as a
+  // brand-new arrival. Busy players are skipped — you can't re-check-in someone
+  // who's mid-match or already queued.
+  const checkInExisting = (playerId, payment = newPlayerPayment) => {
+    const player = players.find(p => p.id === playerId);
+    if (!player) return;
+    setNewPlayerName('');
+    if (busyPlayerIds.has(playerId)) return; // already active this session
+    setNewPlayerPayment('unpaid');
+    const previous = { payment: player.payment, checkedInAt: player.checkedInAt, checkedOut: player.checkedOut };
+    // checkedOut → false brings a checked-out player back onto the active roster.
+    setPlayers(prev => prev.map(p =>
+      p.id === playerId ? { ...p, payment, checkedInAt: Date.now(), checkedOut: false } : p));
+    logEvent({
+      type: 'checkin', playerName: player.name, payment,
+      method: paymentInfo(payment).method, returning: true,
+    });
+    recheckInPlayer(playerId, payment).catch(err => {
+      console.error('Failed to check in returning player:', err);
+      setPlayers(prev => prev.map(p => p.id === playerId ? { ...p, ...previous } : p));
+    });
+  };
+
   // Players live in Postgres now, so the id comes back from the insert rather
   // than from Date.now(). The camera prompt waits for that id.
   const addPlayer = async () => {
     const n = newPlayerName.trim();
     if (!n) return;
+    // A name that already exists is a returning player, not a new one — re-check
+    // them in instead of spawning a duplicate account (spec §1, §4).
+    const existing = findExactPlayer(players, n);
+    if (existing) { checkInExisting(existing.id); return; }
     const payment = newPlayerPayment;
     setNewPlayerName('');
     setNewPlayerPayment('unpaid'); // reset for the next check-in
@@ -413,7 +436,7 @@ export default function App() {
 
   const autoGroup = () => {
     const available = players
-      .filter(p => !busyPlayerIds.has(p.id) && !draftGroup.includes(p.id))
+      .filter(p => !p.checkedOut && !busyPlayerIds.has(p.id) && !draftGroup.includes(p.id))
       .sort((a, b) => skillRank(b.skill) - skillRank(a.skill));
     if (available.length < 4) {
       alert('Need at least 4 available players to auto-group.');
@@ -476,36 +499,27 @@ export default function App() {
   };
 
   // ── Checkout (spec §3) ────────────────────────────────────────────────────
-  // Snapshot a court's session before it's cleared so the checkout screen can
-  // show durations and payment status even after the court is freed.
-  const beginCheckout = (court, { winners } = {}) => {
-    if (!court?.match) return;
-    setCheckoutData({
-      courtName: court.name,
-      courtType: court.type,
-      playerIds: court.match.players,
-      startedAt: court.match.startedAt,
-      endedAt: Date.now(),
-      winners: winners ?? null,
-    });
-  };
-
-  // Confirm the checkout: write a checkout event per player to the audit log.
-  // Payment collection happens live via setPlayerPayment while the modal is open,
-  // so by here each player already carries their final status.
+  // Checkout is a ROSTER action, not a court one. Clearing a court just sends its
+  // players back to the roster to play again; a player only checks out when
+  // they're leaving for the day. completeCheckout records the session length and
+  // payment, then drops them from the active roster (their profile is kept in the
+  // DB so the check-in autocomplete can bring them back next visit).
   const completeCheckout = () => {
-    if (!checkoutData) return;
-    const { playerIds, endedAt, courtName } = checkoutData;
-    playerIds.forEach(id => {
-      const p = playerById(id);
-      if (!p) return;
-      logEvent({
-        type: 'checkout', playerName: p.name, courtName,
-        checkedInAt: p.checkedInAt, checkoutAt: endedAt,
-        sessionMs: endedAt - p.checkedInAt, payment: p.payment,
-      });
+    const p = playerById(checkoutPlayerId);
+    if (!p) { setCheckoutPlayerId(null); return; }
+    const now = Date.now();
+    logEvent({
+      type: 'checkout', playerName: p.name,
+      checkedInAt: p.checkedInAt, checkoutAt: now,
+      sessionMs: now - p.checkedInAt, payment: p.payment,
     });
-    setCheckoutData(null);
+    setPlayers(prev => prev.map(pl => pl.id === p.id ? { ...pl, checkedOut: true } : pl));
+    setDraftGroup(prev => prev.filter(x => x !== p.id));
+    setCheckoutPlayerId(null);
+    checkOutPlayer(p.id).catch(err => {
+      console.error('Failed to check out player:', err);
+      setPlayers(prev => prev.map(pl => pl.id === p.id ? { ...pl, checkedOut: false } : pl));
+    });
   };
 
   const clearCourtCasual = (courtId) => {
@@ -521,7 +535,7 @@ export default function App() {
       finishedAt: now,
     };
     setHistory(prev => [entry, ...prev]);
-    beginCheckout(court); // snapshot while the match is still on the court
+    // Players return to the roster — no checkout here.
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
     recordMatchHistory(venueId, { ...entry, courtName: court.name });
   };
@@ -546,7 +560,7 @@ export default function App() {
       finishedAt: now,
     };
     setHistory(prev => [entry, ...prev]);
-    beginCheckout(court, { winners }); // snapshot before the court is cleared
+    // Winners and losers both go back to the roster — checkout is separate.
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
     setFinishingCourt(null);
 
@@ -598,7 +612,7 @@ export default function App() {
     setAuditLog([]);
     setAnnouncement('');
     setShowAnnouncementBar(false);
-    setCheckoutData(null);
+    setCheckoutPlayerId(null);
     setPlayers(prev => prev.map(p => ({ ...p, wins: 0, losses: 0 })));
     setFinishingCourt(null);
     lastAutoAssigned.current = null;
@@ -625,12 +639,16 @@ export default function App() {
     setDisplayToken(data);
   };
 
+  // The active roster is everyone currently checked in. Checked-out players stay
+  // in `players` (so the check-in autocomplete can find them) but drop off here.
+  const activePlayers = useMemo(() => players.filter(p => !p.checkedOut), [players]);
+
   const filteredPlayers = useMemo(() => {
     const q = search.toLowerCase().trim();
-    return players
+    return activePlayers
       .filter(p => !q || p.name.toLowerCase().includes(q))
       .sort((a, b) => skillRank(b.skill) - skillRank(a.skill) || a.name.localeCompare(b.name));
-  }, [players, search]);
+  }, [activePlayers, search]);
 
   const leaderboard = useMemo(() =>
     [...players]
@@ -884,6 +902,8 @@ export default function App() {
           setNewPlayerSkill={setNewPlayerSkill}
           setNewPlayerPayment={setNewPlayerPayment}
           addPlayer={addPlayer}
+          checkInExisting={checkInExisting}
+          onCheckoutPlayer={setCheckoutPlayerId}
           removePlayer={removePlayer}
           setPlayerPayment={setPlayerPayment}
           togglePlayerInDraft={togglePlayerInDraft}
@@ -945,13 +965,12 @@ export default function App() {
           onClose={() => setShowLeaderboard(false)}
         />
       )}
-      {checkoutData && (
+      {checkoutPlayerId !== null && (
         <CheckoutModal
-          data={checkoutData}
-          playerById={playerById}
+          player={playerById(checkoutPlayerId)}
           onSetPayment={setPlayerPayment}
           onComplete={completeCheckout}
-          onClose={() => setCheckoutData(null)}
+          onClose={() => setCheckoutPlayerId(null)}
         />
       )}
       {showActivityLog && (
@@ -1067,6 +1086,207 @@ function DisplayLinkModal({ token, onRegenerate, onClose }) {
 let _dragId = null;
 
 /* ─────────────────────────────────────────────
+   PLAYER CHECK-IN FIELD (spec §1, §4, §6, §7)
+   The "New player name…" box, now search-as-you-type. As staff type, returning
+   players surface in a dropdown with their skill and W/L — one click re-checks
+   them in (keeping their history, resetting payment). Typing a brand-new name and
+   hitting Add/Enter creates an account; an exact match never makes a duplicate.
+   ───────────────────────────────────────────── */
+function PlayerCheckInField({
+  newPlayerName, setNewPlayerName, newPlayerSkill, setNewPlayerSkill,
+  players, busyPlayerIds, addPlayer, checkInExisting,
+}) {
+  const [focused, setFocused] = useState(false);
+  // -1 = nothing highlighted; Enter then falls through to Add (create / exact match).
+  const [highlight, setHighlight] = useState(-1);
+
+  const matches = useMemo(() => matchRoster(players, newPlayerName), [players, newPlayerName]);
+  const exact = useMemo(() => findExactPlayer(players, newPlayerName), [players, newPlayerName]);
+  const open = focused && newPlayerName.trim().length > 0 && matches.length > 0;
+
+  // A moving target list means a stale highlight would point at the wrong player.
+  useEffect(() => { setHighlight(-1); }, [newPlayerName]);
+
+  const pick = (p) => {
+    if (busyPlayerIds.has(p.id)) return; // already active — nothing to re-check-in
+    checkInExisting(p.id); // clears the name, which closes the dropdown
+  };
+
+  const onKeyDown = (e) => {
+    if (open && e.key === 'ArrowDown') {
+      e.preventDefault();
+      setHighlight(h => Math.min(h + 1, matches.length - 1));
+    } else if (open && e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHighlight(h => Math.max(h - 1, -1));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      if (open && highlight >= 0) pick(matches[highlight]);
+      else addPlayer(); // create, or re-check-in on an exact name match
+    } else if (e.key === 'Escape') {
+      setFocused(false);
+    }
+  };
+
+  return (
+    <div className="relative">
+      <div className="flex gap-2">
+        <input
+          value={newPlayerName}
+          onChange={e => setNewPlayerName(e.target.value)}
+          onKeyDown={onKeyDown}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          placeholder="New player name..."
+          className="flex-1 bg-zinc-950 border border-zinc-800 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-lime-500"
+          autoComplete="off"
+          role="combobox"
+          aria-expanded={open}
+          aria-autocomplete="list"
+        />
+        <select
+          value={newPlayerSkill}
+          onChange={e => setNewPlayerSkill(e.target.value)}
+          className="bg-zinc-950 border border-zinc-800 rounded-md px-2 text-sm focus:outline-none focus:border-lime-500"
+        >
+          {SKILL_TIERS.map(s => <option key={s}>{s}</option>)}
+        </select>
+        <button
+          onClick={addPlayer}
+          className="bg-lime-400 text-zinc-950 rounded-md px-3 hover:bg-lime-300"
+          title="Add player"
+        >
+          <UserPlus className="w-4 h-4" />
+        </button>
+      </div>
+
+      {open && (
+        <div className="absolute left-0 right-0 top-full mt-1 z-30 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl overflow-hidden">
+          <div className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-zinc-500 border-b border-zinc-800 flex items-center gap-1.5">
+            <Search className="w-3 h-3" /> Returning players
+          </div>
+          {matches.map((p, i) => {
+            const busy = busyPlayerIds.has(p.id);
+            const active = i === highlight;
+            return (
+              <button
+                key={p.id}
+                type="button"
+                // Keep focus on the input so the blur-to-close doesn't beat the click.
+                onMouseDown={e => e.preventDefault()}
+                onClick={() => pick(p)}
+                onMouseEnter={() => setHighlight(i)}
+                disabled={busy}
+                className={`w-full flex items-center gap-2.5 px-3 py-2 text-left transition border-b border-zinc-800 last:border-0 ${
+                  busy ? 'opacity-40 cursor-not-allowed' : active ? 'bg-zinc-800' : 'hover:bg-zinc-800'
+                }`}
+              >
+                <span className={`w-2 h-2 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
+                <span className="flex-1 min-w-0">
+                  <span className="block text-sm font-semibold truncate">{p.name}</span>
+                  <span className="block text-xs text-zinc-500">{p.skill} • {p.wins}W {p.losses}L</span>
+                </span>
+                {busy ? (
+                  <span className="text-[10px] font-bold uppercase tracking-wide text-zinc-500 shrink-0">
+                    Active
+                  </span>
+                ) : (
+                  <>
+                    <PaymentBadge payment={p.payment} />
+                    <span className="text-[10px] font-bold uppercase tracking-wide text-lime-400 shrink-0">Check in</span>
+                  </>
+                )}
+              </button>
+            );
+          })}
+          {!exact && (
+            <button
+              type="button"
+              onMouseDown={e => e.preventDefault()}
+              onClick={addPlayer}
+              className="w-full flex items-center gap-2 px-3 py-2 text-left text-sm text-zinc-300 hover:bg-zinc-800 border-t border-zinc-800 transition"
+            >
+              <UserPlus className="w-3.5 h-3.5 text-lime-400 shrink-0" />
+              Add new player “<span className="font-semibold">{newPlayerName.trim()}</span>”
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   CHECKED-OUT BOX (spec §4)
+   Players who've left for the day are held here — not deleted — so staff can find
+   them by name and bring them back with one click, W/L history and skill intact.
+   ───────────────────────────────────────────── */
+function CheckedOutBox({ players, onCheckIn }) {
+  const [search, setSearch] = useState('');
+  const q = search.trim().toLowerCase();
+  const list = useMemo(
+    () => players
+      .filter(p => !q || p.name.toLowerCase().includes(q))
+      .sort((a, b) => a.name.localeCompare(b.name)),
+    [players, q]
+  );
+
+  return (
+    <div className="mt-6">
+      <h2 className="font-display text-xl text-zinc-300 tracking-wide mb-3 flex items-center gap-2">
+        CHECKED OUT <span className="text-zinc-600 text-base">({players.length})</span>
+      </h2>
+      <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
+        {players.length === 0 ? (
+          <p className="p-4 text-sm text-zinc-500 text-center">
+            No one’s checked out yet. Players you check out are saved here — find
+            them by name to check them back in.
+          </p>
+        ) : (
+          <>
+            <div className="p-3.5 border-b border-zinc-800">
+              <div className="relative">
+                <Search className="w-4 h-4 absolute left-3 top-2.5 text-zinc-500" />
+                <input
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  placeholder="Search checked-out players..."
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-md pl-9 pr-3 py-2 text-sm focus:outline-none focus:border-lime-500"
+                />
+              </div>
+            </div>
+            <div className="max-h-72 overflow-y-auto">
+              {list.length === 0 && (
+                <p className="p-4 text-sm text-zinc-500 text-center">No checked-out players match.</p>
+              )}
+              {list.map(p => (
+                <div
+                  key={p.id}
+                  className="px-3.5 py-2.5 flex items-center gap-2.5 border-b border-zinc-800 last:border-0"
+                >
+                  <div className={`w-2 h-2 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-semibold truncate text-zinc-300">{p.name}</div>
+                    <div className="text-xs text-zinc-500">{p.skill} • {p.wins}W {p.losses}L</div>
+                  </div>
+                  <button
+                    onClick={() => onCheckIn(p.id, 'unpaid')}
+                    className="text-xs font-bold px-2.5 py-1.5 rounded-md bg-lime-400 text-zinc-950 hover:bg-lime-300 flex items-center gap-1 shrink-0"
+                    title={`Check ${p.name} back in`}
+                  >
+                    <LogIn className="w-3.5 h-3.5" /> Check in
+                  </button>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
    STAFF VIEW
    ───────────────────────────────────────────── */
 function StaffView(props) {
@@ -1076,7 +1296,7 @@ function StaffView(props) {
     search, newPlayerName, newPlayerSkill, newPlayerPayment,
     avgGameDurationMs, openPlayCourtCount,
     setSearch, setNewPlayerName, setNewPlayerSkill, setNewPlayerPayment,
-    addPlayer, removePlayer, setPlayerPayment, togglePlayerInDraft, saveDraftGroup, autoGroup,
+    addPlayer, checkInExisting, onCheckoutPlayer, removePlayer, setPlayerPayment, togglePlayerInDraft, saveDraftGroup, autoGroup,
     setShowAssign, setShowRental, removeFromQueue, addPlayerToQueueGroup,
     draggingPlayerId, setDraggingPlayerId,
     setFinishingCourt, clearCourtCasual, markArrived, removeNoShow,
@@ -1084,6 +1304,11 @@ function StaffView(props) {
   } = props;
 
   const [dragOverZone, setDragOverZone] = useState(null);
+
+  // Checked-out players stay in `players` for re-check-in but are not part of the
+  // active roster: they're counted separately and shown in their own box below.
+  const activeCount = players.filter(p => !p.checkedOut).length;
+  const checkedOutPlayers = players.filter(p => p.checkedOut);
 
   return (
     <div className="p-4 sm:p-6 space-y-6">
@@ -1132,29 +1357,16 @@ function StaffView(props) {
           <h2 className="font-display text-xl text-zinc-300 tracking-wide mb-3">ROSTER</h2>
           <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
             <div className="p-3.5 border-b border-zinc-800 space-y-2.5">
-              <div className="flex gap-2">
-                <input
-                  value={newPlayerName}
-                  onChange={e => setNewPlayerName(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && addPlayer()}
-                  placeholder="New player name..."
-                  className="flex-1 bg-zinc-950 border border-zinc-800 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-lime-500"
-                />
-                <select
-                  value={newPlayerSkill}
-                  onChange={e => setNewPlayerSkill(e.target.value)}
-                  className="bg-zinc-950 border border-zinc-800 rounded-md px-2 text-sm focus:outline-none focus:border-lime-500"
-                >
-                  {SKILL_TIERS.map(s => <option key={s}>{s}</option>)}
-                </select>
-                <button
-                  onClick={addPlayer}
-                  className="bg-lime-400 text-zinc-950 rounded-md px-3 hover:bg-lime-300"
-                  title="Add player"
-                >
-                  <UserPlus className="w-4 h-4" />
-                </button>
-              </div>
+              <PlayerCheckInField
+                newPlayerName={newPlayerName}
+                setNewPlayerName={setNewPlayerName}
+                newPlayerSkill={newPlayerSkill}
+                setNewPlayerSkill={setNewPlayerSkill}
+                players={players}
+                busyPlayerIds={busyPlayerIds}
+                addPlayer={addPlayer}
+                checkInExisting={checkInExisting}
+              />
               {/* Payment status at check-in (spec §1). Player is added regardless
                   of what's picked; unpaid is the default so it's never assumed. */}
               <div className="flex items-center gap-1.5">
@@ -1231,23 +1443,42 @@ function StaffView(props) {
                       </span>
                     )}
                     {!busy && (
-                      <button
-                        onClick={e => { e.stopPropagation(); removePlayer(p.id); }}
-                        className="text-zinc-600 hover:text-rose-400 p-2 -m-1 shrink-0"
-                        title={`Remove ${p.name}`}
-                        aria-label={`Remove ${p.name}`}
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      <>
+                        {/* Check out — the player is leaving for the day (spec §3).
+                            Records their session + payment, then drops them from the
+                            active roster (profile kept for a future re-check-in). */}
+                        <button
+                          onClick={e => { e.stopPropagation(); onCheckoutPlayer(p.id); }}
+                          className="text-zinc-600 hover:text-lime-400 p-2 -m-1 shrink-0"
+                          title={`Check out ${p.name}`}
+                          aria-label={`Check out ${p.name}`}
+                        >
+                          <LogOut className="w-3.5 h-3.5" />
+                        </button>
+                        {/* Remove — a mistaken entry; deletes the account entirely. */}
+                        <button
+                          onClick={e => { e.stopPropagation(); removePlayer(p.id); }}
+                          className="text-zinc-600 hover:text-rose-400 p-2 -m-1 shrink-0"
+                          title={`Remove ${p.name}`}
+                          aria-label={`Remove ${p.name}`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </>
                     )}
                   </div>
                 );
               })}
             </div>
             <div className="px-3 py-2 text-xs text-zinc-500 border-t border-zinc-800">
-              {players.length} total · {players.length - busyPlayerIds.size} available
+              {activeCount} checked in · {activeCount - busyPlayerIds.size} available
             </div>
           </div>
+
+          {/* CHECKED OUT — players who've left for the day, kept for one-click
+              re-check-in (spec §4). Searchable, and re-checking-in returns them
+              to the roster above with their W/L history intact. */}
+          <CheckedOutBox players={checkedOutPlayers} onCheckIn={checkInExisting} />
         </section>
 
         {/* GROUP BUILDER */}
@@ -2133,94 +2364,80 @@ function LeaderboardModal({ leaderboard, history, onClose }) {
 
 /* ─────────────────────────────────────────────
    CHECKOUT (spec §3)
-   Shown when a court session ends. Records each player's session length, flags
-   anyone still unpaid, and lets staff take payment on the spot. It never blocks
-   the checkout — the "Complete" button always works; the warning is just a nudge.
+   A roster action — the player is leaving for the day. Shows their session length,
+   flags them if still unpaid, and lets staff take payment on the spot. It never
+   blocks: the "Check out" button always works; the warning is just a nudge. On
+   confirm the player leaves the active roster (their profile is kept in the DB).
    ───────────────────────────────────────────── */
-function CheckoutModal({ data, playerById, onSetPayment, onComplete, onClose }) {
-  const { courtName, playerIds, startedAt, endedAt, winners } = data;
-  const roster = playerIds.map(playerById).filter(Boolean);
-  const unpaid = roster.filter(p => !isPaid(p.payment));
-  const sessionMs = endedAt - startedAt;
-  const winnerSet = new Set(winners ?? []);
+function CheckoutModal({ player, onSetPayment, onComplete, onClose }) {
+  // Looked up fresh from state each render, so it can briefly be undefined right
+  // after checkout clears the id — bail cleanly.
+  if (!player) return null;
+  const paid = isPaid(player.payment);
+  const sessionMs = Date.now() - player.checkedInAt;
+  const checkedIn = new Date(player.checkedInAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
   return (
-    <ModalShell onClose={onClose} title={`Checkout — ${courtName}`} wide>
-      <div className="flex items-center gap-3 mb-4 text-sm">
-        <span className="flex items-center gap-1.5 text-zinc-300">
-          <Clock className="w-4 h-4 text-zinc-500" />
-          Session length: <span className="font-semibold text-lime-400">{fmtDuration(sessionMs)}</span>
-        </span>
+    <ModalShell onClose={onClose} title={`Check out — ${player.name}`}>
+      <div className="flex items-center gap-3 mb-4">
+        <PlayerAvatar player={player} size="lg" />
+        <div className="min-w-0">
+          <div className="font-semibold text-lg truncate">{player.name}</div>
+          <div className="text-xs text-zinc-500">{player.skill} • {player.wins}W {player.losses}L</div>
+        </div>
       </div>
 
-      {unpaid.length > 0 && (
-        <div className="bg-rose-950 border border-rose-700 rounded-lg p-3 mb-4 flex items-start gap-2.5">
-          <AlertTriangle className="w-5 h-5 text-rose-300 shrink-0 mt-0.5" />
-          <div className="text-sm text-rose-200">
-            <p className="font-bold mb-0.5">
-              {unpaid.length === 1
-                ? `${unpaid[0].name} hasn't paid yet.`
-                : `${unpaid.length} players haven't paid yet.`}
+      <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3 mb-4 space-y-1.5 text-sm">
+        <div className="flex items-center justify-between">
+          <span className="text-zinc-400 flex items-center gap-1.5">
+            <LogIn className="w-4 h-4 text-zinc-500" /> Checked in
+          </span>
+          <span className="text-zinc-200">{checkedIn}</span>
+        </div>
+        <div className="flex items-center justify-between">
+          <span className="text-zinc-400 flex items-center gap-1.5">
+            <Clock className="w-4 h-4 text-zinc-500" /> Session length
+          </span>
+          <span className="font-semibold text-lime-400">{fmtDuration(sessionMs)}</span>
+        </div>
+      </div>
+
+      {paid ? (
+        <div className="flex items-center gap-2 text-sm text-zinc-300 mb-5">
+          <span className="text-zinc-400">Payment</span>
+          <PaymentBadge payment={player.payment} />
+        </div>
+      ) : (
+        <div className="bg-rose-950 border border-rose-700 rounded-lg p-3 mb-5">
+          <div className="flex items-start gap-2.5 mb-2.5">
+            <AlertTriangle className="w-5 h-5 text-rose-300 shrink-0 mt-0.5" />
+            <p className="text-sm text-rose-200 font-bold">
+              {player.name} has not paid yet. Please collect payment.
             </p>
-            <p className="text-rose-300/90 text-xs">Collect payment below before closing the session.</p>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => onSetPayment(player.id, 'online')}
+              className="flex-1 text-xs font-bold py-2 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 flex items-center justify-center gap-1"
+            >
+              <Check className="w-3.5 h-3.5" /> Paid — Online
+            </button>
+            <button
+              onClick={() => onSetPayment(player.id, 'cash')}
+              className="flex-1 text-xs font-bold py-2 rounded-md bg-amber-400 hover:bg-amber-300 text-zinc-950 flex items-center justify-center gap-1"
+            >
+              <DollarSign className="w-3.5 h-3.5" /> Paid — Cash
+            </button>
           </div>
         </div>
       )}
-
-      <div className="space-y-2 mb-5">
-        {roster.map(p => {
-          const info = paymentInfo(p.payment);
-          const paid = isPaid(p.payment);
-          const checkedIn = new Date(p.checkedInAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-          return (
-            <div
-              key={p.id}
-              className={`rounded-lg border p-3 ${paid ? 'bg-zinc-950 border-zinc-800' : 'bg-rose-950/40 border-rose-900'}`}
-            >
-              <div className="flex items-center gap-2.5">
-                <PlayerAvatar player={p} size="sm" />
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-semibold flex items-center gap-2">
-                    <span className="truncate">{p.name}</span>
-                    {winnerSet.has(p.id) && (
-                      <span className="text-[10px] font-bold text-amber-300 flex items-center gap-0.5 shrink-0">
-                        <Crown className="w-3 h-3" /> WON
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-xs text-zinc-500">
-                    In {checkedIn} · here {fmtDuration(endedAt - p.checkedInAt)}
-                  </div>
-                </div>
-                <PaymentBadge payment={p.payment} title={info.label} />
-              </div>
-              {!paid && (
-                <div className="flex gap-2 mt-2.5">
-                  <button
-                    onClick={() => onSetPayment(p.id, 'online')}
-                    className="flex-1 text-xs font-bold py-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 flex items-center justify-center gap-1"
-                  >
-                    <Check className="w-3.5 h-3.5" /> Paid — Online
-                  </button>
-                  <button
-                    onClick={() => onSetPayment(p.id, 'cash')}
-                    className="flex-1 text-xs font-bold py-1.5 rounded-md bg-amber-400 hover:bg-amber-300 text-zinc-950 flex items-center justify-center gap-1"
-                  >
-                    <DollarSign className="w-3.5 h-3.5" /> Paid — Cash
-                  </button>
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
 
       <button
         onClick={onComplete}
         className="w-full bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition"
       >
-        <Check className="w-4 h-4" />
-        {unpaid.length > 0 ? 'Complete checkout anyway' : 'Complete checkout'}
+        <LogOut className="w-4 h-4" />
+        {paid ? 'Check out' : 'Check out anyway'}
       </button>
     </ModalShell>
   );
@@ -2294,7 +2511,7 @@ function RentalModal({ court, players, busyPlayerIds, onBook, onClose }) {
   const [duration, setDuration] = useState(60);
 
   const available = players
-    .filter(p => !busyPlayerIds.has(p.id))
+    .filter(p => !p.checkedOut && !busyPlayerIds.has(p.id))
     .filter(p => !search || p.name.toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => a.name.localeCompare(b.name));
 

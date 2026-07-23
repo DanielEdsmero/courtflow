@@ -16,6 +16,9 @@ const fromRow = (r) => ({
   photo: r.photo_url,
   payment: r.payment ?? 'unpaid',
   checkedInAt: r.checked_in_at ? new Date(r.checked_in_at).getTime() : Date.now(),
+  // Checked-out players are kept in the table (for re-check-in) but hidden from
+  // the active roster. A truthy checked_out_at means "done for the day".
+  checkedOut: !!r.checked_out_at,
 });
 
 export async function listPlayers(venueId) {
@@ -36,6 +39,33 @@ export async function createPlayer(venueId, { name, skill, payment = 'unpaid' })
     .single();
   if (error) throw error;
   return fromRow(data);
+}
+
+// Re-check-in a returning player (spec §4). Their durable data — skill, W/L,
+// photo — is untouched; only the session-scoped fields move: a fresh
+// checked_in_at (so session duration measures from now) and the payment picked
+// for this visit (defaults to unpaid so they can pay again). Returns the fresh row.
+export async function recheckInPlayer(playerId, payment = 'unpaid') {
+  const { data, error } = await supabase
+    .from('players')
+    // Clear checked_out_at so a returning player rejoins the active roster.
+    .update({ payment, checked_in_at: new Date().toISOString(), checked_out_at: null })
+    .eq('id', playerId)
+    .select()
+    .single();
+  if (error) throw error;
+  return fromRow(data);
+}
+
+// Check a player out (spec §3): they're done for the day and leave the active
+// roster. The row stays put — skill, W/L and photo are kept so the check-in
+// autocomplete can bring them back next visit — only checked_out_at is stamped.
+export async function checkOutPlayer(playerId) {
+  const { error } = await supabase
+    .from('players')
+    .update({ checked_out_at: new Date().toISOString() })
+    .eq('id', playerId);
+  if (error) throw error;
 }
 
 export async function updatePlayerPayment(playerId, payment) {
