@@ -28,16 +28,25 @@ create table if not exists access_keys (
 
 -- The durable roster. Survives session resets; wins/losses are zeroed, not deleted.
 create table if not exists players (
-  id         uuid primary key default gen_random_uuid(),
-  venue_id   uuid not null references venues on delete cascade,
-  name       text not null,
-  skill      text not null default 'Intermediate',
-  wins       int  not null default 0,
-  losses     int  not null default 0,
-  photo_url  text,
-  created_at timestamptz not null default now()
+  id            uuid primary key default gen_random_uuid(),
+  venue_id      uuid not null references venues on delete cascade,
+  name          text not null,
+  skill         text not null default 'Intermediate',
+  wins          int  not null default 0,
+  losses        int  not null default 0,
+  photo_url     text,
+  -- Payment tracking: 'online' (paid card/app), 'cash' (paid at desk), 'unpaid'.
+  payment       text not null default 'unpaid',
+  -- When the player checked in at the desk. Used for session-duration on checkout.
+  checked_in_at timestamptz not null default now(),
+  created_at    timestamptz not null default now()
 );
 create index if not exists players_venue_idx on players (venue_id);
+
+-- Added after the first release — guarded so re-running the file over an existing
+-- database picks them up without erroring.
+alter table players add column if not exists payment       text not null default 'unpaid';
+alter table players add column if not exists checked_in_at timestamptz not null default now();
 
 -- The live session: courts, queue, announcement, toggles — one JSON blob per venue.
 -- Ephemeral working state, rewritten constantly, read by the TV display.
@@ -177,12 +186,13 @@ as $$
     'players',   coalesce(
                    (select jsonb_agg(
                       jsonb_build_object(
-                        'id',    p.id,
-                        'name',  p.name,
-                        'skill', p.skill,
-                        'wins',  p.wins,
-                        'losses',p.losses,
-                        'photo', p.photo_url))
+                        'id',      p.id,
+                        'name',    p.name,
+                        'skill',   p.skill,
+                        'wins',    p.wins,
+                        'losses',  p.losses,
+                        'photo',   p.photo_url,
+                        'payment', p.payment))
                       from players p where p.venue_id = v.id), '[]'::jsonb))
     from venues v
     left join sessions s on s.venue_id = v.id

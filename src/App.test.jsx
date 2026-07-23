@@ -4,8 +4,12 @@ import {
   skillRank,
   fmtElapsed,
   fmtMinutes,
+  fmtDuration,
   estimateWait,
   balancedGroup,
+  paymentInfo,
+  isPaid,
+  PAYMENT_STATUSES,
 } from './lib/logic.js';
 
 /* ── fmtElapsed ─────────────────────────────── */
@@ -127,6 +131,44 @@ describe('fmtMinutes', () => {
   it('rounds to nearest minute', () => {
     expect(fmtMinutes(14.5 * 60 * 1000)).toBe('~15 min');
     expect(fmtMinutes(14.4 * 60 * 1000)).toBe('~14 min');
+  });
+});
+
+/* ── fmtDuration ────────────────────────────── */
+describe('fmtDuration', () => {
+  it('formats sub-hour durations as minutes only', () => {
+    expect(fmtDuration(15 * 60_000)).toBe('15m');
+  });
+  it('formats an hour-plus duration as "1h 15m"', () => {
+    expect(fmtDuration(75 * 60_000)).toBe('1h 15m');
+  });
+  it('formats a whole hour with zero minutes', () => {
+    expect(fmtDuration(60 * 60_000)).toBe('1h 0m');
+  });
+  it('clamps negative durations to 0m', () => {
+    expect(fmtDuration(-5000)).toBe('0m');
+  });
+  it('rounds to the nearest minute', () => {
+    expect(fmtDuration(89_000)).toBe('1m');
+  });
+});
+
+/* ── Payment status ─────────────────────────── */
+describe('payment status', () => {
+  it('resolves each known status to its own config', () => {
+    expect(paymentInfo('online').label).toBe('Paid — Online');
+    expect(paymentInfo('cash').label).toBe('Paid — Cash');
+    expect(paymentInfo('unpaid').label).toBe('Unpaid');
+  });
+  it('falls back to unpaid for unknown or missing status', () => {
+    expect(paymentInfo(undefined)).toBe(PAYMENT_STATUSES.unpaid);
+    expect(paymentInfo('legacy-value')).toBe(PAYMENT_STATUSES.unpaid);
+  });
+  it('treats online and cash as paid, unpaid as not', () => {
+    expect(isPaid('online')).toBe(true);
+    expect(isPaid('cash')).toBe(true);
+    expect(isPaid('unpaid')).toBe(false);
+    expect(isPaid(undefined)).toBe(false);
   });
 });
 

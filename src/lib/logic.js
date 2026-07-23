@@ -18,6 +18,63 @@ export const fmtMinutes = (ms) => {
   return m <= 0 ? 'Now!' : `~${m} min`;
 };
 
+// Total elapsed time in a human "1h 15m" / "15m" shape — used for session length
+// on the checkout screen and in the activity log.
+export const fmtDuration = (ms) => {
+  const totalMin = Math.max(0, Math.round(ms / 60000));
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h === 0 ? `${m}m` : `${h}h ${m}m`;
+};
+
+/* ─────────────────────────────────────────────
+   PAYMENT STATUS
+   One field on the player, three values. Everything about how a status looks
+   (badge colour, emoji, label) lives here so the roster, group builder, queue,
+   checkout screen and customer display all render it the same way.
+   ───────────────────────────────────────────── */
+export const PAYMENT_STATUSES = {
+  online: {
+    value: 'online',
+    label: 'Paid — Online',
+    short: 'Paid',
+    method: 'Online',
+    icon: '✅',
+    // Solid pill styles (dark theme, green = confirmed).
+    badge: 'bg-emerald-500 text-zinc-950 border-emerald-400',
+    dot: 'bg-emerald-500',
+    text: 'text-emerald-400',
+  },
+  cash: {
+    value: 'cash',
+    label: 'Paid — Cash',
+    short: 'Cash',
+    method: 'Cash',
+    icon: '💵',
+    badge: 'bg-amber-400 text-zinc-950 border-amber-300',
+    dot: 'bg-amber-400',
+    text: 'text-amber-400',
+  },
+  unpaid: {
+    value: 'unpaid',
+    label: 'Unpaid',
+    short: 'Unpaid',
+    method: null,
+    icon: '🔴',
+    badge: 'bg-rose-500 text-zinc-950 border-rose-400',
+    dot: 'bg-rose-500',
+    text: 'text-rose-400',
+  },
+};
+
+export const PAYMENT_ORDER = ['online', 'cash', 'unpaid'];
+
+// Tolerant lookup: anything unrecognised (including a legacy player saved before
+// payment tracking existed) reads as unpaid so staff are prompted, not misled.
+export const paymentInfo = (status) => PAYMENT_STATUSES[status] || PAYMENT_STATUSES.unpaid;
+
+export const isPaid = (status) => status === 'online' || status === 'cash';
+
 // Returns estimated wait in ms for queue group at `queueIndex`.
 // Uses ceiling-division so group at index 0 still shows one round's wait
 // (the caller decides if they should show "stepping on" instead).
