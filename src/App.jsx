@@ -3,7 +3,8 @@ import {
   Plus, Trophy, RotateCcw, X, Check, Search, Zap, Monitor,
   Settings, Users, ChevronRight, Clock, Trash2, UserPlus,
   Shuffle, Crown, Activity, Megaphone, BarChart2, Camera,
-  Copy, LogOut, RefreshCw, ExternalLink,
+  Copy, LogOut, RefreshCw, ExternalLink, AlertTriangle, ClipboardList,
+  LogIn, DollarSign,
 } from 'lucide-react';
 
 import { useAuth } from './lib/AuthProvider';
@@ -11,17 +12,38 @@ import { supabase } from './lib/supabase';
 import { loadSession, createSessionSync } from './lib/session';
 import {
   listPlayers, createPlayer, deletePlayer, updatePlayerPhoto,
-  recordResult, resetAllStats, recordMatchHistory,
+  updatePlayerPayment, recordResult, resetAllStats, recordMatchHistory,
 } from './lib/players';
 import { uploadPhoto } from './lib/photos';
 
 // Pure logic lives in ./lib/logic.js so tests can import it without booting the
 // Supabase client. Re-exported here because existing callers import from App.
 import {
-  SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, estimateWait, balancedGroup,
+  SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, fmtDuration, estimateWait, balancedGroup,
   defaultCourts, hydrateCourts,
+  PAYMENT_STATUSES, PAYMENT_ORDER, paymentInfo, isPaid,
 } from './lib/logic';
 export { SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, estimateWait, balancedGroup };
+
+// Minutes a called group has to start playing before staff get a no-show nudge.
+const NO_SHOW_MINUTES = 5;
+
+// Bounds the in-memory activity log carried in the session blob.
+const MAX_AUDIT = 100;
+
+// True if this device has a webcam. Lets the check-in flow skip the photo step
+// silently when there's no camera, instead of popping an error modal (spec §5).
+// enumerateDevices exposes device *kinds* without camera permission, so this is a
+// permission-free probe; we only need to know a videoinput exists.
+async function hasCamera() {
+  try {
+    if (!navigator.mediaDevices?.enumerateDevices) return false;
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.some(d => d.kind === 'videoinput');
+  } catch {
+    return false;
+  }
+}
 
 /* ─────────────────────────────────────────────
    SKILL STYLES
@@ -42,6 +64,89 @@ const skillStyleSolid = (s) => ({
   Pro:          'bg-rose-500',
 }[s] || 'bg-slate-500');
 
+// Subtle vertical divider between toolbar button groups (spec §4A). Hidden when
+// the toolbar wraps to a second row on narrow screens.
+function Divider() {
+  return <div className="hidden lg:block w-px h-7 bg-zinc-800 mx-1 shrink-0" aria-hidden />;
+}
+
+/* ─────────────────────────────────────────────
+   PAYMENT BADGE + EDITOR
+   Rendered everywhere a player name appears. `dot` is the compact form (a single
+   coloured circle for tight rows like the queue); the default is a labelled pill.
+   ───────────────────────────────────────────── */
+function PaymentBadge({ payment, dot = false, title }) {
+  const info = paymentInfo(payment);
+  if (dot) {
+    return (
+      <span
+        className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${info.dot}`}
+        title={title ?? info.label}
+        aria-label={info.label}
+      />
+    );
+  }
+  return (
+    <span
+      className={`inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded border shrink-0 ${info.badge}`}
+      title={title ?? info.label}
+    >
+      <span aria-hidden>{info.icon}</span>
+      {info.short}
+    </span>
+  );
+}
+
+// A payment badge that opens a little menu to change the status. Used in the
+// roster so staff can correct a payment at any time (spec §8).
+function PaymentEditor({ payment, onChange }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e) => { if (!ref.current?.contains(e.target)) setOpen(false); };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [open]);
+
+  return (
+    <div className="relative shrink-0" ref={ref}>
+      <button
+        onClick={(e) => { e.stopPropagation(); setOpen(v => !v); }}
+        title="Change payment status"
+        className="focus:outline-none"
+      >
+        <PaymentBadge payment={payment} />
+      </button>
+      {open && (
+        <div
+          className="absolute right-0 top-full mt-1 z-20 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl p-1 w-44"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {PAYMENT_ORDER.map(status => {
+            const info = PAYMENT_STATUSES[status];
+            const active = status === payment;
+            return (
+              <button
+                key={status}
+                onClick={(e) => { e.stopPropagation(); onChange(status); setOpen(false); }}
+                className={`w-full flex items-center gap-2 text-left text-xs font-semibold px-2 py-1.5 rounded-md transition ${
+                  active ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-300 hover:bg-zinc-800'
+                }`}
+              >
+                <span aria-hidden>{info.icon}</span>
+                {info.label}
+                {active && <Check className="w-3.5 h-3.5 ml-auto text-lime-400" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ─────────────────────────────────────────────
    APP
    ───────────────────────────────────────────── */
@@ -61,6 +166,9 @@ export default function App() {
   const [courts, setCourts]           = useState(defaultCourts);
   const [queue, setQueue]             = useState([]);
   const [history, setHistory]         = useState([]);
+  // Append-only audit trail: check-ins, checkouts, payment changes (spec §9).
+  // Lives in the session blob so it survives a refresh; capped at MAX_AUDIT.
+  const [auditLog, setAuditLog]       = useState([]);
   const [announcement, setAnnouncement] = useState('');
   const [competitiveMode, setCompetitiveMode] = useState(false);
   const [autoAssign, setAutoAssign]   = useState(true);
@@ -72,10 +180,14 @@ export default function App() {
 
   const [newPlayerName, setNewPlayerName] = useState('');
   const [newPlayerSkill, setNewPlayerSkill] = useState('Intermediate');
+  const [newPlayerPayment, setNewPlayerPayment] = useState('unpaid');
   const [search, setSearch]           = useState('');
   const [draftGroup, setDraftGroup]   = useState([]);
   const [showLeaderboard, setShowLeaderboard] = useState(false);
+  const [showActivityLog, setShowActivityLog] = useState(false);
   const [finishingCourt, setFinishingCourt]   = useState(null);
+  // Snapshot of a just-ended court session awaiting the checkout screen (spec §3).
+  const [checkoutData, setCheckoutData]       = useState(null);
   const [showAssign, setShowAssign]           = useState(null);
   const [showRental, setShowRental]           = useState(null);
   const [showAnnouncementBar, setShowAnnouncementBar] = useState(false);
@@ -103,6 +215,7 @@ export default function App() {
           setCourts(saved.courts ? hydrateCourts(saved.courts) : defaultCourts());
           setQueue(saved.queue ?? []);
           setHistory(saved.history ?? []);
+          setAuditLog(saved.auditLog ?? []);
           setAnnouncement(saved.announcement ?? '');
           setCompetitiveMode(saved.competitiveMode ?? false);
           setAutoAssign(saved.autoAssign ?? true);
@@ -133,9 +246,9 @@ export default function App() {
   useEffect(() => {
     if (booting) return;
     syncRef.current?.push({
-      courts, queue, history, competitiveMode, autoAssign, announcement, defaultOpenDuration,
+      courts, queue, history, auditLog, competitiveMode, autoAssign, announcement, defaultOpenDuration,
     });
-  }, [booting, courts, queue, history, competitiveMode, autoAssign, announcement, defaultOpenDuration]);
+  }, [booting, courts, queue, history, auditLog, competitiveMode, autoAssign, announcement, defaultOpenDuration]);
 
   // Auto-expire courts when their duration runs out.
   useEffect(() => {
@@ -159,6 +272,17 @@ export default function App() {
       };
       setHistory(h => [entry, ...h]);
       recordMatchHistory(venueId, { ...entry, courtName: c.name });
+      // Timer-expiry is an automatic checkout — log it (no modal, staff may be
+      // away), but unpaid players stay flagged red in the roster regardless.
+      c.match.players.forEach(id => {
+        const p = players.find(pl => pl.id === id);
+        if (!p) return;
+        logEvent({
+          type: 'checkout', playerName: p.name, courtName: c.name,
+          checkedInAt: p.checkedInAt, checkoutAt: now,
+          sessionMs: now - p.checkedInAt, payment: p.payment, autoEnded: true,
+        });
+      });
     });
     setCourts(prev => prev.map(c =>
       expired.find(e => e.id === c.id) ? { ...c, match: null } : c
@@ -186,6 +310,8 @@ export default function App() {
       endsAt: dur ? now + dur * 60 * 1000 : null,
       durationMin: dur,
       autoAssigned: true,
+      calledAt: now,
+      arrived: false,
     };
     setCourts(prev => prev.map(c => c.id === freeCourt.id ? { ...c, match } : c));
     setQueue(prev => prev.filter(g => g.id !== nextGroup.id));
@@ -211,21 +337,52 @@ export default function App() {
 
   const playerById = (id) => players.find(p => p.id === id);
 
+  // Append to the audit trail (spec §9). Newest first, capped so the session blob
+  // stays well under the Realtime broadcast limit.
+  const logEvent = (entry) =>
+    setAuditLog(prev => [{ id: `${Date.now()}-${Math.random()}`, at: Date.now(), ...entry }, ...prev].slice(0, MAX_AUDIT));
+
   // Players live in Postgres now, so the id comes back from the insert rather
   // than from Date.now(). The camera prompt waits for that id.
   const addPlayer = async () => {
     const n = newPlayerName.trim();
     if (!n) return;
+    const payment = newPlayerPayment;
     setNewPlayerName('');
+    setNewPlayerPayment('unpaid'); // reset for the next check-in
     try {
-      const player = await createPlayer(venueId, { name: n, skill: newPlayerSkill });
+      const player = await createPlayer(venueId, { name: n, skill: newPlayerSkill, payment });
       setPlayers(prev => [...prev, player]);
-      setPendingPhotoPlayerId(player.id);
+      logEvent({
+        type: 'checkin', playerName: player.name, payment,
+        method: paymentInfo(payment).method,
+      });
+      // Only prompt for a photo when a camera is actually present — otherwise
+      // this would pop a dead modal staff have to dismiss on every check-in.
+      if (await hasCamera()) setPendingPhotoPlayerId(player.id);
     } catch (err) {
       console.error('Failed to add player:', err);
       alert(`Couldn't add ${n}. Check your connection and try again.`);
       setNewPlayerName(n);
+      setNewPlayerPayment(payment);
     }
+  };
+
+  // Change a player's payment status (spec §8) — optimistic, rolls back on error,
+  // and records the change in the audit log.
+  const setPlayerPayment = (id, payment) => {
+    const player = players.find(p => p.id === id);
+    if (!player || player.payment === payment) return;
+    const previous = player.payment;
+    setPlayers(prev => prev.map(p => p.id === id ? { ...p, payment } : p));
+    logEvent({
+      type: 'payment', playerName: player.name, payment,
+      method: paymentInfo(payment).method, from: previous,
+    });
+    updatePlayerPayment(id, payment).catch(err => {
+      console.error('Failed to update payment:', err);
+      setPlayers(prev => prev.map(p => p.id === id ? { ...p, payment: previous } : p));
+    });
   };
 
   const removePlayer = async (id) => {
@@ -276,6 +433,9 @@ export default function App() {
       startedAt: now,
       endsAt: durationMin ? now + durationMin * 60 * 1000 : null,
       durationMin: durationMin || null,
+      // Called-to-court but not yet confirmed present — drives the no-show nudge.
+      calledAt: now,
+      arrived: false,
     };
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match } : c));
     setQueue(prev => prev.filter(g => g.id !== groupId));
@@ -297,6 +457,57 @@ export default function App() {
     setShowRental(null);
   };
 
+  // ── No-show handling (spec §7) ────────────────────────────────────────────
+  // Staff confirm the called group actually showed up; that dismisses the nudge.
+  const markArrived = (courtId) => {
+    setCourts(prev => prev.map(c =>
+      c.id === courtId && c.match ? { ...c, match: { ...c.match, arrived: true } } : c
+    ));
+  };
+
+  // The group never turned up: free the court (they're dropped, not requeued) so
+  // auto-assign — or staff — can put the next group on. Logged for the audit trail.
+  const removeNoShow = (courtId) => {
+    const court = courts.find(c => c.id === courtId);
+    if (!court?.match) return;
+    const names = court.match.players.map(id => playerById(id)?.name).filter(Boolean).join(', ');
+    logEvent({ type: 'noshow', playerName: names || '(unknown)', courtName: court.name });
+    setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
+  };
+
+  // ── Checkout (spec §3) ────────────────────────────────────────────────────
+  // Snapshot a court's session before it's cleared so the checkout screen can
+  // show durations and payment status even after the court is freed.
+  const beginCheckout = (court, { winners } = {}) => {
+    if (!court?.match) return;
+    setCheckoutData({
+      courtName: court.name,
+      courtType: court.type,
+      playerIds: court.match.players,
+      startedAt: court.match.startedAt,
+      endedAt: Date.now(),
+      winners: winners ?? null,
+    });
+  };
+
+  // Confirm the checkout: write a checkout event per player to the audit log.
+  // Payment collection happens live via setPlayerPayment while the modal is open,
+  // so by here each player already carries their final status.
+  const completeCheckout = () => {
+    if (!checkoutData) return;
+    const { playerIds, endedAt, courtName } = checkoutData;
+    playerIds.forEach(id => {
+      const p = playerById(id);
+      if (!p) return;
+      logEvent({
+        type: 'checkout', playerName: p.name, courtName,
+        checkedInAt: p.checkedInAt, checkoutAt: endedAt,
+        sessionMs: endedAt - p.checkedInAt, payment: p.payment,
+      });
+    });
+    setCheckoutData(null);
+  };
+
   const clearCourtCasual = (courtId) => {
     const court = courts.find(c => c.id === courtId);
     if (!court?.match) return;
@@ -310,6 +521,7 @@ export default function App() {
       finishedAt: now,
     };
     setHistory(prev => [entry, ...prev]);
+    beginCheckout(court); // snapshot while the match is still on the court
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
     recordMatchHistory(venueId, { ...entry, courtName: court.name });
   };
@@ -334,6 +546,7 @@ export default function App() {
       finishedAt: now,
     };
     setHistory(prev => [entry, ...prev]);
+    beginCheckout(court, { winners }); // snapshot before the court is cleared
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
     setFinishingCourt(null);
 
@@ -382,8 +595,10 @@ export default function App() {
     setQueue([]);
     setDraftGroup([]);
     setHistory([]);
+    setAuditLog([]);
     setAnnouncement('');
     setShowAnnouncementBar(false);
+    setCheckoutData(null);
     setPlayers(prev => prev.map(p => ({ ...p, wins: 0, losses: 0 })));
     setFinishingCourt(null);
     lastAutoAssigned.current = null;
@@ -394,7 +609,7 @@ export default function App() {
     // Push the cleared state immediately — the debounced write would be dropped
     // if staff closed the tab straight after resetting, resurrecting the session.
     syncRef.current?.push({
-      courts: clearedCourts, queue: [], history: [],
+      courts: clearedCourts, queue: [], history: [], auditLog: [],
       competitiveMode, autoAssign, announcement: '', defaultOpenDuration,
     });
     await syncRef.current?.flush();
@@ -468,8 +683,10 @@ export default function App() {
             </div>
           </div>
 
+          {/* Toolbar — three logical groups (left toggle · centre session controls ·
+              right actions) separated by subtle dividers (spec §4A). */}
           <div className="flex items-center gap-2 flex-wrap justify-end">
-                {/* View toggle */}
+                {/* LEFT — view toggle */}
                 <div className="flex bg-zinc-900 rounded-lg p-1 border border-zinc-800">
                   <button
                     onClick={() => setView('staff')}
@@ -491,105 +708,120 @@ export default function App() {
 
                 {view === 'staff' && (
                   <>
-                    {/* Share the customer display link for the TV */}
-                    <button
-                      onClick={() => setShowDisplayLink(true)}
-                      className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
-                      title="Get the link to open on your TV"
-                    >
-                      <Monitor className="w-4 h-4" /> Display Link
-                    </button>
+                    <Divider />
 
-                    {/* Announcement */}
-                    <button
-                      onClick={() => setShowAnnouncementBar(v => !v)}
-                      className={`px-3 py-2 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
-                        announcement
-                          ? 'bg-lime-400 text-zinc-950 border-lime-300 hover:bg-lime-300'
-                          : showAnnouncementBar
-                          ? 'bg-zinc-800 border-zinc-600 text-zinc-200'
-                          : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                      }`}
-                      title="Broadcast announcement to the customer display screen"
-                    >
-                      <Megaphone className="w-4 h-4" />
-                      {announcement ? 'Announcement' : 'Announce'}
-                    </button>
-
-                    {/* Auto-assign */}
-                    <button
-                      onClick={() => setAutoAssign(v => !v)}
-                      className={`px-3 py-2 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
-                        autoAssign
-                          ? 'bg-cyan-500 text-zinc-950 border-cyan-400 hover:bg-cyan-400'
-                          : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                      }`}
-                      title={autoAssign
-                        ? 'Auto-assign ON — queue groups feed open-play courts automatically'
-                        : 'Auto-assign OFF — staff manually assigns every group'}
-                    >
-                      <Zap className="w-4 h-4" />
-                      Auto {autoAssign ? 'ON' : 'OFF'}
-                    </button>
-
-                    {/* Default open-play session time */}
-                    <div className="flex items-center gap-1.5 bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1.5">
-                      <Clock className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-                      <select
-                        value={defaultOpenDuration === null ? 'none' : String(defaultOpenDuration)}
-                        onChange={e => setDefaultOpenDuration(e.target.value === 'none' ? null : Number(e.target.value))}
-                        className="bg-transparent text-sm font-semibold text-zinc-300 focus:outline-none cursor-pointer"
-                        title="Default open-play session time — applied when auto-assigning"
+                    {/* CENTRE — session controls: Auto, timer, mode */}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        onClick={() => setAutoAssign(v => !v)}
+                        className={`px-3 py-2 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
+                          autoAssign
+                            ? 'bg-cyan-500 text-zinc-950 border-cyan-400 hover:bg-cyan-400'
+                            : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                        }`}
+                        title={autoAssign
+                          ? 'Auto-assign ON — queue groups feed open-play courts automatically'
+                          : 'Auto-assign OFF — staff manually assigns every group'}
                       >
-                        <option value="none">No timer</option>
-                        <option value="10">10 min</option>
-                        <option value="15">15 min</option>
-                        <option value="20">20 min</option>
-                        <option value="30">30 min</option>
-                        <option value="45">45 min</option>
-                        <option value="60">60 min</option>
-                      </select>
+                        <Zap className="w-4 h-4" />
+                        Auto {autoAssign ? 'ON' : 'OFF'}
+                      </button>
+
+                      {/* Default open-play session time */}
+                      <div className="flex items-center gap-1.5 bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1.5">
+                        <Clock className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+                        <select
+                          value={defaultOpenDuration === null ? 'none' : String(defaultOpenDuration)}
+                          onChange={e => setDefaultOpenDuration(e.target.value === 'none' ? null : Number(e.target.value))}
+                          className="bg-transparent text-sm font-semibold text-zinc-300 focus:outline-none cursor-pointer"
+                          title="Default open-play session time — applied when auto-assigning"
+                        >
+                          <option value="none">No timer</option>
+                          <option value="10">10 min</option>
+                          <option value="15">15 min</option>
+                          <option value="20">20 min</option>
+                          <option value="30">30 min</option>
+                          <option value="45">45 min</option>
+                          <option value="60">60 min</option>
+                        </select>
+                      </div>
+
+                      {/* Competitive mode */}
+                      <button
+                        onClick={() => setCompetitiveMode(v => !v)}
+                        className={`px-3 py-2 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
+                          competitiveMode
+                            ? 'bg-rose-500 text-zinc-950 border-rose-400 hover:bg-rose-400'
+                            : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                        }`}
+                        title={competitiveMode
+                          ? 'Competitive mode ON — winners tracked, leaderboard active'
+                          : 'Casual mode — no winner tracking, courts auto-clear when timer ends'}
+                      >
+                        <Trophy className="w-4 h-4" />
+                        {competitiveMode ? 'Competitive' : 'Casual'}
+                      </button>
+
+                      {competitiveMode && (
+                        <button
+                          onClick={() => setShowLeaderboard(true)}
+                          className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
+                        >
+                          <Crown className="w-4 h-4" /> Leaderboard
+                        </button>
+                      )}
                     </div>
 
-                    {/* Competitive mode */}
-                    <button
-                      onClick={() => setCompetitiveMode(v => !v)}
-                      className={`px-3 py-2 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
-                        competitiveMode
-                          ? 'bg-rose-500 text-zinc-950 border-rose-400 hover:bg-rose-400'
-                          : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                      }`}
-                      title={competitiveMode
-                        ? 'Competitive mode ON — winners tracked, leaderboard active'
-                        : 'Casual mode — no winner tracking, courts auto-clear when timer ends'}
-                    >
-                      <Trophy className="w-4 h-4" />
-                      {competitiveMode ? 'Competitive' : 'Casual'}
-                    </button>
+                    <Divider />
 
-                    {competitiveMode && (
+                    {/* RIGHT — display link, announce, log, reset, sign out */}
+                    <div className="flex items-center gap-2 flex-wrap">
                       <button
-                        onClick={() => setShowLeaderboard(true)}
+                        onClick={() => setShowDisplayLink(true)}
                         className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
+                        title="Get the link to open on your TV"
                       >
-                        <Crown className="w-4 h-4" /> Leaderboard
+                        <Monitor className="w-4 h-4" /> Display Link
                       </button>
-                    )}
 
-                    <button
-                      onClick={resetSession}
-                      className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-rose-950 hover:text-rose-300 hover:border-rose-900 text-sm font-semibold flex items-center gap-2"
-                    >
-                      <RotateCcw className="w-4 h-4" /> Reset
-                    </button>
+                      <button
+                        onClick={() => setShowAnnouncementBar(v => !v)}
+                        className={`px-3 py-2 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
+                          announcement
+                            ? 'bg-lime-400 text-zinc-950 border-lime-300 hover:bg-lime-300'
+                            : showAnnouncementBar
+                            ? 'bg-zinc-800 border-zinc-600 text-zinc-200'
+                            : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                        }`}
+                        title="Broadcast announcement to the customer display screen"
+                      >
+                        <Megaphone className="w-4 h-4" />
+                        {announcement ? 'Announcement' : 'Announce'}
+                      </button>
 
-                    <button
-                      onClick={signOut}
-                      className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-200 text-sm font-semibold flex items-center gap-2"
-                      title="Sign out"
-                    >
-                      <LogOut className="w-4 h-4" />
-                    </button>
+                      <button
+                        onClick={() => setShowActivityLog(true)}
+                        className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
+                        title="Check-in, checkout and payment history"
+                      >
+                        <ClipboardList className="w-4 h-4" /> Log
+                      </button>
+
+                      <button
+                        onClick={resetSession}
+                        className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-rose-950 hover:text-rose-300 hover:border-rose-900 text-sm font-semibold flex items-center gap-2"
+                      >
+                        <RotateCcw className="w-4 h-4" /> Reset
+                      </button>
+
+                      <button
+                        onClick={signOut}
+                        className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-200 text-sm font-semibold flex items-center gap-2"
+                        title="Sign out"
+                      >
+                        <LogOut className="w-4 h-4" />
+                      </button>
+                    </div>
                   </>
                 )}
           </div>
@@ -644,13 +876,16 @@ export default function App() {
           search={search}
           newPlayerName={newPlayerName}
           newPlayerSkill={newPlayerSkill}
+          newPlayerPayment={newPlayerPayment}
           avgGameDurationMs={avgGameDurationMs}
           openPlayCourtCount={openPlayCourtCount}
           setSearch={setSearch}
           setNewPlayerName={setNewPlayerName}
           setNewPlayerSkill={setNewPlayerSkill}
+          setNewPlayerPayment={setNewPlayerPayment}
           addPlayer={addPlayer}
           removePlayer={removePlayer}
+          setPlayerPayment={setPlayerPayment}
           togglePlayerInDraft={togglePlayerInDraft}
           saveDraftGroup={saveDraftGroup}
           autoGroup={autoGroup}
@@ -662,6 +897,8 @@ export default function App() {
           setDraggingPlayerId={setDraggingPlayerId}
           setFinishingCourt={setFinishingCourt}
           clearCourtCasual={clearCourtCasual}
+          markArrived={markArrived}
+          removeNoShow={removeNoShow}
           addCourt={addCourt}
           removeCourt={removeCourt}
           toggleCourtType={toggleCourtType}
@@ -706,6 +943,21 @@ export default function App() {
           leaderboard={leaderboard}
           history={history}
           onClose={() => setShowLeaderboard(false)}
+        />
+      )}
+      {checkoutData && (
+        <CheckoutModal
+          data={checkoutData}
+          playerById={playerById}
+          onSetPayment={setPlayerPayment}
+          onComplete={completeCheckout}
+          onClose={() => setCheckoutData(null)}
+        />
+      )}
+      {showActivityLog && (
+        <ActivityLogModal
+          auditLog={auditLog}
+          onClose={() => setShowActivityLog(false)}
         />
       )}
       {showRental !== null && (
@@ -821,13 +1073,13 @@ function StaffView(props) {
   const {
     competitiveMode, autoAssign,
     players, filteredPlayers, courts, queue, draftGroup, busyPlayerIds,
-    search, newPlayerName, newPlayerSkill,
+    search, newPlayerName, newPlayerSkill, newPlayerPayment,
     avgGameDurationMs, openPlayCourtCount,
-    setSearch, setNewPlayerName, setNewPlayerSkill,
-    addPlayer, removePlayer, togglePlayerInDraft, saveDraftGroup, autoGroup,
+    setSearch, setNewPlayerName, setNewPlayerSkill, setNewPlayerPayment,
+    addPlayer, removePlayer, setPlayerPayment, togglePlayerInDraft, saveDraftGroup, autoGroup,
     setShowAssign, setShowRental, removeFromQueue, addPlayerToQueueGroup,
     draggingPlayerId, setDraggingPlayerId,
-    setFinishingCourt, clearCourtCasual,
+    setFinishingCourt, clearCourtCasual, markArrived, removeNoShow,
     addCourt, removeCourt, toggleCourtType, renameCourt, playerById,
   } = props;
 
@@ -866,6 +1118,8 @@ function StaffView(props) {
               onToggleType={() => toggleCourtType(court.id)}
               onRename={(name) => renameCourt(court.id, name)}
               onBookRental={() => setShowRental(court.id)}
+              onArrived={() => markArrived(court.id)}
+              onNoShow={() => removeNoShow(court.id)}
             />
           ))}
         </div>
@@ -877,7 +1131,7 @@ function StaffView(props) {
         <section className="lg:col-span-4">
           <h2 className="font-display text-xl text-zinc-300 tracking-wide mb-3">ROSTER</h2>
           <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
-            <div className="p-3 border-b border-zinc-800 space-y-2">
+            <div className="p-3.5 border-b border-zinc-800 space-y-2.5">
               <div className="flex gap-2">
                 <input
                   value={newPlayerName}
@@ -896,9 +1150,34 @@ function StaffView(props) {
                 <button
                   onClick={addPlayer}
                   className="bg-lime-400 text-zinc-950 rounded-md px-3 hover:bg-lime-300"
+                  title="Add player"
                 >
                   <UserPlus className="w-4 h-4" />
                 </button>
+              </div>
+              {/* Payment status at check-in (spec §1). Player is added regardless
+                  of what's picked; unpaid is the default so it's never assumed. */}
+              <div className="flex items-center gap-1.5">
+                <DollarSign className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+                <div className="flex gap-1 flex-1">
+                  {PAYMENT_ORDER.map(status => {
+                    const info = PAYMENT_STATUSES[status];
+                    const active = newPlayerPayment === status;
+                    return (
+                      <button
+                        key={status}
+                        onClick={() => setNewPlayerPayment(status)}
+                        title={info.label}
+                        className={`flex-1 text-[11px] font-bold py-1.5 rounded-md border transition flex items-center justify-center gap-1 ${
+                          active ? info.badge : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:text-zinc-200'
+                        }`}
+                      >
+                        <span aria-hidden>{info.icon}</span>
+                        {info.short}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
               <div className="relative">
                 <Search className="w-4 h-4 absolute left-3 top-2.5 text-zinc-500" />
@@ -929,23 +1208,25 @@ function StaffView(props) {
                       requestAnimationFrame(() => setDraggingPlayerId(p.id));
                     }}
                     onDragEnd={() => { _dragId = null; setDraggingPlayerId(null); setDragOverZone(null); }}
-                    className={`px-3 py-2 flex items-center gap-2 border-b border-zinc-800 last:border-0 transition ${
+                    className={`px-3.5 py-2.5 flex items-center gap-2.5 border-b border-zinc-800 last:border-0 transition ${
                       busy ? 'opacity-40' : 'hover:bg-zinc-800'
                     } ${inDraft ? 'bg-lime-950' : ''} ${
                       draggingPlayerId === p.id ? 'opacity-40' : ''
                     } ${canDrag ? 'cursor-grab' : 'cursor-pointer'}`}
                     onClick={() => !busy && togglePlayerInDraft(p.id)}
                   >
-                    <div className={`w-2 h-2 rounded-full ${skillStyleSolid(p.skill)}`} />
+                    <div className={`w-2 h-2 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-semibold truncate">{p.name}</div>
                       <div className="text-xs text-zinc-500">
                         {p.skill} • {p.wins}W {p.losses}L
                       </div>
                     </div>
-                    {inDraft && <Check className="w-4 h-4 text-lime-400" />}
+                    {/* Payment badge doubles as the editor (spec §2, §8) */}
+                    <PaymentEditor payment={p.payment} onChange={(status) => setPlayerPayment(p.id, status)} />
+                    {inDraft && <Check className="w-4 h-4 text-lime-400 shrink-0" />}
                     {busy && (
-                      <span className="text-xs text-zinc-500">
+                      <span className="text-xs text-zinc-500 shrink-0">
                         {courts.some(c => c.match?.players.includes(p.id)) ? 'Playing' : 'Queued'}
                       </span>
                     )}
@@ -1009,8 +1290,9 @@ function StaffView(props) {
                 return (
                   <div key={id} className="flex items-center gap-2 bg-zinc-950 rounded-lg p-2 border border-zinc-800">
                     <span className={`text-xs px-2 py-0.5 rounded border ${skillStyle(p.skill)}`}>{p.skill}</span>
-                    <span className="flex-1 text-sm font-semibold">{p.name}</span>
-                    <button onClick={() => togglePlayerInDraft(id)} className="text-zinc-500 hover:text-rose-400">
+                    <span className="flex-1 text-sm font-semibold truncate">{p.name}</span>
+                    <PaymentBadge payment={p.payment} />
+                    <button onClick={() => togglePlayerInDraft(id)} className="text-zinc-500 hover:text-rose-400 shrink-0">
                       <X className="w-4 h-4" />
                     </button>
                   </div>
@@ -1054,8 +1336,8 @@ function StaffView(props) {
           </div>
           <div className="space-y-3">
             {queue.length === 0 && (
-              <div className="text-sm text-zinc-600 italic text-center py-12 border border-dashed border-zinc-800 rounded-xl">
-                No groups in queue
+              <div className="text-sm text-zinc-500 italic flex items-center gap-2 px-4 py-2.5 border border-dashed border-zinc-800 rounded-lg">
+                <Users className="w-4 h-4 text-zinc-600 shrink-0" /> No groups in queue
               </div>
             )}
             {queue.map((g, idx) => {
@@ -1066,6 +1348,7 @@ function StaffView(props) {
               const estWaitMs = estimateWait(idx, openPlayCourtCount, avgGameDurationMs);
               const hasFreeCourt = courts.some(c => c.type === 'open' && !c.match);
               const isImmediateNext = idx === 0 && hasFreeCourt && groupPlayers.length >= 4;
+              const unpaidCount = groupPlayers.filter(p => !isPaid(p.payment)).length;
 
               const canDrop = !!_dragId && groupPlayers.length < 4 && !g.players.includes(_dragId);
               return (
@@ -1096,6 +1379,11 @@ function StaffView(props) {
                       <span className={`text-xs px-1.5 py-0.5 rounded ${skillStyleSolid(SKILL_TIERS[avgSkill])} bg-opacity-20 text-zinc-300`}>
                         avg {SKILL_TIERS[avgSkill]}
                       </span>
+                      {unpaidCount > 0 && (
+                        <span className="text-xs font-bold text-rose-300 bg-rose-950 border border-rose-800 px-2 py-0.5 rounded-full flex items-center gap-1">
+                          <AlertTriangle className="w-3 h-3" /> {unpaidCount} unpaid
+                        </span>
+                      )}
                       {isImmediateNext ? (
                         <span className="text-xs font-bold text-lime-400 bg-lime-950 border border-lime-800 px-2 py-0.5 rounded-full">
                           Now
@@ -1113,8 +1401,9 @@ function StaffView(props) {
                   <div className="space-y-1 mb-3">
                     {groupPlayers.map(p => (
                       <div key={p.id} className="flex items-center gap-2 text-sm">
-                        <div className={`w-1.5 h-1.5 rounded-full ${skillStyleSolid(p.skill)}`} />
-                        <span>{p.name}</span>
+                        <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
+                        <span className="flex-1 truncate">{p.name}</span>
+                        <PaymentBadge payment={p.payment} dot title={`${p.name} — ${paymentInfo(p.payment).label}`} />
                       </div>
                     ))}
                     {groupPlayers.length < 4 && (
@@ -1165,7 +1454,7 @@ function PlayerAvatar({ player, size }) {
 /* ─────────────────────────────────────────────
    COURT CARD (STAFF) — double-click name to rename
    ───────────────────────────────────────────── */
-function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear, onRemove, onToggleType, onRename, onBookRental }) {
+function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear, onRemove, onToggleType, onRename, onBookRental, onArrived, onNoShow }) {
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(court.name);
   const inputRef = useRef(null);
@@ -1188,6 +1477,11 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
   const timeUp     = hasTimer && remaining <= 0;
   const showTimeUp = timeUp && !isRental && competitiveMode;
 
+  // No-show tracking (spec §7): a called group that hasn't been confirmed present.
+  const awaitingArrival = isPlaying && !isRental && court.match.arrived === false;
+  const calledAgoMs = awaitingArrival ? now - (court.match.calledAt ?? court.match.startedAt) : 0;
+  const possibleNoShow = awaitingArrival && calledAgoMs >= NO_SHOW_MINUTES * 60_000;
+
   const borderClass = showTimeUp
     ? 'bg-rose-950 border-rose-600'
     : isPlaying && isRental ? 'bg-amber-950 border-amber-600'
@@ -1196,7 +1490,7 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
     : 'bg-zinc-900 border-zinc-800';
 
   return (
-    <div className={`rounded-xl border-2 p-4 transition ${borderClass}`}>
+    <div className={`rounded-xl border-2 p-5 transition ${borderClass}`}>
       {/* Header */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
@@ -1272,6 +1566,39 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
 
       {isPlaying ? (
         <>
+          {/* No-show nudge (spec §7): staff confirm arrival or drop the group. */}
+          {awaitingArrival && (
+            <div className={`mb-3 rounded-lg border p-2.5 ${
+              possibleNoShow ? 'bg-rose-950 border-rose-700' : 'bg-amber-950/40 border-amber-800'
+            }`}>
+              <div className={`flex items-center gap-1.5 text-xs font-bold mb-2 ${
+                possibleNoShow ? 'text-rose-300' : 'text-amber-300'
+              }`}>
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                {possibleNoShow
+                  ? `Possible no-show — called ${fmtElapsed(calledAgoMs)} ago`
+                  : 'Called — waiting for players'}
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={onArrived}
+                  className="flex-1 bg-lime-400 hover:bg-lime-300 text-zinc-950 text-xs font-bold py-1.5 rounded-md flex items-center justify-center gap-1"
+                >
+                  <Check className="w-3.5 h-3.5" /> They're here
+                </button>
+                <button
+                  onClick={onNoShow}
+                  className={`flex-1 text-xs font-bold py-1.5 rounded-md flex items-center justify-center gap-1 transition ${
+                    possibleNoShow
+                      ? 'bg-rose-500 hover:bg-rose-400 text-zinc-950'
+                      : 'bg-zinc-800 hover:bg-rose-900 text-zinc-300 hover:text-rose-200'
+                  }`}
+                >
+                  <X className="w-3.5 h-3.5" /> No-show
+                </button>
+              </div>
+            </div>
+          )}
           {isRental ? (
             /* Rental — host party display */
             (() => {
@@ -1294,7 +1621,8 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
                   <div key={id} className="flex items-center gap-2 bg-zinc-950 bg-opacity-50 rounded px-2 py-1.5">
                     <span className="text-xs text-zinc-500 font-mono w-6">{teamLabel}</span>
                     <PlayerAvatar player={p} size="sm" />
-                    <span className="text-sm font-semibold flex-1">{p.name}</span>
+                    <span className="text-sm font-semibold flex-1 truncate">{p.name}</span>
+                    <PaymentBadge payment={p.payment} dot title={`${p.name} — ${paymentInfo(p.payment).label}`} />
                     <span className="text-[10px] text-zinc-500">{p.skill}</span>
                   </div>
                 );
@@ -1325,7 +1653,7 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
           <Plus className="w-4 h-4" /> Book Rental
         </button>
       ) : (
-        <div className="text-center py-6 text-zinc-600 text-sm italic">
+        <div className="text-center py-7 text-zinc-400 text-base italic">
           Assign a group from queue
         </div>
       )}
@@ -1344,6 +1672,10 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
   const activeCourts  = courts.filter(c => c.match).length;
   const playersOnCourt = courts.reduce((n, c) => n + (c.match ? c.match.players.length : 0), 0);
   const gamesServed   = history.length;
+  const openCourts    = courts.filter(c => c.type === 'open' && !c.match).length;
+  // Front-desk call-to-action: only worth shouting about when a court is free
+  // AND nobody is already waiting for it (spec §6).
+  const showCta       = openCourts > 0 && queue.length === 0;
 
   return (
     <div className="min-h-screen">
@@ -1351,7 +1683,17 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
       {announcement && (
         <div className="bg-lime-400 text-zinc-950 px-8 py-4 flex items-center gap-4">
           <Megaphone className="w-7 h-7 shrink-0" />
-          <p className="font-bold text-xl leading-snug">{announcement}</p>
+          <p className="font-bold text-2xl leading-snug">{announcement}</p>
+        </div>
+      )}
+
+      {/* ── COURTS-AVAILABLE CALL TO ACTION (spec §6) ── */}
+      {showCta && (
+        <div className="bg-lime-400 text-zinc-950 px-8 py-3 flex items-center justify-center gap-3 text-center">
+          <Check className="w-7 h-7 shrink-0" strokeWidth={3} />
+          <p className="font-display text-3xl sm:text-4xl">
+            {openCourts} COURT{openCourts > 1 ? 'S' : ''} AVAILABLE — CHECK IN AT THE DESK!
+          </p>
         </div>
       )}
 
@@ -1362,7 +1704,7 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
         <div className="flex items-center justify-between mb-6">
           <div>
             <div className="font-display text-5xl text-lime-400 leading-none mb-1">COURTFLOW</div>
-            <div className="flex items-center gap-4 text-sm text-zinc-500">
+            <div className="flex items-center gap-4 text-base text-zinc-400">
               <span>
                 <span className="text-zinc-200 font-semibold">{activeCourts}</span> courts active
               </span>
@@ -1438,7 +1780,7 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                       )}
                     </div>
                   ) : (
-                    <span className={`font-display text-3xl ${isRental ? 'text-amber-700' : 'text-zinc-700'}`}>
+                    <span className={`font-display text-6xl leading-none ${isRental ? 'text-amber-400' : 'text-lime-400'}`}>
                       {isRental ? 'AVAILABLE' : 'OPEN'}
                     </span>
                   )}
@@ -1510,8 +1852,15 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                     </div>
                   </>
                 ) : (
-                  <div className={`text-center py-16 font-display text-3xl border-t border-zinc-800/50 ${isRental ? 'text-amber-800' : 'text-zinc-700'}`}>
-                    {isRental ? 'AVAILABLE TO RENT' : 'WAITING FOR PLAYERS'}
+                  <div className="text-center py-14 border-t border-zinc-800/50">
+                    <div className={`font-display text-4xl ${isRental ? 'text-amber-400' : 'text-lime-400'}`}>
+                      {isRental ? 'AVAILABLE TO RENT' : 'WAITING FOR PLAYERS'}
+                    </div>
+                    {!isRental && (
+                      <div className="mt-2 text-lg font-semibold text-zinc-300">
+                        Check in at the desk to play
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -1533,11 +1882,11 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
           </div>
 
           {queue.length === 0 ? (
-            <div className="bg-zinc-900 border-2 border-dashed border-zinc-800 rounded-2xl p-12 text-center">
-              <p className="font-display text-3xl text-zinc-700 mb-2">QUEUE EMPTY</p>
-              <p className="text-zinc-600 text-sm">
-                {courts.some(c => c.type === 'open' && !c.match)
-                  ? `${courts.filter(c => c.type === 'open' && !c.match).length} court(s) ready — check in with staff`
+            <div className="bg-zinc-900 border-2 border-dashed border-zinc-700 rounded-2xl p-10 text-center">
+              <p className="font-display text-4xl text-zinc-400 mb-2">QUEUE EMPTY</p>
+              <p className="text-zinc-300 text-lg font-semibold">
+                {openCourts > 0
+                  ? `${openCourts} court${openCourts > 1 ? 's' : ''} ready — check in at the desk!`
                   : 'All courts are currently in use'}
               </p>
             </div>
@@ -1588,7 +1937,8 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                             {groupPlayers.slice(team * 2, team * 2 + 2).map(p => (
                               <div key={p.id} className="flex items-center gap-1.5 mb-1.5 last:mb-0">
                                 <div className={`w-2 h-2 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
-                                <span className="font-display text-xl leading-tight">{p.name}</span>
+                                <span className="font-display text-xl leading-tight flex-1">{p.name}</span>
+                                <PaymentBadge payment={p.payment} dot title={paymentInfo(p.payment).label} />
                               </div>
                             ))}
                           </div>
@@ -1598,8 +1948,9 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                       <div className="space-y-2">
                         {groupPlayers.map(p => (
                           <div key={p.id} className="flex items-center gap-2">
-                            <div className={`w-2.5 h-2.5 rounded-full ${skillStyleSolid(p.skill)}`} />
-                            <span className="font-display text-2xl">{p.name}</span>
+                            <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
+                            <span className="font-display text-2xl flex-1">{p.name}</span>
+                            <PaymentBadge payment={p.payment} dot title={paymentInfo(p.payment).label} />
                           </div>
                         ))}
                       </div>
@@ -1780,6 +2131,163 @@ function LeaderboardModal({ leaderboard, history, onClose }) {
   );
 }
 
+/* ─────────────────────────────────────────────
+   CHECKOUT (spec §3)
+   Shown when a court session ends. Records each player's session length, flags
+   anyone still unpaid, and lets staff take payment on the spot. It never blocks
+   the checkout — the "Complete" button always works; the warning is just a nudge.
+   ───────────────────────────────────────────── */
+function CheckoutModal({ data, playerById, onSetPayment, onComplete, onClose }) {
+  const { courtName, playerIds, startedAt, endedAt, winners } = data;
+  const roster = playerIds.map(playerById).filter(Boolean);
+  const unpaid = roster.filter(p => !isPaid(p.payment));
+  const sessionMs = endedAt - startedAt;
+  const winnerSet = new Set(winners ?? []);
+
+  return (
+    <ModalShell onClose={onClose} title={`Checkout — ${courtName}`} wide>
+      <div className="flex items-center gap-3 mb-4 text-sm">
+        <span className="flex items-center gap-1.5 text-zinc-300">
+          <Clock className="w-4 h-4 text-zinc-500" />
+          Session length: <span className="font-semibold text-lime-400">{fmtDuration(sessionMs)}</span>
+        </span>
+      </div>
+
+      {unpaid.length > 0 && (
+        <div className="bg-rose-950 border border-rose-700 rounded-lg p-3 mb-4 flex items-start gap-2.5">
+          <AlertTriangle className="w-5 h-5 text-rose-300 shrink-0 mt-0.5" />
+          <div className="text-sm text-rose-200">
+            <p className="font-bold mb-0.5">
+              {unpaid.length === 1
+                ? `${unpaid[0].name} hasn't paid yet.`
+                : `${unpaid.length} players haven't paid yet.`}
+            </p>
+            <p className="text-rose-300/90 text-xs">Collect payment below before closing the session.</p>
+          </div>
+        </div>
+      )}
+
+      <div className="space-y-2 mb-5">
+        {roster.map(p => {
+          const info = paymentInfo(p.payment);
+          const paid = isPaid(p.payment);
+          const checkedIn = new Date(p.checkedInAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          return (
+            <div
+              key={p.id}
+              className={`rounded-lg border p-3 ${paid ? 'bg-zinc-950 border-zinc-800' : 'bg-rose-950/40 border-rose-900'}`}
+            >
+              <div className="flex items-center gap-2.5">
+                <PlayerAvatar player={p} size="sm" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-semibold flex items-center gap-2">
+                    <span className="truncate">{p.name}</span>
+                    {winnerSet.has(p.id) && (
+                      <span className="text-[10px] font-bold text-amber-300 flex items-center gap-0.5 shrink-0">
+                        <Crown className="w-3 h-3" /> WON
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-xs text-zinc-500">
+                    In {checkedIn} · here {fmtDuration(endedAt - p.checkedInAt)}
+                  </div>
+                </div>
+                <PaymentBadge payment={p.payment} title={info.label} />
+              </div>
+              {!paid && (
+                <div className="flex gap-2 mt-2.5">
+                  <button
+                    onClick={() => onSetPayment(p.id, 'online')}
+                    className="flex-1 text-xs font-bold py-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 flex items-center justify-center gap-1"
+                  >
+                    <Check className="w-3.5 h-3.5" /> Paid — Online
+                  </button>
+                  <button
+                    onClick={() => onSetPayment(p.id, 'cash')}
+                    className="flex-1 text-xs font-bold py-1.5 rounded-md bg-amber-400 hover:bg-amber-300 text-zinc-950 flex items-center justify-center gap-1"
+                  >
+                    <DollarSign className="w-3.5 h-3.5" /> Paid — Cash
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <button
+        onClick={onComplete}
+        className="w-full bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition"
+      >
+        <Check className="w-4 h-4" />
+        {unpaid.length > 0 ? 'Complete checkout anyway' : 'Complete checkout'}
+      </button>
+    </ModalShell>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   ACTIVITY LOG (spec §9)
+   A simple reverse-chronological list of check-ins, checkouts, payment changes
+   and no-shows. Kept lightweight — a review list, not an analytics surface.
+   ───────────────────────────────────────────── */
+const AUDIT_META = {
+  checkin:  { icon: LogIn,         color: 'text-cyan-400',    label: 'Checked in' },
+  checkout: { icon: LogOut,        color: 'text-zinc-300',    label: 'Checked out' },
+  payment:  { icon: DollarSign,    color: 'text-amber-400',   label: 'Payment updated' },
+  noshow:   { icon: AlertTriangle, color: 'text-rose-400',    label: 'No-show removed' },
+};
+
+function ActivityLogModal({ auditLog, onClose }) {
+  const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  const describe = (e) => {
+    switch (e.type) {
+      case 'checkin':
+        return `${e.payment ? paymentInfo(e.payment).label : 'Unpaid'}`;
+      case 'checkout':
+        return `${e.courtName ? e.courtName + ' · ' : ''}here ${fmtDuration(e.sessionMs ?? 0)} · ${paymentInfo(e.payment).label}`;
+      case 'payment':
+        return `→ ${paymentInfo(e.payment).label}`;
+      case 'noshow':
+        return e.courtName ? `from ${e.courtName}` : '';
+      default:
+        return '';
+    }
+  };
+
+  return (
+    <ModalShell onClose={onClose} title="Activity Log" wide>
+      {auditLog.length === 0 ? (
+        <p className="text-zinc-500 text-center py-10">No activity yet today.</p>
+      ) : (
+        <div className="space-y-1 max-h-[60vh] overflow-y-auto">
+          {auditLog.map(e => {
+            const meta = AUDIT_META[e.type] ?? AUDIT_META.checkin;
+            const Icon = meta.icon;
+            return (
+              <div key={e.id} className="flex items-center gap-3 bg-zinc-950 rounded-lg px-3 py-2">
+                <Icon className={`w-4 h-4 shrink-0 ${meta.color}`} />
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-semibold">
+                    <span className={meta.color}>{meta.label}</span>
+                    <span className="text-zinc-200"> · {e.playerName}</span>
+                  </div>
+                  <div className="text-xs text-zinc-500 truncate">{describe(e)}</div>
+                </div>
+                <span className="text-xs text-zinc-500 shrink-0">{fmtTime(e.at)}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <p className="text-xs text-zinc-600 mt-4 pt-3 border-t border-zinc-800">
+        Showing this session's events (most recent first). Cleared on session reset.
+      </p>
+    </ModalShell>
+  );
+}
+
 function RentalModal({ court, players, busyPlayerIds, onBook, onClose }) {
   const [search, setSearch]     = useState('');
   const [selectedId, setSelectedId] = useState(null);
@@ -1866,18 +2374,22 @@ function CameraModal({ playerName, onSave, onClose }) {
   const canvasRef = useRef(null);
   const streamRef = useRef(null);
   const [captured, setCaptured] = useState(null);
-  const [error, setError]       = useState(null);
 
   useEffect(() => {
+    let cancelled = false;
     navigator.mediaDevices
-      .getUserMedia({ video: { facingMode: 'user', width: { ideal: 400 }, height: { ideal: 400 } } })
+      ?.getUserMedia({ video: { facingMode: 'user', width: { ideal: 400 }, height: { ideal: 400 } } })
       .then(s => {
+        if (cancelled) { s.getTracks().forEach(t => t.stop()); return; }
         streamRef.current = s;
         if (videoRef.current) videoRef.current.srcObject = s;
       })
-      .catch(err => setError(err.message));
-    return () => { streamRef.current?.getTracks().forEach(t => t.stop()); };
-  }, []);
+      // No camera, or permission denied → silently skip the photo step rather
+      // than blocking check-in with an error modal (spec §5). The parent already
+      // pre-checks for a camera, so this is the belt-and-braces fallback.
+      .catch(() => { if (!cancelled) onClose(); });
+    return () => { cancelled = true; streamRef.current?.getTracks().forEach(t => t.stop()); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const capture = () => {
     const v = videoRef.current;
@@ -1901,15 +2413,7 @@ function CameraModal({ playerName, onSave, onClose }) {
   return (
     <ModalShell onClose={onClose} title={`Photo for ${playerName}`}>
       <canvas ref={canvasRef} className="hidden" />
-      {error ? (
-        <div className="text-center py-8">
-          <p className="text-rose-400 mb-2">Camera unavailable</p>
-          <p className="text-zinc-500 text-sm mb-4">{error}</p>
-          <button onClick={onClose} className="px-6 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-semibold rounded-lg">
-            Skip Photo
-          </button>
-        </div>
-      ) : captured ? (
+      {captured ? (
         <div className="text-center">
           <img src={captured} alt="Preview" className="w-48 h-48 rounded-full object-cover mx-auto mb-5 border-4 border-lime-500" />
           <div className="flex gap-3 justify-center">

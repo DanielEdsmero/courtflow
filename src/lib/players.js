@@ -5,6 +5,8 @@ import { supabase } from './supabase';
 // rolls back on error, so the UI never waits on the network.
 
 // The DB column is photo_url; the UI has always called it `player.photo`.
+// checked_in_at comes back as an ISO string; the UI does arithmetic on it
+// (session duration), so hand it over as an epoch-ms number like the match times.
 const fromRow = (r) => ({
   id: r.id,
   name: r.name,
@@ -12,6 +14,8 @@ const fromRow = (r) => ({
   wins: r.wins,
   losses: r.losses,
   photo: r.photo_url,
+  payment: r.payment ?? 'unpaid',
+  checkedInAt: r.checked_in_at ? new Date(r.checked_in_at).getTime() : Date.now(),
 });
 
 export async function listPlayers(venueId) {
@@ -24,14 +28,22 @@ export async function listPlayers(venueId) {
   return data.map(fromRow);
 }
 
-export async function createPlayer(venueId, { name, skill }) {
+export async function createPlayer(venueId, { name, skill, payment = 'unpaid' }) {
   const { data, error } = await supabase
     .from('players')
-    .insert({ venue_id: venueId, name, skill })
+    .insert({ venue_id: venueId, name, skill, payment, checked_in_at: new Date().toISOString() })
     .select()
     .single();
   if (error) throw error;
   return fromRow(data);
+}
+
+export async function updatePlayerPayment(playerId, payment) {
+  const { error } = await supabase
+    .from('players')
+    .update({ payment })
+    .eq('id', playerId);
+  if (error) throw error;
 }
 
 export async function deletePlayer(playerId) {

@@ -13,4 +13,7 @@
 
 html {
   background: #09090b;
+  /* Nudge the base up from 16px so the whole rem-based type scale reads a touch
+     larger and more legible on the staff dashboard and the customer TV alike. */
+  font-size: 106.25%; /* 17px */
 }
