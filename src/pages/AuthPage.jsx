@@ -43,14 +43,24 @@ export default function AuthPage({ mode }) {
   const ready = email.includes('@') && password.length >= 6;
 
   return (
-    <div className="font-body min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-4 sm:p-6">
-      <div className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 sm:p-8 w-full max-w-sm shadow-2xl">
+    <div className="font-body relative min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-4 sm:p-6 overflow-hidden">
+      {/* Ambient aurora — subtle drifting light behind the card (§1). Decorative
+          and pointer-events-none, so it never sits between the user and the form. */}
+      <div className="cf-aurora" aria-hidden />
+
+      <div className="cf-fade-up relative z-10 bg-zinc-900/90 backdrop-blur-sm border border-zinc-800 rounded-2xl p-6 sm:p-8 w-full max-w-sm shadow-2xl">
         <div className="flex items-center gap-3 mb-6">
-          <div className="w-10 h-10 bg-lime-400 rounded-md flex items-center justify-center shrink-0">
+          <div className="w-10 h-10 bg-lime-400 rounded-md flex items-center justify-center shrink-0 shadow-[0_0_20px_-4px_rgba(190,242,100,0.6)]">
             <Activity className="w-6 h-6 text-zinc-950" strokeWidth={3} />
           </div>
           <div>
-            <div className="font-display text-3xl text-lime-400 leading-none">COURTFLOW</div>
+            <div className="font-display text-3xl text-lime-400 leading-none" aria-label="COURTFLOW">
+              {'COURTFLOW'.split('').map((ch, i) => (
+                <span key={i} className="cf-letter" style={{ '--cf-delay': `${150 + i * 55}ms` }} aria-hidden>
+                  {ch}
+                </span>
+              ))}
+            </div>
             <p className="text-zinc-500 text-xs mt-1">
               {isSignUp ? 'Create your venue account' : 'Sign in to your venue'}
             </p>
@@ -67,7 +77,7 @@ export default function AuthPage({ mode }) {
             autoComplete="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-700 focus:border-lime-500 focus:outline-none rounded-xl px-4 py-3 text-sm text-white mb-4 transition-colors"
+            className="w-full bg-zinc-950 border border-zinc-700 focus:border-lime-500 focus:outline-none focus:ring-2 focus:ring-lime-500/25 focus:shadow-[0_0_18px_-6px_rgba(190,242,100,0.5)] rounded-xl px-4 py-3 text-sm text-white mb-4 transition duration-200"
           />
 
           <label className="block text-xs font-semibold text-zinc-400 mb-1.5" htmlFor="password">
@@ -79,7 +89,7 @@ export default function AuthPage({ mode }) {
             autoComplete={isSignUp ? 'new-password' : 'current-password'}
             value={password}
             onChange={(e) => setPassword(e.target.value)}
-            className="w-full bg-zinc-950 border border-zinc-700 focus:border-lime-500 focus:outline-none rounded-xl px-4 py-3 text-sm text-white mb-2 transition-colors"
+            className="w-full bg-zinc-950 border border-zinc-700 focus:border-lime-500 focus:outline-none focus:ring-2 focus:ring-lime-500/25 focus:shadow-[0_0_18px_-6px_rgba(190,242,100,0.5)] rounded-xl px-4 py-3 text-sm text-white mb-2 transition duration-200"
           />
           {isSignUp && (
             <p className="text-zinc-600 text-xs mb-3">At least 6 characters.</p>
@@ -91,7 +101,7 @@ export default function AuthPage({ mode }) {
           <button
             type="submit"
             disabled={!ready || busy}
-            className="w-full bg-lime-400 hover:bg-lime-300 disabled:opacity-30 disabled:cursor-not-allowed text-zinc-950 font-bold rounded-xl py-3 mt-2 transition-colors"
+            className="w-full bg-lime-400 hover:bg-lime-300 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100 text-zinc-950 font-bold rounded-xl py-3 mt-2 transition-all duration-150 will-change-transform"
           >
             {busy ? 'Working…' : isSignUp ? 'Create account' : 'Sign in'}
           </button>

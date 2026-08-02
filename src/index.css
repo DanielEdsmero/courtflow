@@ -13,7 +13,183 @@
 
 html {
   background: #09090b;
-  /* Nudge the base up from 16px so the whole rem-based type scale reads a touch
-     larger and more legible on the staff dashboard and the customer TV alike. */
-  font-size: 106.25%; /* 17px */
+  /* Tuned so the staff dashboard fits a single viewport with no page scrolling,
+     while the customer TV — which uses far larger display sizes — stays legible
+     across a room. Everything is rem-based, so this one value scales both. */
+  font-size: 93.75%; /* 15px */
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ANIMATIONS
+   Reusable, subtle motion for the whole app. Everything here animates only
+   `transform`, `opacity` and `filter` so it stays on the compositor and never
+   reflows the page (no CLS). Entrance classes seed their "from" state inside
+   the keyframe's 0% so there's no first-paint flash before the animation runs.
+   All of it is disabled under prefers-reduced-motion at the bottom of the file.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* — Card / panel entrance: fade in while rising a few px — */
+@keyframes cf-fade-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.cf-fade-up {
+  /* `backwards` (not `both`) so the pre-delay "from" state is applied without
+     holding the final transform afterwards — which would otherwise defeat a
+     :hover lift on the same element (empty court cards). */
+  animation: cf-fade-up 0.5s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+
+/* — List-row entrance: fade in sliding from the left. Rows set their own
+     --cf-delay inline for the stagger. — */
+@keyframes cf-slide-in {
+  from { opacity: 0; transform: translateX(-14px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.cf-slide-in {
+  animation: cf-slide-in 0.4s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  animation-delay: var(--cf-delay, 0ms);
+}
+
+/* — Plain fade (crossfades, badges appearing) — */
+@keyframes cf-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.cf-fade-in {
+  animation: cf-fade-in 0.45s ease-out backwards;
+}
+
+/* — Title entrance: each letter fades up in sequence (login screen) — */
+@keyframes cf-letter-in {
+  from { opacity: 0; transform: translateY(0.4em); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.cf-letter {
+  display: inline-block;
+  animation: cf-letter-in 0.55s cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  animation-delay: var(--cf-delay, 0ms);
+}
+
+/* — Confirmation "pop": quick scale up and settle. Retriggered by toggling a
+     key/class in React; used on payment badges. — */
+@keyframes cf-pop {
+  0%   { transform: scale(1); }
+  35%  { transform: scale(1.28); }
+  100% { transform: scale(1); }
+}
+.cf-pop {
+  animation: cf-pop 0.32s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* — Empty-state breathing: a slow, low-contrast pulse so a waiting surface
+     reads as "active and idle" rather than broken. — */
+@keyframes cf-breathe {
+  0%, 100% { opacity: 0.45; }
+  50%      { opacity: 0.85; }
+}
+.cf-breathe {
+  animation: cf-breathe 2.6s ease-in-out infinite;
+}
+
+/* — Shimmer sweep for loading affordances (Group Builder "Auto"). — */
+@keyframes cf-shimmer {
+  from { transform: translateX(-120%); }
+  to   { transform: translateX(120%); }
+}
+.cf-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 20%,
+    rgba(190, 242, 100, 0.18) 50%,
+    transparent 80%
+  );
+  transform: translateX(-120%);
+  animation: cf-shimmer 1.1s ease-in-out infinite;
+}
+
+/* — Login ambient background: two slow-drifting aurora blobs behind the card.
+     Sits in a fixed, pointer-events-none layer so it never blocks the form. — */
+.cf-aurora {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+.cf-aurora::before,
+.cf-aurora::after {
+  content: '';
+  position: absolute;
+  width: 55vw;
+  height: 55vw;
+  min-width: 460px;
+  min-height: 460px;
+  border-radius: 50%;
+  filter: blur(90px);
+  opacity: 0.5;
+  will-change: transform;
+}
+.cf-aurora::before {
+  top: -12%;
+  left: -8%;
+  background: radial-gradient(circle at 30% 30%, rgba(132, 204, 22, 0.45), transparent 62%);
+  animation: cf-aurora-a 20s ease-in-out infinite alternate;
+}
+.cf-aurora::after {
+  bottom: -14%;
+  right: -6%;
+  background: radial-gradient(circle at 60% 60%, rgba(250, 204, 21, 0.28), transparent 62%);
+  animation: cf-aurora-b 26s ease-in-out infinite alternate;
+}
+@keyframes cf-aurora-a {
+  0%   { transform: translate3d(0, 0, 0) scale(1); }
+  100% { transform: translate3d(6vw, 5vh, 0) scale(1.18); }
+}
+@keyframes cf-aurora-b {
+  0%   { transform: translate3d(0, 0, 0) scale(1.1); }
+  100% { transform: translate3d(-5vw, -4vh, 0) scale(1); }
+}
+
+/* — Soft glow used on live customer-display names so they carry across a room. — */
+.cf-text-glow {
+  text-shadow: 0 0 18px rgba(190, 242, 100, 0.35), 0 0 2px rgba(190, 242, 100, 0.2);
+}
+
+/* — Card lift on hover (empty courts, interactive tiles). Kept as its own class
+     so the transition is consistent everywhere. — */
+.cf-lift {
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+.cf-lift:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 10px 28px -12px rgba(0, 0, 0, 0.7);
+}
+
+/* Honour the OS "reduce motion" setting — drop every animation to a plain,
+   instant final state, but keep opacity at 1 so nothing stays invisible. */
+@media (prefers-reduced-motion: reduce) {
+  .cf-fade-up,
+  .cf-slide-in,
+  .cf-fade-in,
+  .cf-letter,
+  .cf-pop,
+  .cf-breathe,
+  .cf-lift {
+    animation: none !important;
+    transition: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+  .cf-shimmer::after,
+  .cf-aurora::before,
+  .cf-aurora::after {
+    animation: none !important;
+  }
+  .cf-lift:hover {
+    transform: none;
+  }
 }

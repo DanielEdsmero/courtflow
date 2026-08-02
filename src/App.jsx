@@ -77,10 +77,24 @@ function Divider() {
    ───────────────────────────────────────────── */
 function PaymentBadge({ payment, dot = false, title }) {
   const info = paymentInfo(payment);
+  // A quick "pop" whenever the status actually changes (spec §4) — confirms a
+  // staff edit at a glance. Seeded from the first value so it never fires on
+  // mount, only on a real change.
+  const prev = useRef(payment);
+  const [pop, setPop] = useState(false);
+  useEffect(() => {
+    if (prev.current === payment) return;
+    prev.current = payment;
+    setPop(true);
+    const t = setTimeout(() => setPop(false), 340);
+    return () => clearTimeout(t);
+  }, [payment]);
+  const popClass = pop ? 'cf-pop' : '';
+
   if (dot) {
     return (
       <span
-        className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${info.dot}`}
+        className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${info.dot} ${popClass}`}
         title={title ?? info.label}
         aria-label={info.label}
       />
@@ -88,7 +102,7 @@ function PaymentBadge({ payment, dot = false, title }) {
   }
   return (
     <span
-      className={`inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded border shrink-0 ${info.badge}`}
+      className={`inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded border shrink-0 ${info.badge} ${popClass}`}
       title={title ?? info.label}
     >
       <span aria-hidden>{info.icon}</span>
@@ -276,6 +290,8 @@ export default function App() {
       // The timer running out just frees the court — the players go back to the
       // roster, still checked in. Checking out (leaving for the day) is a separate
       // roster action, so nothing is logged or finalised here.
+      // With Auto-Filling on, an expired open-play group rotates back into the queue.
+      if (c.type !== 'rental') requeueGroup(c.match.players);
     });
     setCourts(prev => prev.map(c =>
       expired.find(e => e.id === c.id) ? { ...c, match: null } : c
@@ -522,6 +538,29 @@ export default function App() {
     });
   };
 
+  // Auto-requeue: with Auto-Filling on, an open-play group that finishes drops
+  // straight back onto the end of the queue, so play rotates without staff having
+  // to rebuild the group. Checked-out players are left out; rentals never requeue.
+  // Once queued they can be freely dragged to swap opponents or fill a short group.
+  const requeueGroup = (playerIds) => {
+    if (!autoAssign) return;
+    const eligible = playerIds.filter(id => {
+      const p = players.find(pl => pl.id === id);
+      return p && !p.checkedOut;
+    });
+    if (eligible.length === 0) return;
+    setQueue(prev => [...prev, { id: Date.now() + Math.random(), players: eligible, type: 'requeue' }]);
+  };
+
+  // Pull a single player out of the queue and back to the roster — staff need to
+  // peel one person off a group (e.g. to check them out) without deleting the
+  // whole group. Removing them clears their busy flag, so they reappear in the
+  // roster automatically. A group emptied by the removal is dropped.
+  const removePlayerFromQueue = (playerId) =>
+    setQueue(prev => prev
+      .map(g => (g.players.includes(playerId) ? { ...g, players: g.players.filter(id => id !== playerId) } : g))
+      .filter(g => g.players.length > 0));
+
   const clearCourtCasual = (courtId) => {
     const court = courts.find(c => c.id === courtId);
     if (!court?.match) return;
@@ -538,6 +577,8 @@ export default function App() {
     // Players return to the roster — no checkout here.
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
     recordMatchHistory(venueId, { ...entry, courtName: court.name });
+    // Open-play groups rotate back into the queue when Auto-Filling is on.
+    if (court.type !== 'rental') requeueGroup(court.match.players);
   };
 
   const finishMatch = (courtId, winningPair) => {
@@ -569,6 +610,8 @@ export default function App() {
     recordResult(players, winners, losers).catch(err =>
       console.error('Failed to save win/loss:', err));
     recordMatchHistory(venueId, { ...entry, courtName: court.name });
+    // Both teams rotate back into the queue when Auto-Filling is on.
+    requeueGroup(court.match.players);
   };
 
   const addCourt = () => {
@@ -736,28 +779,32 @@ export default function App() {
   }
 
   return (
-    <div className="font-body min-h-screen bg-zinc-950 text-zinc-100">
+    /* The staff dashboard is a fixed-height app frame on desktop: the page itself
+       never scrolls, and each panel scrolls internally instead. Below `lg` the
+       lock is released and the document scrolls normally (three side-by-side
+       columns can't fit a phone viewport). */
+    <div className="font-body min-h-screen lg:h-screen lg:overflow-hidden lg:flex lg:flex-col bg-zinc-950 text-zinc-100">
       {/* ── HEADER ─────────────────────────────── */}
-      <header className="border-b border-zinc-800 bg-zinc-950 sticky top-0 z-30">
-        <div className="px-4 sm:px-6 py-3 sm:py-4 flex items-center justify-between gap-3 flex-wrap">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 bg-lime-400 rounded-md flex items-center justify-center shrink-0">
+      <header className="border-b border-zinc-800 bg-zinc-950 sticky top-0 z-30 shrink-0">
+        <div className="px-4 sm:px-6 py-2 flex items-center justify-between gap-3 flex-wrap">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 bg-lime-400 rounded-md flex items-center justify-center shrink-0">
               <Activity className="w-5 h-5 text-zinc-950" strokeWidth={3} />
             </div>
             <div className="min-w-0">
-              <h1 className="font-display text-2xl text-lime-400 leading-none">COURTFLOW</h1>
-              <p className="text-xs text-zinc-500 mt-0.5 truncate">{venue.name}</p>
+              <h1 className="font-display text-xl text-lime-400 leading-none">COURTFLOW</h1>
+              <p className="text-[11px] text-zinc-500 mt-0.5 truncate">{venue.name}</p>
             </div>
           </div>
 
           {/* Toolbar — three logical groups (left toggle · centre session controls ·
               right actions) separated by subtle dividers (spec §4A). */}
-          <div className="flex items-center gap-2 flex-wrap justify-end">
+          <div className="flex items-center gap-1.5 flex-wrap justify-end">
                 {/* LEFT — view toggle */}
-                <div className="flex bg-zinc-900 rounded-lg p-1 border border-zinc-800">
+                <div className="flex bg-zinc-900 rounded-lg p-0.5 border border-zinc-800">
                   <button
                     onClick={() => setView('staff')}
-                    className={`px-3 sm:px-4 py-1.5 rounded-md text-sm font-semibold flex items-center gap-2 transition ${
+                    className={`px-2.5 sm:px-3 py-1 rounded-md text-sm font-semibold flex items-center gap-2 transition ${
                       view === 'staff' ? 'bg-lime-400 text-zinc-950' : 'text-zinc-400 hover:text-zinc-200'
                     }`}
                   >
@@ -765,7 +812,7 @@ export default function App() {
                   </button>
                   <button
                     onClick={() => setView('display')}
-                    className={`px-3 sm:px-4 py-1.5 rounded-md text-sm font-semibold flex items-center gap-2 transition ${
+                    className={`px-2.5 sm:px-3 py-1 rounded-md text-sm font-semibold flex items-center gap-2 transition ${
                       view === 'display' ? 'bg-lime-400 text-zinc-950' : 'text-zinc-400 hover:text-zinc-200'
                     }`}
                   >
@@ -778,10 +825,10 @@ export default function App() {
                     <Divider />
 
                     {/* CENTRE — session controls: Auto, timer, mode */}
-                    <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex items-center gap-1.5 flex-wrap">
                       <button
                         onClick={() => setAutoAssign(v => !v)}
-                        className={`px-3 py-2 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
+                        className={`px-2.5 py-1.5 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
                           autoAssign
                             ? 'bg-cyan-500 text-zinc-950 border-cyan-400 hover:bg-cyan-400'
                             : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
@@ -795,7 +842,7 @@ export default function App() {
                       </button>
 
                       {/* Default open-play session time */}
-                      <div className="flex items-center gap-1.5 bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1.5">
+                      <div className="flex items-center gap-1.5 bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1">
                         <Clock className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
                         <select
                           value={defaultOpenDuration === null ? 'none' : String(defaultOpenDuration)}
@@ -816,7 +863,7 @@ export default function App() {
                       {/* Competitive mode */}
                       <button
                         onClick={() => setCompetitiveMode(v => !v)}
-                        className={`px-3 py-2 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
+                        className={`px-2.5 py-1.5 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
                           competitiveMode
                             ? 'bg-rose-500 text-zinc-950 border-rose-400 hover:bg-rose-400'
                             : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
@@ -832,7 +879,7 @@ export default function App() {
                       {competitiveMode && (
                         <button
                           onClick={() => setShowLeaderboard(true)}
-                          className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
+                          className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
                         >
                           <Crown className="w-4 h-4" /> Leaderboard
                         </button>
@@ -842,10 +889,10 @@ export default function App() {
                     <Divider />
 
                     {/* RIGHT — display link, announce, log, reset, sign out */}
-                    <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex items-center gap-1.5 flex-wrap">
                       <button
                         onClick={() => setShowDisplayLink(true)}
-                        className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
+                        className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
                         title="Get the link to open on your TV"
                       >
                         <Monitor className="w-4 h-4" /> Display Link
@@ -853,7 +900,7 @@ export default function App() {
 
                       <button
                         onClick={() => setShowAnnouncementBar(v => !v)}
-                        className={`px-3 py-2 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
+                        className={`px-2.5 py-1.5 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
                           announcement
                             ? 'bg-lime-400 text-zinc-950 border-lime-300 hover:bg-lime-300'
                             : showAnnouncementBar
@@ -868,7 +915,7 @@ export default function App() {
 
                       <button
                         onClick={() => setShowActivityLog(true)}
-                        className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
+                        className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
                         title="Check-in, checkout and payment history"
                       >
                         <ClipboardList className="w-4 h-4" /> Log
@@ -876,14 +923,14 @@ export default function App() {
 
                       <button
                         onClick={resetSession}
-                        className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-rose-950 hover:text-rose-300 hover:border-rose-900 text-sm font-semibold flex items-center gap-2"
+                        className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-rose-950 hover:text-rose-300 hover:border-rose-900 text-sm font-semibold flex items-center gap-2"
                       >
                         <RotateCcw className="w-4 h-4" /> Reset
                       </button>
 
                       <button
                         onClick={signOut}
-                        className="px-3 py-2 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-200 text-sm font-semibold flex items-center gap-2"
+                        className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-200 text-sm font-semibold flex items-center gap-2"
                         title="Sign out"
                       >
                         <LogOut className="w-4 h-4" />
@@ -896,7 +943,7 @@ export default function App() {
 
         {/* ── ANNOUNCEMENT BAR (staff only) ─── */}
         {view === 'staff' && showAnnouncementBar && (
-          <div className="border-t border-zinc-800 bg-zinc-900 px-4 sm:px-6 py-3">
+          <div className="border-t border-zinc-800 bg-zinc-900 px-4 sm:px-6 py-2">
             <div className="flex items-center gap-3">
               <Megaphone className="w-4 h-4 text-lime-400 shrink-0" />
               <input
@@ -929,7 +976,11 @@ export default function App() {
         )}
       </header>
 
-      {/* ── VIEWS ─────────────────────────────── */}
+      {/* ── VIEWS ───────────────────────────────
+          `min-h-0` is what lets this flex child shrink to the leftover height
+          instead of growing to fit its content — without it the 100vh lock on
+          the wrapper above silently does nothing. */}
+      <main className="lg:flex-1 lg:min-h-0">
       {view === 'staff' ? (
         <StaffView
           competitiveMode={competitiveMode}
@@ -961,6 +1012,7 @@ export default function App() {
           setShowAssign={setShowAssign}
           setShowRental={setShowRental}
           removeFromQueue={removeFromQueue}
+          removePlayerFromQueue={removePlayerFromQueue}
           movePlayerToQueueGroup={movePlayerToQueueGroup}
           dropOnQueuePlayer={dropOnQueuePlayer}
           draggingPlayerId={draggingPlayerId}
@@ -987,6 +1039,7 @@ export default function App() {
           playerById={playerById}
         />
       )}
+      </main>
 
       {/* ── MODALS ─────────────────────────────── */}
       {showAssign !== null && (
@@ -1273,6 +1326,9 @@ function PlayerCheckInField({
    ───────────────────────────────────────────── */
 function CheckedOutBox({ players, onCheckIn }) {
   const [search, setSearch] = useState('');
+  // Collapsed by default: this list is consulted occasionally, and left open it
+  // was the single biggest reason the dashboard outgrew the viewport.
+  const [open, setOpen] = useState(false);
   const q = search.trim().toLowerCase();
   const list = useMemo(
     () => players
@@ -1282,56 +1338,62 @@ function CheckedOutBox({ players, onCheckIn }) {
   );
 
   return (
-    <div className="mt-6">
-      <h2 className="font-display text-xl text-zinc-300 tracking-wide mb-3 flex items-center gap-2">
-        CHECKED OUT <span className="text-zinc-600 text-base">({players.length})</span>
-      </h2>
-      <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
-        {players.length === 0 ? (
-          <p className="p-4 text-sm text-zinc-500 text-center">
-            No one’s checked out yet. Players you check out are saved here — find
-            them by name to check them back in.
-          </p>
-        ) : (
-          <>
-            <div className="p-3.5 border-b border-zinc-800">
-              <div className="relative">
-                <Search className="w-4 h-4 absolute left-3 top-2.5 text-zinc-500" />
-                <input
-                  value={search}
-                  onChange={e => setSearch(e.target.value)}
-                  placeholder="Search checked-out players..."
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded-md pl-9 pr-3 py-2 text-sm focus:outline-none focus:border-lime-500"
-                />
-              </div>
-            </div>
-            <div className="max-h-72 overflow-y-auto">
-              {list.length === 0 && (
-                <p className="p-4 text-sm text-zinc-500 text-center">No checked-out players match.</p>
-              )}
-              {list.map(p => (
-                <div
-                  key={p.id}
-                  className="px-3.5 py-2.5 flex items-center gap-2.5 border-b border-zinc-800 last:border-0"
-                >
-                  <div className={`w-2 h-2 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-semibold truncate text-zinc-300">{p.name}</div>
-                    <div className="text-xs text-zinc-500">{p.skill} • {p.wins}W {p.losses}L</div>
-                  </div>
-                  <button
-                    onClick={() => onCheckIn(p.id, 'unpaid')}
-                    className="text-xs font-bold px-2.5 py-1.5 rounded-md bg-lime-400 text-zinc-950 hover:bg-lime-300 flex items-center gap-1 shrink-0"
-                    title={`Check ${p.name} back in`}
-                  >
-                    <LogIn className="w-3.5 h-3.5" /> Check in
-                  </button>
+    <div className="mt-2 shrink-0">
+      <button
+        onClick={() => setOpen(v => !v)}
+        aria-expanded={open}
+        className="w-full flex items-center gap-2 py-1.5 text-zinc-300 hover:text-zinc-100 transition"
+      >
+        <ChevronRight className={`w-4 h-4 text-zinc-500 transition-transform ${open ? 'rotate-90' : ''}`} />
+        <span className="font-display text-sm tracking-wide">CHECKED OUT</span>
+        <span className="text-zinc-600 text-xs">({players.length})</span>
+      </button>
+      {open && (
+        <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
+          {players.length === 0 ? (
+            <p className="p-2.5 text-xs text-zinc-500 text-center">No one’s checked out yet.</p>
+          ) : (
+            <>
+              <div className="p-2 border-b border-zinc-800">
+                <div className="relative">
+                  <Search className="w-4 h-4 absolute left-3 top-2 text-zinc-500" />
+                  <input
+                    value={search}
+                    onChange={e => setSearch(e.target.value)}
+                    placeholder="Search checked-out players..."
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded-md pl-9 pr-3 py-1.5 text-sm focus:outline-none focus:border-lime-500"
+                  />
                 </div>
-              ))}
-            </div>
-          </>
-        )}
-      </div>
+              </div>
+              <div className="max-h-[140px] overflow-y-auto">
+                {list.length === 0 && (
+                  <p className="p-2.5 text-xs text-zinc-500 text-center">No checked-out players match.</p>
+                )}
+                {list.map(p => (
+                  <div
+                    key={p.id}
+                    className="px-3 py-1.5 flex items-center gap-2 border-b border-zinc-800 last:border-0"
+                  >
+                    <div className={`w-2 h-2 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-semibold truncate text-zinc-300">{p.name}</div>
+                      <div className="text-xs text-zinc-500">{p.skill} • {p.wins}W {p.losses}L</div>
+                    </div>
+                    <button
+                      onClick={() => onCheckIn(p.id, 'unpaid')}
+                      className="p-1.5 rounded-md bg-lime-400 text-zinc-950 hover:bg-lime-300 shrink-0"
+                      title={`Check ${p.name} back in`}
+                      aria-label={`Check ${p.name} back in`}
+                    >
+                      <LogIn className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -1347,7 +1409,7 @@ function StaffView(props) {
     avgGameDurationMs, openPlayCourtCount,
     setSearch, setNewPlayerName, setNewPlayerSkill, setNewPlayerPayment,
     addPlayer, checkInExisting, onCheckoutPlayer, removePlayer, setPlayerPayment, togglePlayerInDraft, saveDraftGroup, autoGroup,
-    setShowAssign, setShowRental, removeFromQueue, movePlayerToQueueGroup, dropOnQueuePlayer,
+    setShowAssign, setShowRental, removeFromQueue, removePlayerFromQueue, movePlayerToQueueGroup, dropOnQueuePlayer,
     draggingPlayerId, setDraggingPlayerId,
     setFinishingCourt, clearCourtCasual, markArrived, removeNoShow,
     addCourt, removeCourt, toggleCourtType, renameCourt, playerById,
@@ -1356,6 +1418,13 @@ function StaffView(props) {
   const [dragOverZone, setDragOverZone] = useState(null);
   // The specific queued player a drag is hovering — the one who'll be swapped out.
   const [dragOverPlayerId, setDragOverPlayerId] = useState(null);
+  // Brief "thinking" state so Auto-group feels deliberate rather than instant (§4).
+  const [autoBusy, setAutoBusy] = useState(false);
+  const runAutoGroup = () => {
+    if (autoBusy) return;
+    setAutoBusy(true);
+    setTimeout(() => { autoGroup(); setAutoBusy(false); }, 550);
+  };
 
   // Checked-out players stay in `players` for re-check-in but are not part of the
   // active roster: they're counted separately and shown in their own box below.
@@ -1363,12 +1432,15 @@ function StaffView(props) {
   const checkedOutPlayers = players.filter(p => p.checkedOut);
 
   return (
-    <div className="p-4 sm:p-6 space-y-6">
+    /* Desktop: a fixed-height column — courts band on top, then the three
+       working panels sharing the leftover height. Each panel scrolls internally
+       so the page itself never grows past the viewport. */
+    <div className="p-3 sm:p-4 flex flex-col gap-3 lg:h-full lg:overflow-hidden">
       {/* COURTS */}
-      <section>
-        <div className="flex items-center justify-between mb-3">
+      <section className="shrink-0 flex flex-col min-h-0">
+        <div className="flex items-center justify-between mb-1.5 shrink-0">
           <div className="flex items-center gap-3">
-            <h2 className="font-display text-xl text-zinc-300 tracking-wide">COURTS</h2>
+            <h2 className="font-display text-xl text-zinc-200 tracking-wide">COURTS</h2>
             {autoAssign && (
               <span className="text-xs font-bold text-cyan-400 bg-cyan-950 border border-cyan-800 px-2 py-0.5 rounded-full flex items-center gap-1">
                 <Zap className="w-3 h-3" /> AUTO-FILLING
@@ -1382,9 +1454,15 @@ function StaffView(props) {
             <Plus className="w-4 h-4" /> Add court
           </button>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-          {courts.map(court => (
+        {/* auto-FIT (not auto-fill): empty tracks collapse, so however many
+            courts exist they stretch to share the full row width — 2 courts →
+            50% each, 4 → 25%, and beyond that they wrap. `min(230px,100%)`
+            keeps a single narrow-screen card from overflowing its container.
+            The band scrolls internally once courts wrap past one row. */}
+        <div className="overflow-y-auto lg:max-h-[38vh] grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr))]">
+          {courts.map((court, i) => (
             <CourtCardStaff
+              index={i}
               key={court.id}
               competitiveMode={competitiveMode}
               court={court}
@@ -1403,12 +1481,15 @@ function StaffView(props) {
       </section>
 
       {/* ROSTER + GROUP BUILDER + QUEUE */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+      {/* `lg:grid-rows-1` is load-bearing: it pins the single row to
+          `minmax(0, 1fr)` of the frame's leftover height. Left auto-sized, the
+          row would grow to its tallest column's content and overflow the lock. */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 lg:grid-rows-1 gap-3 lg:flex-1 lg:min-h-0">
         {/* ROSTER */}
-        <section className="lg:col-span-4">
-          <h2 className="font-display text-xl text-zinc-300 tracking-wide mb-3">ROSTER</h2>
-          <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
-            <div className="p-3.5 border-b border-zinc-800 space-y-2.5">
+        <section className="lg:col-span-4 flex flex-col min-h-0">
+          <h2 className="font-display text-xl text-zinc-200 tracking-wide mb-1.5 shrink-0">ROSTER</h2>
+          <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden flex-1 min-h-0 flex flex-col">
+            <div className="p-2.5 border-b border-zinc-800 space-y-2 shrink-0">
               <PlayerCheckInField
                 newPlayerName={newPlayerName}
                 setNewPlayerName={setNewPlayerName}
@@ -1432,7 +1513,7 @@ function StaffView(props) {
                         key={status}
                         onClick={() => setNewPlayerPayment(status)}
                         title={info.label}
-                        className={`flex-1 text-[11px] font-bold py-1.5 rounded-md border transition flex items-center justify-center gap-1 ${
+                        className={`flex-1 text-[11px] font-bold py-1 rounded-md border transition flex items-center justify-center gap-1 ${
                           active ? info.badge : 'bg-zinc-950 border-zinc-800 text-zinc-400 hover:text-zinc-200'
                         }`}
                       >
@@ -1444,20 +1525,23 @@ function StaffView(props) {
                 </div>
               </div>
               <div className="relative">
-                <Search className="w-4 h-4 absolute left-3 top-2.5 text-zinc-500" />
+                <Search className="w-4 h-4 absolute left-3 top-2 text-zinc-500" />
                 <input
                   value={search}
                   onChange={e => setSearch(e.target.value)}
                   placeholder="Search players..."
-                  className="w-full bg-zinc-950 border border-zinc-800 rounded-md pl-9 pr-3 py-2 text-sm focus:outline-none focus:border-lime-500"
+                  className="w-full bg-zinc-950 border border-zinc-800 rounded-md pl-9 pr-3 py-1.5 text-sm focus:outline-none focus:border-lime-500"
                 />
               </div>
             </div>
-            <div className="max-h-96 overflow-y-auto">
+            {/* The scroller sits on the list alone — putting it (or any new
+                clipping ancestor) around the check-in field above would cut off
+                its returning-player autocomplete dropdown. */}
+            <div className="flex-1 min-h-0 overflow-y-auto">
               {filteredPlayers.length === 0 && (
-                <p className="p-4 text-sm text-zinc-500 text-center">No players match.</p>
+                <p className="p-3 text-xs text-zinc-500 text-center">No players match.</p>
               )}
-              {filteredPlayers.map(p => {
+              {filteredPlayers.map((p, i) => {
                 const busy = busyPlayerIds.has(p.id);
                 const inDraft = draftGroup.includes(p.id);
                 const canDrag = !busy && !inDraft;
@@ -1472,7 +1556,8 @@ function StaffView(props) {
                       requestAnimationFrame(() => setDraggingPlayerId(p.id));
                     }}
                     onDragEnd={() => { _dragId = null; setDraggingPlayerId(null); setDragOverZone(null); setDragOverPlayerId(null); }}
-                    className={`px-3.5 py-2.5 flex items-center gap-2.5 border-b border-zinc-800 last:border-0 transition ${
+                    style={{ '--cf-delay': `${Math.min(i, 12) * 40}ms` }}
+                    className={`cf-slide-in px-3 py-2 flex items-center gap-2 border-b border-zinc-800 last:border-0 transition ${
                       busy ? 'opacity-40' : 'hover:bg-zinc-800'
                     } ${inDraft ? 'bg-lime-950' : ''} ${
                       draggingPlayerId === p.id ? 'opacity-40' : ''
@@ -1501,7 +1586,7 @@ function StaffView(props) {
                             active roster (profile kept for a future re-check-in). */}
                         <button
                           onClick={e => { e.stopPropagation(); onCheckoutPlayer(p.id); }}
-                          className="text-zinc-600 hover:text-lime-400 p-2 -m-1 shrink-0"
+                          className="text-zinc-600 hover:text-lime-400 p-2 -m-1 shrink-0 transition-colors duration-150"
                           title={`Check out ${p.name}`}
                           aria-label={`Check out ${p.name}`}
                         >
@@ -1510,7 +1595,7 @@ function StaffView(props) {
                         {/* Remove — a mistaken entry; deletes the account entirely. */}
                         <button
                           onClick={e => { e.stopPropagation(); removePlayer(p.id); }}
-                          className="text-zinc-600 hover:text-rose-400 p-2 -m-1 shrink-0"
+                          className="text-zinc-600 hover:text-rose-400 p-2 -m-1 shrink-0 transition-colors duration-150"
                           title={`Remove ${p.name}`}
                           aria-label={`Remove ${p.name}`}
                         >
@@ -1522,7 +1607,7 @@ function StaffView(props) {
                 );
               })}
             </div>
-            <div className="px-3 py-2 text-xs text-zinc-500 border-t border-zinc-800">
+            <div className="px-3 py-1.5 text-[11px] text-zinc-500 border-t border-zinc-800 shrink-0">
               {activeCount} checked in · {activeCount - busyPlayerIds.size} available
             </div>
           </div>
@@ -1534,14 +1619,14 @@ function StaffView(props) {
         </section>
 
         {/* GROUP BUILDER */}
-        <section className="lg:col-span-4">
-          <h2 className="font-display text-xl text-zinc-300 tracking-wide mb-3">GROUP BUILDER</h2>
-          <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-4 space-y-3">
-            <p className="text-sm text-zinc-400">
+        <section className="lg:col-span-4 flex flex-col min-h-0">
+          <h2 className="font-display text-xl text-zinc-200 tracking-wide mb-1.5 shrink-0">GROUP BUILDER</h2>
+          <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-2.5 space-y-2 flex-1 min-h-0 flex flex-col">
+            <p className="text-xs text-zinc-400 shrink-0">
               Click roster names to add. <span className="text-zinc-500">{draftGroup.length}/4 selected.</span>
             </p>
             <div
-              className={`space-y-2 min-h-[8rem] rounded-lg p-1 transition ${
+              className={`space-y-2 min-h-[4.5rem] flex-1 lg:min-h-0 overflow-y-auto rounded-lg p-1 transition ${
                 dragOverZone === 'builder' ? 'bg-lime-950/30 ring-2 ring-lime-600' : ''
               }`}
               onDragOver={e => {
@@ -1562,7 +1647,7 @@ function StaffView(props) {
               }}
             >
               {draftGroup.length === 0 && (
-                <div className={`text-sm text-center py-8 border border-dashed rounded-lg transition ${
+                <div className={`text-xs text-center py-4 border border-dashed rounded-lg transition ${
                   draggingPlayerId
                     ? 'text-lime-400 border-lime-600 bg-lime-950/20'
                     : 'text-zinc-600 italic border-zinc-800'
@@ -1574,7 +1659,7 @@ function StaffView(props) {
                 const p = playerById(id);
                 if (!p) return null;
                 return (
-                  <div key={id} className="flex items-center gap-2 bg-zinc-950 rounded-lg p-2 border border-zinc-800">
+                  <div key={id} className="flex items-center gap-2 bg-zinc-950 rounded-lg px-2 py-1.5 border border-zinc-800">
                     <span className={`text-xs px-2 py-0.5 rounded border ${skillStyle(p.skill)}`}>{p.skill}</span>
                     <span className="flex-1 text-sm font-semibold truncate">{p.name}</span>
                     <PaymentBadge payment={p.payment} />
@@ -1585,45 +1670,41 @@ function StaffView(props) {
                 );
               })}
             </div>
-            <div className="flex gap-2">
+            <div className="flex gap-2 shrink-0">
               <button
                 onClick={saveDraftGroup}
                 disabled={draftGroup.length === 0}
-                className="flex-1 bg-lime-400 text-zinc-950 font-bold py-2.5 rounded-lg hover:bg-lime-300 disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                className="flex-1 bg-lime-400 text-zinc-950 font-bold py-2 rounded-lg hover:bg-lime-300 disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                title="Save groups with fewer than 4 to hold spots for arriving players"
               >
                 <Users className="w-4 h-4" /> Save group
               </button>
               <button
-                onClick={autoGroup}
-                className="bg-zinc-800 text-zinc-200 font-semibold py-2.5 px-4 rounded-lg hover:bg-zinc-700 flex items-center gap-2"
-                title="Auto-group 4 available players with balanced teams"
+                onClick={runAutoGroup}
+                disabled={autoBusy}
+                className={`relative overflow-hidden bg-zinc-800 text-zinc-200 font-semibold py-2 px-4 rounded-lg hover:bg-zinc-700 flex items-center gap-2 transition-colors disabled:cursor-wait ${autoBusy ? 'cf-shimmer' : ''}`}
+                title="Auto-group 4 available players and balance the teams (best+worst vs 2nd+3rd)"
               >
-                <Shuffle className="w-4 h-4" /> Auto
+                {autoBusy
+                  ? <><RefreshCw className="w-4 h-4 animate-spin" /> Balancing…</>
+                  : <><Shuffle className="w-4 h-4" /> Auto</>}
               </button>
             </div>
-            <p className="text-xs text-zinc-600 leading-relaxed">
-              <strong className="text-zinc-500">Auto</strong> picks 4 players and balances teams (best+worst vs 2nd+3rd).
-              Save groups with fewer than 4 to hold spots for arriving players.
-            </p>
           </div>
         </section>
 
         {/* QUEUE */}
-        <section className="lg:col-span-4">
-          <div className="flex items-center gap-3 mb-3">
-            <h2 className="font-display text-xl text-zinc-300 tracking-wide">
-              QUEUE <span className="text-zinc-600 text-base">({queue.length})</span>
+        <section className="lg:col-span-4 flex flex-col min-h-0">
+          <div className="flex items-center gap-3 mb-1.5 shrink-0">
+            <h2 className="font-display text-xl text-zinc-200 tracking-wide">
+              QUEUE <span className="text-zinc-600 text-sm">({queue.length})</span>
             </h2>
-            {openPlayCourtCount > 0 && (
-              <span className="text-xs text-zinc-500 flex items-center gap-1">
-                <Clock className="w-3 h-3" /> avg {fmtMinutes(avgGameDurationMs)}/game
-              </span>
-            )}
           </div>
-          <div className="space-y-3">
+          <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-0.5">
             {queue.length === 0 && (
-              <div className="text-sm text-zinc-500 italic flex items-center gap-2 px-4 py-2.5 border border-dashed border-zinc-800 rounded-lg">
-                <Users className="w-4 h-4 text-zinc-600 shrink-0" /> No groups in queue
+              <div className="flex flex-col items-center gap-2 px-3 py-4 border border-dashed border-zinc-800 rounded-xl text-center">
+                <Users className="cf-breathe w-6 h-6 text-zinc-600" />
+                <span className="cf-breathe text-sm text-zinc-500 italic">Waiting for groups…</span>
               </div>
             )}
             {queue.map((g, idx) => {
@@ -1640,7 +1721,8 @@ function StaffView(props) {
               return (
                 <div
                   key={g.id}
-                  className={`bg-zinc-900 rounded-xl border p-3 transition ${
+                  style={{ animationDelay: `${Math.min(idx, 8) * 60}ms` }}
+                  className={`cf-fade-up bg-zinc-900 rounded-xl border p-2.5 transition ${
                     dragOverZone === g.id
                       ? 'border-lime-500 ring-1 ring-lime-600 bg-lime-950/10'
                       : canDrop ? 'border-lime-800'
@@ -1657,11 +1739,11 @@ function StaffView(props) {
                       movePlayerToQueueGroup(g.id, id);
                   }}
                 >
-                  <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center justify-between mb-1.5">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-display text-2xl text-lime-400">#{idx + 1}</span>
+                      <span className="font-display text-xl text-lime-400">#{idx + 1}</span>
                       <span className="text-xs uppercase tracking-wider text-zinc-500">
-                        {g.type === 'auto' ? 'Auto-grouped' : 'Manual'}
+                        {g.type === 'auto' ? 'Auto-grouped' : g.type === 'requeue' ? 'Re-queued' : 'Manual'}
                       </span>
                       <span className={`text-xs px-1.5 py-0.5 rounded ${skillStyleSolid(SKILL_TIERS[avgSkill])} bg-opacity-20 text-zinc-300`}>
                         avg {SKILL_TIERS[avgSkill]}
@@ -1681,11 +1763,11 @@ function StaffView(props) {
                         </span>
                       ) : null}
                     </div>
-                    <button onClick={() => removeFromQueue(g.id)} className="text-zinc-600 hover:text-rose-400">
+                    <button onClick={() => removeFromQueue(g.id)} className="text-zinc-600 hover:text-rose-400 transition-colors duration-150">
                       <X className="w-4 h-4" />
                     </button>
                   </div>
-                  <div className="space-y-1 mb-3">
+                  <div className="space-y-0.5 mb-2">
                     {groupPlayers.map(p => {
                       const canSwapHere = !!_dragId && _dragId !== p.id;
                       return (
@@ -1729,6 +1811,16 @@ function StaffView(props) {
                         <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
                         <span className="flex-1 truncate">{p.name}</span>
                         <PaymentBadge payment={p.payment} dot title={`${p.name} — ${paymentInfo(p.payment).label}`} />
+                        {/* Pull this one player back to the roster without touching
+                            the rest of the group — e.g. to check them out. */}
+                        <button
+                          onClick={e => { e.stopPropagation(); removePlayerFromQueue(p.id); }}
+                          className="text-zinc-600 hover:text-rose-400 shrink-0 p-1 -m-1 transition-colors duration-150"
+                          title={`Remove ${p.name} from queue`}
+                          aria-label={`Remove ${p.name} from queue`}
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
                       </div>
                       );
                     })}
@@ -1743,7 +1835,7 @@ function StaffView(props) {
                   <button
                     onClick={() => setShowAssign(g.id)}
                     disabled={groupPlayers.length < 4}
-                    className="w-full bg-zinc-800 hover:bg-lime-400 hover:text-zinc-950 text-sm font-semibold py-2 rounded-lg flex items-center justify-center gap-2 transition disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-zinc-800 disabled:hover:text-current"
+                    className="w-full bg-zinc-800 hover:bg-lime-400 hover:text-zinc-950 text-sm font-semibold py-1.5 rounded-lg flex items-center justify-center gap-2 transition disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-zinc-800 disabled:hover:text-current"
                   >
                     Assign to court <ChevronRight className="w-4 h-4" />
                   </button>
@@ -1780,7 +1872,7 @@ function PlayerAvatar({ player, size }) {
 /* ─────────────────────────────────────────────
    COURT CARD (STAFF) — double-click name to rename
    ───────────────────────────────────────────── */
-function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear, onRemove, onToggleType, onRename, onBookRental, onArrived, onNoShow }) {
+function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinish, onClear, onRemove, onToggleType, onRename, onBookRental, onArrived, onNoShow }) {
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(court.name);
   const inputRef = useRef(null);
@@ -1808,17 +1900,24 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
   const calledAgoMs = awaitingArrival ? now - (court.match.calledAt ?? court.match.startedAt) : 0;
   const possibleNoShow = awaitingArrival && calledAgoMs >= NO_SHOW_MINUTES * 60_000;
 
+  // Empty courts get a dashed "placeholder" border + a hover lift; the waiting
+  // pulse is carried by the breathing icon/text in the body (§2). Keeping the
+  // pulse off the card itself leaves the entrance fade-up free to run — an
+  // element can only host one CSS `animation` at a time.
   const borderClass = showTimeUp
     ? 'bg-rose-950 border-rose-600'
     : isPlaying && isRental ? 'bg-amber-950 border-amber-600'
     : isPlaying ? 'bg-lime-950 border-lime-700'
-    : isRental ? 'bg-zinc-900 border-amber-800 border-dashed'
-    : 'bg-zinc-900 border-zinc-800';
+    : isRental ? 'bg-zinc-900 border-amber-800 border-dashed cf-lift'
+    : 'bg-zinc-900 border-zinc-800 border-dashed cf-lift';
 
   return (
-    <div className={`rounded-xl border-2 p-5 transition ${borderClass}`}>
+    <div
+      className={`cf-fade-up rounded-xl border p-3 transition ${borderClass}`}
+      style={{ animationDelay: `${index * 60}ms` }}
+    >
       {/* Header */}
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex items-center justify-between mb-1.5">
         <div className="flex items-center gap-2">
           {editing ? (
             <input
@@ -1830,11 +1929,11 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
                 if (e.key === 'Enter') commitRename();
                 if (e.key === 'Escape') { setEditName(court.name); setEditing(false); }
               }}
-              className="font-display text-2xl bg-transparent border-b-2 border-lime-400 outline-none w-28 text-zinc-100"
+              className="font-display text-xl bg-transparent border-b-2 border-lime-400 outline-none w-28 text-zinc-100"
             />
           ) : (
             <h3
-              className="font-display text-2xl cursor-pointer hover:text-lime-400 transition"
+              className="font-display text-xl cursor-pointer hover:text-lime-400 transition"
               onDoubleClick={() => { setEditName(court.name); setEditing(true); }}
               title="Double-click to rename"
             >
@@ -1866,22 +1965,24 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
         </div>
       </div>
 
-      {/* Type toggle + remove */}
-      <div className="flex items-center gap-2 mb-3">
+      {/* Type toggle + remove — label is abbreviated to keep the card short; the
+          full wording lives in the tooltip. */}
+      <div className="flex items-center gap-2 mb-2">
         <button
           onClick={onToggleType}
-          className={`text-[10px] font-bold tracking-wider px-2 py-1 rounded border transition flex-1 ${
+          title={isRental ? 'Switch to open play' : 'Switch to rental'}
+          className={`text-[10px] font-bold tracking-wider px-2 py-0.5 rounded border transition flex-1 ${
             isRental
               ? 'bg-amber-950 border-amber-700 text-amber-300 hover:bg-amber-900'
               : 'bg-zinc-950 border-zinc-700 text-zinc-400 hover:text-zinc-200'
           }`}
         >
-          {isRental ? '◀ SWITCH TO OPEN PLAY' : 'SWITCH TO RENTAL ▶'}
+          {isRental ? '◀ OPEN PLAY' : 'RENTAL ▶'}
         </button>
         {!isPlaying && (
           <button
             onClick={onRemove}
-            className="text-zinc-600 hover:text-rose-400 p-2 -m-1 shrink-0"
+            className="text-zinc-600 hover:text-rose-400 p-2 -m-1 shrink-0 transition-colors duration-150"
             title="Remove court"
             aria-label={`Remove ${court.name}`}
           >
@@ -1938,13 +2039,13 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
             })()
           ) : (
             /* Open play — 4-player grid */
-            <div className="grid grid-cols-1 gap-1.5 mb-3">
+            <div className="grid grid-cols-1 gap-1 mb-2">
               {court.match.players.map((id, i) => {
                 const p = playerById(id);
                 if (!p) return null;
                 const teamLabel = i < 2 ? 'T1' : 'T2';
                 return (
-                  <div key={id} className="flex items-center gap-2 bg-zinc-950 bg-opacity-50 rounded px-2 py-1.5">
+                  <div key={id} className="flex items-center gap-2 bg-zinc-950 bg-opacity-50 rounded px-2 py-1">
                     <span className="text-xs text-zinc-500 font-mono w-6">{teamLabel}</span>
                     <PlayerAvatar player={p} size="sm" />
                     <span className="text-sm font-semibold flex-1 truncate">{p.name}</span>
@@ -1958,14 +2059,14 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
           {(competitiveMode && !isRental) ? (
             <button
               onClick={onFinish}
-              className="w-full bg-zinc-950 hover:bg-zinc-100 hover:text-zinc-950 border border-zinc-700 text-sm font-bold py-2 rounded-lg transition"
+              className="w-full bg-zinc-950 hover:bg-zinc-100 hover:text-zinc-950 border border-zinc-700 text-sm font-bold py-1.5 rounded-lg transition"
             >
               FINISH MATCH
             </button>
           ) : (
             <button
               onClick={onClear}
-              className="w-full bg-zinc-950 hover:bg-zinc-100 hover:text-zinc-950 border border-zinc-700 text-sm font-bold py-2 rounded-lg transition"
+              className="w-full bg-zinc-950 hover:bg-zinc-100 hover:text-zinc-950 border border-zinc-700 text-sm font-bold py-1.5 rounded-lg transition"
             >
               {isRental ? 'END RENTAL' : 'CLEAR COURT'}
             </button>
@@ -1974,12 +2075,13 @@ function CourtCardStaff({ competitiveMode, court, playerById, onFinish, onClear,
       ) : isRental ? (
         <button
           onClick={onBookRental}
-          className="w-full mt-1 bg-amber-500 hover:bg-amber-400 text-zinc-950 font-bold text-sm py-2.5 rounded-lg flex items-center justify-center gap-2"
+          className="w-full bg-amber-500 hover:bg-amber-400 text-zinc-950 font-bold text-sm py-2 rounded-lg flex items-center justify-center gap-2"
         >
           <Plus className="w-4 h-4" /> Book Rental
         </button>
       ) : (
-        <div className="text-center py-7 text-zinc-400 text-base italic">
+        <div className="cf-breathe text-center py-3 text-zinc-400 text-sm italic flex flex-col items-center gap-1">
+          <Users className="w-5 h-5 text-zinc-600" />
           Assign a group from queue
         </div>
       )}
@@ -2004,7 +2106,10 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
   const showCta       = openCourts > 0 && queue.length === 0;
 
   return (
-    <div className="min-h-screen">
+    /* `lg:h-full` + its own scroller so the preview still works inside the
+       staff shell's fixed-height frame; standalone (the public /d/:token page)
+       it just falls back to natural document height. */
+    <div className="min-h-screen lg:h-full lg:min-h-0 lg:overflow-y-auto">
       {/* ── ANNOUNCEMENT BANNER ── */}
       {announcement && (
         <div className="bg-lime-400 text-zinc-950 px-8 py-4 flex items-center gap-4">
@@ -2071,8 +2176,14 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
               : isRental ? 'bg-zinc-900 border-amber-700 border-dashed'
               : 'bg-zinc-900 border-zinc-800';
 
+            // Re-keying the body on the status token remounts it, so a change like
+            // EMPTY → OCCUPIED crossfades in rather than snapping (spec §5). The
+            // card's own colours transition at the same time (transition-colors).
+            const statusKey = showTimeUp ? 'timeup' : isPlaying ? (isRental ? 'rental' : 'live') : 'idle';
+
             return (
-              <div key={court.id} className={`rounded-2xl border-2 overflow-hidden ${cardClass}`}>
+              <div key={court.id} className={`rounded-2xl border-2 overflow-hidden transition-colors duration-500 ${cardClass}`}>
+                <div key={statusKey} className="cf-fade-in">
                 {/* ── Card header ── */}
                 <div className="flex items-center justify-between px-5 py-4">
                   <div className="flex items-center gap-3">
@@ -2140,7 +2251,7 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                           >
                             <PlayerAvatar player={p} size="xl" />
                             <div className="mt-3 text-center">
-                              <div className="font-display text-xl leading-tight">{p.name}</div>
+                              <div className="cf-text-glow font-display text-xl leading-tight">{p.name}</div>
                               <span className={`inline-block text-xs px-2 py-0.5 rounded mt-1 border ${skillStyle(p.skill)}`}>
                                 {p.skill}
                               </span>
@@ -2167,7 +2278,7 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                           >
                             <PlayerAvatar player={p} size="xl" />
                             <div className="mt-3 text-center">
-                              <div className="font-display text-xl leading-tight">{p.name}</div>
+                              <div className="cf-text-glow font-display text-xl leading-tight">{p.name}</div>
                               <span className={`inline-block text-xs px-2 py-0.5 rounded mt-1 border ${skillStyle(p.skill)}`}>
                                 {p.skill}
                               </span>
@@ -2189,6 +2300,7 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                     )}
                   </div>
                 )}
+                </div>
               </div>
             );
           })}
@@ -2228,7 +2340,8 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                 return (
                   <div
                     key={g.id}
-                    className={`rounded-2xl p-5 border-2 transition ${
+                    style={{ animationDelay: `${Math.min(idx, 8) * 70}ms` }}
+                    className={`cf-fade-up rounded-2xl p-5 border-2 transition-colors duration-500 ${
                       isImmediateNext
                         ? 'bg-lime-950 border-lime-600'
                         : 'bg-zinc-900 border-zinc-800'
@@ -2239,7 +2352,7 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                       <div>
                         <span className="font-display text-6xl text-lime-400 leading-none">#{idx + 1}</span>
                         <div className="text-xs uppercase tracking-widest text-zinc-500 mt-0.5">
-                          {g.type === 'auto' ? 'Auto-balanced' : 'Group'}
+                          {g.type === 'auto' ? 'Auto-balanced' : g.type === 'requeue' ? 'Back in play' : 'Group'}
                         </div>
                       </div>
                       {isImmediateNext ? (
