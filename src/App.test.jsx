@@ -12,6 +12,18 @@ import {
   PAYMENT_STATUSES,
   matchRoster,
   findExactPlayer,
+  playerForm,
+  formScore,
+  rankByForm,
+  ladderGroup,
+  recentPartners,
+  partnerWeight,
+  balancedFreshGroup,
+  buildAutoGroup,
+  allTimeLeaderboard,
+  RANKED_MIN_GAMES,
+  slugify,
+  isValidSlug,
 } from './lib/logic.js';
 
 /* ── fmtElapsed ─────────────────────────────── */
@@ -355,5 +367,492 @@ describe('Auto-expire court logic', () => {
   it('court with no timer (open duration) never auto-expires', () => {
     const court = { id: 1, type: 'open', match: makeMatch(60 * 60_000, null) };
     expect(shouldExpireCasual(court)).toBe(false);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MATCHING STYLES (spec §F1, §F2)
+   ═══════════════════════════════════════════════════════════════════════ */
+
+// Fixtures. Ids stay numeric — production uses uuids, and the pair keys and sort
+// tie-breaks stringify precisely so both work.
+const evenFour = [
+  { id: 1, name: 'One',   skill: 'Intermediate' },
+  { id: 2, name: 'Two',   skill: 'Intermediate' },
+  { id: 3, name: 'Three', skill: 'Intermediate' },
+  { id: 4, name: 'Four',  skill: 'Intermediate' },
+];
+const evenFive = [...evenFour, { id: 5, name: 'Five', skill: 'Intermediate' }];
+
+const tieredFour = [
+  { id: 1, name: 'Pro',   skill: 'Pro' },
+  { id: 2, name: 'Adv',   skill: 'Advanced' },
+  { id: 3, name: 'Inter', skill: 'Intermediate' },
+  { id: 4, name: 'Nov',   skill: 'Novice' },
+];
+
+const ids = (group) => group.map((p) => p.id);
+const decided = (winners, losers) => ({ players: [...winners, ...losers], winners, losers });
+
+/* ── playerForm ─────────────────────────────── */
+describe('playerForm', () => {
+  it('reads the newest-first history so the first appearance is the latest game', () => {
+    const history = [decided([1, 2], [3, 4]), decided([3, 4], [1, 2])];
+    const form = playerForm(history);
+    expect(form[1]).toEqual({ games: 2, wins: 1, losses: 1, last: 'W' });
+    expect(form[3]).toEqual({ games: 2, wins: 1, losses: 1, last: 'L' });
+  });
+
+  it('skips casual and rental entries that recorded no result', () => {
+    const history = [
+      { players: [1, 2, 3, 4], type: 'casual' },
+      { players: [1], type: 'rental' },
+      decided([1], [2]),
+    ];
+    const form = playerForm(history);
+    expect(form[1]).toEqual({ games: 1, wins: 1, losses: 0, last: 'W' });
+    expect(form[2].last).toBe('L');
+  });
+
+  it('caps the window per player, not as a flat slice of history', () => {
+    // Player 1 plays all six; player 2 only appears in the OLDEST entry, which a
+    // flat history.slice(0, 5) would drop entirely.
+    const history = [
+      decided([1], [9]),
+      decided([1], [9]),
+      decided([1], [9]),
+      decided([1], [9]),
+      decided([1], [9]),
+      decided([1, 2], [9]),
+    ];
+    const form = playerForm(history, 5);
+    expect(form[1]).toEqual({ games: 5, wins: 5, losses: 0, last: 'W' });
+    expect(form[9]).toEqual({ games: 5, wins: 0, losses: 5, last: 'L' });
+    expect(form[2]).toEqual({ games: 1, wins: 1, losses: 0, last: 'W' });
+  });
+
+  it('honours a custom window', () => {
+    const history = [decided([1], [2]), decided([1], [2]), decided([1], [2])];
+    expect(playerForm(history, 2)[1].games).toBe(2);
+  });
+
+  it('returns nothing for an empty or missing history', () => {
+    expect(playerForm([])).toEqual({});
+    expect(playerForm(undefined)).toEqual({});
+    expect(playerForm(null)).toEqual({});
+  });
+});
+
+/* ── formScore ──────────────────────────────── */
+describe('formScore', () => {
+  it('scores an unknown or empty form as exactly 0', () => {
+    expect(formScore(undefined)).toBe(0);
+    expect(formScore(null)).toBe(0);
+    expect(formScore({ games: 0, wins: 0, losses: 0, last: null })).toBe(0);
+  });
+
+  it('puts every won-last player above 0 and every lost-last player below it', () => {
+    // Worst possible "won last" still beats the best possible "lost last".
+    const wonLast = formScore({ games: 5, wins: 1, losses: 4, last: 'W' });
+    const lostLast = formScore({ games: 5, wins: 4, losses: 1, last: 'L' });
+    expect(wonLast).toBeGreaterThan(0);
+    expect(lostLast).toBeLessThan(0);
+    expect(wonLast).toBeGreaterThan(lostLast);
+  });
+
+  it('breaks ties between two winners on their record', () => {
+    const perfect = formScore({ games: 2, wins: 2, losses: 0, last: 'W' });
+    const patchy = formScore({ games: 2, wins: 1, losses: 1, last: 'W' });
+    expect(perfect).toBeGreaterThan(patchy);
+  });
+
+  it('breaks ties between two losers on their record', () => {
+    const decent = formScore({ games: 2, wins: 1, losses: 1, last: 'L' });
+    const dire = formScore({ games: 2, wins: 0, losses: 2, last: 'L' });
+    expect(decent).toBeGreaterThan(dire);
+  });
+});
+
+/* ── rankByForm ─────────────────────────────── */
+describe('rankByForm', () => {
+  it('collapses to plain skill-descending when there is no history (F1 fallback)', () => {
+    const shuffled = [tieredFour[2], tieredFour[0], tieredFour[3], tieredFour[1]];
+    const form = playerForm([]);
+    const legacy = [...shuffled].sort((a, b) => skillRank(b.skill) - skillRank(a.skill));
+    expect(ids(rankByForm(shuffled, form))).toEqual(ids(legacy));
+    expect(ids(rankByForm(shuffled, form))).toEqual([1, 2, 3, 4]);
+  });
+
+  it('ranks a recent winner above a higher-skilled recent loser', () => {
+    const pro = { id: 1, skill: 'Pro' };
+    const beginner = { id: 2, skill: 'Beginner' };
+    const form = playerForm([decided([2], [1])]);
+    expect(ids(rankByForm([pro, beginner], form))).toEqual([2, 1]);
+  });
+
+  it('is deterministic for players that are identical apart from id', () => {
+    const form = playerForm([]);
+    const a = ids(rankByForm(evenFour, form));
+    const b = ids(rankByForm([...evenFour].reverse(), form));
+    expect(a).toEqual(b);
+  });
+});
+
+/* ── ladderGroup ────────────────────────────── */
+describe('ladderGroup', () => {
+  it('returns null when fewer than four are available', () => {
+    expect(ladderGroup(evenFour.slice(0, 3), [])).toBeNull();
+    expect(ladderGroup([], [])).toBeNull();
+    expect(ladderGroup(undefined, [])).toBeNull();
+  });
+
+  it('gives each team one recent winner and one recent loser', () => {
+    const history = [decided([1, 2], [3, 4])];
+    const group = ladderGroup(evenFour, history);
+    const won = new Set([1, 2]);
+    const [t1a, t1b, t2a, t2b] = ids(group);
+    expect(won.has(t1a)).not.toBe(won.has(t1b));
+    expect(won.has(t2a)).not.toBe(won.has(t2b));
+  });
+
+  it('makes the two best performers opponents, not partners', () => {
+    const history = [decided([1, 2], [3, 4])];
+    const group = ids(ladderGroup(evenFour, history));
+    // Slots [0,1] are team 1 and [2,3] team 2, so "not partners" means the two
+    // in-form players land one per team.
+    const teamOf = (id) => (group.indexOf(id) < 2 ? 1 : 2);
+    expect(teamOf(1)).not.toBe(teamOf(2));
+  });
+
+  it('walks down the ladder: the next call groups the next four', () => {
+    const six = [...evenFour, { id: 5, skill: 'Intermediate' }, { id: 6, skill: 'Intermediate' }];
+    const history = [decided([1, 2], [5, 6])];
+    const first = ids(ladderGroup(six, history));
+    // Those four are on court now, so the second call sees only who is left.
+    const rest = six.filter((p) => !first.includes(p.id));
+    expect(rest).toHaveLength(2);
+    expect(ladderGroup(rest, history)).toBeNull();
+  });
+
+  it('equals the plain skill-sorted snake draft when the history is empty', () => {
+    const skillSorted = [...tieredFour].sort((a, b) => skillRank(b.skill) - skillRank(a.skill));
+    expect(ladderGroup(tieredFour, [])).toEqual(balancedGroup(skillSorted));
+  });
+});
+
+/* ── recentPartners / partnerWeight ─────────── */
+describe('recentPartners', () => {
+  it('reads teams from slots [0,1] and [2,3]', () => {
+    const counts = recentPartners([{ players: [1, 2, 3, 4] }]);
+    expect(partnerWeight(counts, 1, 2)).toBeGreaterThan(0);
+    expect(partnerWeight(counts, 3, 4)).toBeGreaterThan(0);
+    // Opponents are not partners.
+    expect(partnerWeight(counts, 1, 3)).toBe(0);
+    expect(partnerWeight(counts, 2, 4)).toBe(0);
+  });
+
+  it('weights the most recent game highest', () => {
+    const counts = recentPartners([{ players: [1, 2, 3, 4] }, { players: [5, 6, 7, 8] }]);
+    expect(partnerWeight(counts, 1, 2)).toBeGreaterThan(partnerWeight(counts, 5, 6));
+  });
+
+  it('accumulates weight for a pair that keeps repeating', () => {
+    const once = recentPartners([{ players: [1, 2, 3, 4] }]);
+    const twice = recentPartners([{ players: [1, 2, 3, 4] }, { players: [1, 2, 5, 6] }]);
+    expect(partnerWeight(twice, 1, 2)).toBeGreaterThan(partnerWeight(once, 1, 2));
+  });
+
+  it('keys pairs independently of order', () => {
+    const counts = recentPartners([{ players: [1, 2, 3, 4] }]);
+    expect(partnerWeight(counts, 2, 1)).toBe(partnerWeight(counts, 1, 2));
+  });
+
+  it('ignores entries with fewer than four players', () => {
+    const counts = recentPartners([{ players: [1, 2, 3] }, { players: [1] }, {}]);
+    expect(partnerWeight(counts, 1, 2)).toBe(0);
+    expect(counts.size).toBe(0);
+  });
+
+  it('respects the window', () => {
+    const history = [
+      { players: [1, 2, 3, 4] },
+      { players: [5, 6, 7, 8] },
+      { players: [9, 10, 11, 12] },
+    ];
+    const counts = recentPartners(history, 2);
+    expect(partnerWeight(counts, 1, 2)).toBeGreaterThan(0);
+    expect(partnerWeight(counts, 5, 6)).toBeGreaterThan(0);
+    expect(partnerWeight(counts, 9, 10)).toBe(0);
+  });
+
+  it('scores an unseen pair as 0', () => {
+    expect(partnerWeight(recentPartners([]), 1, 2)).toBe(0);
+  });
+});
+
+/* ── balancedFreshGroup ─────────────────────── */
+describe('balancedFreshGroup', () => {
+  it('returns null when fewer than four are available', () => {
+    expect(balancedFreshGroup(evenFour.slice(0, 3), [])).toBeNull();
+    expect(balancedFreshGroup(undefined, [])).toBeNull();
+  });
+
+  it('returns the top four in snake order when there is no history', () => {
+    const five = [...tieredFour, { id: 5, skill: 'Beginner' }];
+    expect(balancedFreshGroup(five, [])).toEqual(balancedGroup(tieredFour));
+    expect(ids(balancedFreshGroup(five, []))).toEqual([1, 4, 2, 3]);
+  });
+
+  it('re-splits the same four rather than repeating last round’s partnerships', () => {
+    const group = ids(balancedFreshGroup(evenFour, [{ players: [1, 2, 3, 4] }]));
+    const partnered = (a, b) => {
+      const i = group.indexOf(a);
+      const j = group.indexOf(b);
+      return Math.floor(i / 2) === Math.floor(j / 2);
+    };
+    expect(partnered(1, 2)).toBe(false);
+    expect(partnered(3, 4)).toBe(false);
+  });
+
+  it('drafts a free fifth player when every split of the top four repeats', () => {
+    // Three rounds that between them used all three ways of splitting 1-4, so no
+    // arrangement of those four is fresh — only reaching past them is.
+    const history = [
+      { players: [1, 4, 2, 3] }, // most recent
+      { players: [1, 3, 2, 4] },
+      { players: [1, 2, 3, 4] },
+    ];
+    const group = ids(balancedFreshGroup(evenFive, history));
+    expect(group).toContain(5);
+    const partnered = (a, b) => {
+      const i = group.indexOf(a);
+      const j = group.indexOf(b);
+      return i >= 0 && j >= 0 && Math.floor(i / 2) === Math.floor(j / 2);
+    };
+    // Last round's partnerships are the most expensive; neither survives.
+    expect(partnered(1, 4)).toBe(false);
+    expect(partnered(2, 3)).toBe(false);
+  });
+
+  it('still terminates and returns a valid four when every pairing repeats', () => {
+    // Six players, and a history long enough to have paired all 15 combinations,
+    // so no choice is free of repeats. The search must pick a least-bad one, not
+    // loop looking for a perfect answer.
+    const six = [1, 2, 3, 4, 5, 6].map((id) => ({ id, skill: 'Intermediate' }));
+    const pairs = [];
+    for (let i = 0; i < 6; i++) for (let j = i + 1; j < 6; j++) pairs.push([i + 1, j + 1]);
+    const history = pairs.map(([a, b]) => ({
+      players: [a, b, ...[1, 2, 3, 4, 5, 6].filter((x) => x !== a && x !== b).slice(0, 2)],
+    }));
+    const group = balancedFreshGroup(six, history, { partnerWindow: pairs.length });
+    expect(group).toHaveLength(4);
+    expect(new Set(ids(group)).size).toBe(4);
+  });
+
+  it('is deterministic across repeated calls with the same input', () => {
+    const history = [{ players: [1, 2, 3, 4] }, { players: [2, 5, 1, 3] }];
+    const a = ids(balancedFreshGroup(evenFive, history));
+    const b = ids(balancedFreshGroup(evenFive, history));
+    expect(a).toEqual(b);
+  });
+
+  it('never picks the same player twice', () => {
+    const history = [{ players: [1, 2, 3, 4] }, { players: [3, 5, 1, 2] }];
+    const group = balancedFreshGroup(evenFive, history);
+    expect(new Set(ids(group)).size).toBe(4);
+  });
+});
+
+/* ── buildAutoGroup ─────────────────────────── */
+describe('buildAutoGroup', () => {
+  // A history that makes the two strategies visibly disagree: form order is not
+  // the roster order, and every player is the same skill so nothing else can.
+  const history = [decided([3, 4], [5, 1])];
+
+  it('routes winnersLosers to the ladder', () => {
+    expect(buildAutoGroup(evenFive, history, 'winnersLosers')).toEqual(
+      ladderGroup(evenFive, history)
+    );
+  });
+
+  it('routes balanced to the repeat-avoiding draft', () => {
+    expect(buildAutoGroup(evenFive, history, 'balanced')).toEqual(
+      balancedFreshGroup(evenFive, history)
+    );
+  });
+
+  it('actually produces different groups for the two styles', () => {
+    expect(ids(buildAutoGroup(evenFive, history, 'winnersLosers'))).not.toEqual(
+      ids(buildAutoGroup(evenFive, history, 'balanced'))
+    );
+  });
+
+  it('falls back to balanced for an unknown or missing style', () => {
+    const expected = balancedFreshGroup(evenFive, history);
+    expect(buildAutoGroup(evenFive, history, 'legacy-value')).toEqual(expected);
+    expect(buildAutoGroup(evenFive, history, undefined)).toEqual(expected);
+    expect(buildAutoGroup(evenFive, history)).toEqual(expected);
+  });
+
+  it('always returns exactly four players, or null', () => {
+    for (const style of ['balanced', 'winnersLosers', 'nonsense']) {
+      expect(buildAutoGroup(evenFive, history, style)).toHaveLength(4);
+      expect(buildAutoGroup(evenFour.slice(0, 3), history, style)).toBeNull();
+      expect(buildAutoGroup([], history, style)).toBeNull();
+      expect(buildAutoGroup(undefined, history, style)).toBeNull();
+    }
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ALL-TIME RANKINGS (spec §F3)
+   ═══════════════════════════════════════════════════════════════════════ */
+describe('allTimeLeaderboard', () => {
+  const player = (id, name, totalWins, totalLosses) => ({
+    id,
+    name,
+    skill: 'Intermediate',
+    totalWins,
+    totalLosses,
+    totalGames: totalWins + totalLosses,
+  });
+
+  it('splits ranked from unranked on the 10-game threshold', () => {
+    const rows = [player(1, 'Veteran', 6, 6), player(2, 'Newbie', 5, 4)];
+    const { ranked, unranked } = allTimeLeaderboard(rows);
+    expect(ranked.map((r) => r.id)).toEqual([1]);
+    expect(unranked.map((r) => r.id)).toEqual([2]);
+  });
+
+  it('ranks a player sitting exactly on the threshold', () => {
+    const { ranked, unranked } = allTimeLeaderboard([player(1, 'Exactly', 5, 5)]);
+    expect(ranked).toHaveLength(1);
+    expect(unranked).toHaveLength(0);
+    expect(RANKED_MIN_GAMES).toBe(10);
+  });
+
+  it('leaves a never-played player out of both lists but still counts them', () => {
+    const { ranked, unranked, totalPlayers } = allTimeLeaderboard([
+      player(1, 'Veteran', 6, 6),
+      player(2, 'Signed up, never played', 0, 0),
+    ]);
+    expect(ranked.map((r) => r.id)).toEqual([1]);
+    expect(unranked).toHaveLength(0);
+    expect(totalPlayers).toBe(2);
+  });
+
+  it('sorts by win rate descending, breaking ties on games played', () => {
+    const rows = [
+      player(1, 'Thin', 8, 2), // 80% over 10
+      player(2, 'Proven', 48, 12), // 80% over 60
+      player(3, 'Steady', 12, 8), // 60% over 20
+    ];
+    expect(allTimeLeaderboard(rows).ranked.map((r) => r.id)).toEqual([2, 1, 3]);
+  });
+
+  it('reads the all-time totals, never the session wins', () => {
+    // Nine wins today, but this is their first ever session on a fresh venue —
+    // the durable counters are what decides, so they cannot rank.
+    const rows = [{ id: 1, name: 'Hot today', skill: 'Pro', wins: 9, losses: 0, totalGames: 0 }];
+    const { ranked, unranked } = allTimeLeaderboard(rows);
+    expect(ranked).toHaveLength(0);
+    expect(unranked).toHaveLength(0);
+  });
+
+  it('remaps the all-time totals onto wins / defeats / games / rate', () => {
+    const [row] = allTimeLeaderboard([player(1, 'Veteran', 9, 3)]).ranked;
+    expect(row.wins).toBe(9);
+    expect(row.defeats).toBe(3);
+    expect(row.games).toBe(12);
+    expect(row.rate).toBeCloseTo(0.75);
+  });
+
+  it('tolerates rows saved before the all-time columns existed', () => {
+    const board = allTimeLeaderboard([{ id: 1, name: 'Legacy', skill: 'Novice' }]);
+    expect(board.ranked).toHaveLength(0);
+    expect(board.unranked).toHaveLength(0);
+    expect(board.totalPlayers).toBe(1);
+    expect(board.totalGames).toBe(0);
+  });
+
+  it('handles an empty or missing roster', () => {
+    expect(allTimeLeaderboard([])).toEqual({
+      ranked: [],
+      unranked: [],
+      totalPlayers: 0,
+      totalGames: 0,
+    });
+    expect(allTimeLeaderboard(undefined).totalPlayers).toBe(0);
+  });
+
+  it('totals player-games, not venue games (four per doubles match)', () => {
+    const rows = [player(1, 'A', 5, 5), player(2, 'B', 5, 5)];
+    expect(allTimeLeaderboard(rows).totalGames).toBe(20);
+  });
+
+  it('honours a custom minimum', () => {
+    const rows = [player(1, 'Short', 2, 1)];
+    expect(allTimeLeaderboard(rows, 3).ranked.map((r) => r.id)).toEqual([1]);
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CLUB SLUG (spec §F4)
+   ═══════════════════════════════════════════════════════════════════════ */
+describe('slugify', () => {
+  it('lowercases and hyphenates a normal club name', () => {
+    expect(slugify('Smash Club')).toBe('smash-club');
+  });
+
+  it('collapses runs of punctuation and space into one hyphen', () => {
+    expect(slugify('Ace  &  Volley!!')).toBe('ace-volley');
+    expect(slugify('Court--Flow')).toBe('court-flow');
+  });
+
+  it('trims leading and trailing hyphens', () => {
+    expect(slugify('  The Pickle Pit  ')).toBe('the-pickle-pit');
+    expect(slugify('!!Rally!!')).toBe('rally');
+  });
+
+  it('keeps digits', () => {
+    expect(slugify('Courts 24/7')).toBe('courts-24-7');
+  });
+
+  it('returns an empty string when nothing survives', () => {
+    expect(slugify('🏓🏓')).toBe('');
+    expect(slugify('   ')).toBe('');
+    expect(slugify('')).toBe('');
+  });
+
+  it('is null-safe', () => {
+    expect(slugify(null)).toBe('');
+    expect(slugify(undefined)).toBe('');
+  });
+});
+
+describe('isValidSlug', () => {
+  it('accepts what slugify produces', () => {
+    for (const name of ['Smash Club', 'Ace  &  Volley!!', 'Courts 24/7', 'Rally']) {
+      expect(isValidSlug(slugify(name))).toBe(true);
+    }
+  });
+
+  it('rejects uppercase, spaces and other punctuation', () => {
+    expect(isValidSlug('Smash-Club')).toBe(false);
+    expect(isValidSlug('smash club')).toBe(false);
+    expect(isValidSlug('smash_club')).toBe(false);
+    expect(isValidSlug('smash/club')).toBe(false);
+  });
+
+  it('rejects leading, trailing and doubled hyphens', () => {
+    expect(isValidSlug('-smash')).toBe(false);
+    expect(isValidSlug('smash-')).toBe(false);
+    expect(isValidSlug('smash--club')).toBe(false);
+  });
+
+  it('rejects the empty slug and null', () => {
+    expect(isValidSlug('')).toBe(false);
+    expect(isValidSlug(null)).toBe(false);
+    expect(isValidSlug(undefined)).toBe(false);
   });
 });

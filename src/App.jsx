@@ -4,8 +4,9 @@ import {
   Settings, Users, ChevronRight, Clock, Trash2, UserPlus,
   Shuffle, Crown, Activity, Megaphone, BarChart2, Camera,
   Copy, LogOut, RefreshCw, ExternalLink, AlertTriangle, ClipboardList,
-  LogIn, DollarSign,
+  LogIn, DollarSign, Medal, HelpCircle,
 } from 'lucide-react';
+import { Link } from 'react-router-dom';
 
 import { useAuth } from './lib/AuthProvider';
 import { supabase } from './lib/supabase';
@@ -15,6 +16,9 @@ import {
   updatePlayerPayment, recheckInPlayer, checkOutPlayer, recordResult, resetAllStats, recordMatchHistory,
 } from './lib/players';
 import { uploadPhoto } from './lib/photos';
+import ModalShell from './components/ModalShell';
+import OnboardingWizard from './components/OnboardingWizard';
+import ClubQrPoster from './components/ClubQrPoster';
 
 // Pure logic lives in ./lib/logic.js so tests can import it without booting the
 // Supabase client. Re-exported here because existing callers import from App.
@@ -22,6 +26,7 @@ import {
   SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, fmtDuration, estimateWait, balancedGroup,
   defaultCourts, hydrateCourts, matchRoster, findExactPlayer,
   PAYMENT_STATUSES, PAYMENT_ORDER, paymentInfo, isPaid,
+  buildAutoGroup, DEFAULT_MATCHING_STYLE, MATCHING_STYLE_ORDER, matchingStyleInfo,
 } from './lib/logic';
 export { SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, estimateWait, balancedGroup };
 
@@ -188,6 +193,13 @@ export default function App() {
   const [autoAssign, setAutoAssign]   = useState(true);
   // null = no timer; number = minutes. Applies to auto-assign for open-play courts.
   const [defaultOpenDuration, setDefaultOpenDuration] = useState(null);
+  // How the Auto button forms a group (spec §F1, §F2). In the session blob so
+  // it's a club setting rather than a per-device one.
+  const [matchingStyle, setMatchingStyle] = useState(DEFAULT_MATCHING_STYLE);
+  // Whether the setup wizard has been run for this venue (spec §F5). Also in the
+  // blob: a club that set up on the desk iPad must not be re-onboarded on the
+  // manager's laptop.
+  const [onboarded, setOnboarded] = useState(true);
 
   const [showDisplayLink, setShowDisplayLink] = useState(false);
   const [displayToken, setDisplayToken] = useState(venue.display_token);
@@ -198,6 +210,7 @@ export default function App() {
   const [search, setSearch]           = useState('');
   const [draftGroup, setDraftGroup]   = useState([]);
   const [showLeaderboard, setShowLeaderboard] = useState(false);
+  const [showWizard, setShowWizard] = useState(false);
   const [showActivityLog, setShowActivityLog] = useState(false);
   const [finishingCourt, setFinishingCourt]   = useState(null);
   // Id of the player being checked out (spec §3). Checkout is a roster action —
@@ -235,6 +248,13 @@ export default function App() {
           setCompetitiveMode(saved.competitiveMode ?? false);
           setAutoAssign(saved.autoAssign ?? true);
           setDefaultOpenDuration(saved.defaultOpenDuration ?? null);
+          setMatchingStyle(saved.matchingStyle ?? DEFAULT_MATCHING_STYLE);
+          // A venue with a saved session predates the wizard by definition — it's
+          // already set up, so default to onboarded rather than ambushing staff.
+          setOnboarded(saved.onboarded ?? true);
+        } else {
+          // A genuinely empty sessions row is a brand new venue: run the tour.
+          setOnboarded(false);
         }
         if (!cancelled) setBooting(false);
       } catch (err) {
@@ -245,16 +265,22 @@ export default function App() {
     return () => { cancelled = true; };
   }, [venueId, reloadNonce]);
 
+  // Fire the setup wizard once, the first time a brand new venue reaches the
+  // dashboard. Manual re-runs come from the "Guide me" toolbar button.
+  useEffect(() => {
+    if (!booting && !onboarded) setShowWizard(true);
+  }, [booting, onboarded]);
+
   // ── Session sync: debounced write to Postgres + instant broadcast to the TV ──
   const syncRef = useRef(null);
   useEffect(() => {
-    const sync = createSessionSync(venueId, displayToken);
+    const sync = createSessionSync(venueId, displayToken, venue.slug);
     syncRef.current = sync;
     return () => {
       sync.destroy();
       syncRef.current = null;
     };
-  }, [venueId, displayToken]);
+  }, [venueId, displayToken, venue.slug]);
 
   // Replaces the old localStorage write. Players are excluded — they live in
   // their own table now, and the display fetches them separately.
@@ -262,8 +288,10 @@ export default function App() {
     if (booting) return;
     syncRef.current?.push({
       courts, queue, history, auditLog, competitiveMode, autoAssign, announcement, defaultOpenDuration,
+      matchingStyle, onboarded,
     });
-  }, [booting, courts, queue, history, auditLog, competitiveMode, autoAssign, announcement, defaultOpenDuration]);
+  }, [booting, courts, queue, history, auditLog, competitiveMode, autoAssign, announcement,
+      defaultOpenDuration, matchingStyle, onboarded]);
 
   // Auto-expire courts when their duration runs out.
   useEffect(() => {
@@ -450,16 +478,19 @@ export default function App() {
     setDraftGroup([]);
   };
 
+  // Ranking, repeat-partner avoidance and the snake draft all live in logic.js so
+  // they stay testable without React — this owns only the roster filter and the
+  // failure message. Which of the two algorithms runs is the club's matchingStyle.
   const autoGroup = () => {
-    const available = players
-      .filter(p => !p.checkedOut && !busyPlayerIds.has(p.id) && !draftGroup.includes(p.id))
-      .sort((a, b) => skillRank(b.skill) - skillRank(a.skill));
-    if (available.length < 4) {
+    const available = players.filter(
+      p => !p.checkedOut && !busyPlayerIds.has(p.id) && !draftGroup.includes(p.id)
+    );
+    const group = buildAutoGroup(available, history, matchingStyle);
+    if (!group) {
       alert('Need at least 4 available players to auto-group.');
       return;
     }
-    const balanced = balancedGroup(available.slice(0, 4));
-    setQueue(prev => [...prev, { id: Date.now(), players: balanced.map(p => p.id), type: 'auto' }]);
+    setQueue(prev => [...prev, { id: Date.now(), players: group.map(p => p.id), type: 'auto' }]);
   };
 
   const assignToCourt = (groupId, courtId, durationMin) => {
@@ -587,9 +618,17 @@ export default function App() {
     const [p1, p2, p3, p4] = court.match.players;
     const winners = winningPair === 1 ? [p1, p2] : [p3, p4];
     const losers  = winningPair === 1 ? [p3, p4] : [p1, p2];
+    // Both counters move together: wins/losses are today's, total_* are forever
+    // (spec §F3). Mirrors what record_match_result does server-side.
     setPlayers(prev => prev.map(p => {
-      if (winners.includes(p.id)) return { ...p, wins: p.wins + 1 };
-      if (losers.includes(p.id))  return { ...p, losses: p.losses + 1 };
+      if (winners.includes(p.id)) return {
+        ...p, wins: p.wins + 1,
+        totalWins: (p.totalWins ?? 0) + 1, totalGames: (p.totalGames ?? 0) + 1,
+      };
+      if (losers.includes(p.id)) return {
+        ...p, losses: p.losses + 1,
+        totalLosses: (p.totalLosses ?? 0) + 1, totalGames: (p.totalGames ?? 0) + 1,
+      };
       return p;
     }));
     const now = Date.now();
@@ -607,7 +646,7 @@ export default function App() {
 
     // Fire-and-forget: the UI has already moved on, and both of these are
     // recoverable (stats can be corrected, history is for later analysis).
-    recordResult(players, winners, losers).catch(err =>
+    recordResult(winners, losers).catch(err =>
       console.error('Failed to save win/loss:', err));
     recordMatchHistory(venueId, { ...entry, courtName: court.name });
     // Both teams rotate back into the queue when Auto-Filling is on.
@@ -616,6 +655,27 @@ export default function App() {
 
   const addCourt = () => {
     setCourts(prev => [...prev, { id: Date.now(), name: `Court ${prev.length + 1}`, type: 'open', match: null }]);
+  };
+
+  // Used by the setup wizard (spec §F5) to dial the floor in with one control.
+  // Growing appends; shrinking drops from the tail but never removes a court with
+  // a live match on it — those are kept past the target rather than vanishing
+  // mid-game, and staff can remove them normally once the match ends.
+  const setCourtCount = (n) => {
+    const target = Math.max(1, Math.min(12, Math.round(Number(n) || 1)));
+    setCourts(prev => {
+      if (prev.length === target) return prev;
+      if (prev.length < target) {
+        const extra = Array.from({ length: target - prev.length }, (_, i) => ({
+          id: Date.now() + i,
+          name: `Court ${prev.length + i + 1}`,
+          type: 'open',
+          match: null,
+        }));
+        return [...prev, ...extra];
+      }
+      return [...prev.slice(0, target), ...prev.slice(target).filter(c => c.match)];
+    });
   };
 
   const toggleCourtType = (courtId) => {
@@ -717,6 +777,9 @@ export default function App() {
     syncRef.current?.push({
       courts: clearedCourts, queue: [], history: [], auditLog: [],
       competitiveMode, autoAssign, announcement: '', defaultOpenDuration,
+      // Both are settings, not session data: a reset must not re-run the wizard
+      // or silently flip the club back to the default matching style.
+      matchingStyle, onboarded,
     });
     await syncRef.current?.flush();
   };
@@ -860,6 +923,25 @@ export default function App() {
                         </select>
                       </div>
 
+                      {/* Matching style (spec §F1, §F2). Sits next to the timer
+                          because it's the other thing that changes how a group
+                          reaches the court. */}
+                      <div
+                        className="flex items-center gap-1.5 bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1"
+                        title={matchingStyleInfo(matchingStyle).blurb}
+                      >
+                        <Shuffle className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+                        <select
+                          value={matchingStyle}
+                          onChange={e => setMatchingStyle(e.target.value)}
+                          className="bg-transparent text-sm font-semibold text-zinc-300 focus:outline-none cursor-pointer"
+                        >
+                          {MATCHING_STYLE_ORDER.map(s => (
+                            <option key={s} value={s}>{matchingStyleInfo(s).label}</option>
+                          ))}
+                        </select>
+                      </div>
+
                       {/* Competitive mode */}
                       <button
                         onClick={() => setCompetitiveMode(v => !v)}
@@ -919,6 +1001,22 @@ export default function App() {
                         title="Check-in, checkout and payment history"
                       >
                         <ClipboardList className="w-4 h-4" /> Log
+                      </button>
+
+                      <Link
+                        to="/leaderboard"
+                        className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
+                        title="All-time rankings across every session"
+                      >
+                        <Medal className="w-4 h-4" /> Rankings
+                      </Link>
+
+                      <button
+                        onClick={() => setShowWizard(true)}
+                        className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
+                        title="Walk through setting up open play"
+                      >
+                        <HelpCircle className="w-4 h-4" /> Guide me
                       </button>
 
                       <button
@@ -1115,8 +1213,28 @@ export default function App() {
       {showDisplayLink && (
         <DisplayLinkModal
           token={displayToken}
+          slug={venue.slug}
+          venueName={venue.name}
           onRegenerate={regenerateDisplayLink}
           onClose={() => setShowDisplayLink(false)}
+        />
+      )}
+      {showWizard && (
+        <OnboardingWizard
+          courtCount={courts.length}
+          setCourtCount={setCourtCount}
+          matchingStyle={matchingStyle}
+          setMatchingStyle={setMatchingStyle}
+          players={activePlayers}
+          newPlayerName={newPlayerName}
+          setNewPlayerName={setNewPlayerName}
+          newPlayerSkill={newPlayerSkill}
+          setNewPlayerSkill={setNewPlayerSkill}
+          addPlayer={addPlayer}
+          // Dismissing counts as finishing — otherwise the wizard would reopen on
+          // every reload for a venue that closed it deliberately.
+          onFinish={() => { setOnboarded(true); setShowWizard(false); }}
+          onClose={() => { setOnboarded(true); setShowWizard(false); }}
         />
       )}
     </div>
@@ -1126,7 +1244,7 @@ export default function App() {
 /* ─────────────────────────────────────────────
    DISPLAY LINK
    ───────────────────────────────────────────── */
-function DisplayLinkModal({ token, onRegenerate, onClose }) {
+function DisplayLinkModal({ token, slug, venueName, onRegenerate, onClose }) {
   const [copied, setCopied] = useState(false);
   const url = `${window.location.origin}/d/${token}`;
 
@@ -1141,7 +1259,7 @@ function DisplayLinkModal({ token, onRegenerate, onClose }) {
   };
 
   return (
-    <ModalShell onClose={onClose} title="Customer Display">
+    <ModalShell onClose={onClose} title="Customer Display" wide>
       <p className="text-zinc-400 text-sm mb-4">
         Open this link in the browser on your TV, then put it full screen. It updates
         live and is read-only — nobody can change anything from it.
@@ -1167,6 +1285,20 @@ function DisplayLinkModal({ token, onRegenerate, onClose }) {
           <ExternalLink className="w-4 h-4" /> Open
         </a>
       </div>
+
+      {/* The club board (spec §F4). Only once the venue actually has a slug —
+          it's null until schema.sql has been re-run on an existing database. */}
+      {slug && (
+        <div className="border-t border-zinc-800 pt-4 mb-5">
+          <h4 className="font-display text-lg mb-1">Club queue link</h4>
+          <p className="text-zinc-400 text-sm mb-3">
+            Print this for the front desk — players scan it to see the queue on their
+            phone. It never changes, so regenerating the TV link above leaves every
+            printed copy working.
+          </p>
+          <ClubQrPoster venueName={venueName} slug={slug} />
+        </div>
+      )}
 
       <div className="border-t border-zinc-800 pt-4">
         <button
@@ -2879,24 +3011,5 @@ function CameraModal({ playerName, onSave, onClose }) {
   );
 }
 
-function ModalShell({ children, onClose, title, wide }) {
-  return (
-    <div
-      className="fixed inset-0 bg-black bg-opacity-70 z-50 flex items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <div
-        className={`bg-zinc-900 border border-zinc-800 rounded-2xl p-4 sm:p-6 w-full ${wide ? 'max-w-2xl' : 'max-w-md'} max-h-[85vh] overflow-y-auto overscroll-contain`}
-        onClick={e => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="font-display text-2xl">{title}</h3>
-          <button onClick={onClose} className="text-zinc-500 hover:text-zinc-200">
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-        {children}
-      </div>
-    </div>
-  );
-}
+/* ModalShell now lives in ./components/ModalShell.jsx so the setup wizard can
+   import it without pulling App.jsx in with it. */

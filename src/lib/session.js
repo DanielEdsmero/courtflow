@@ -38,13 +38,31 @@ export function channelName(displayToken) {
   return `display:${displayToken}`;
 }
 
+// The public club board's channel (spec §F4). Named off the slug, which is
+// printed on a poster — so unlike display:<token> it is guessable, and we
+// deliberately never put the state on it. It carries a bare "something changed"
+// ping and the /queue page answers by re-calling get_display_state_by_slug.
+// That way a forged broadcast can at worst cost one extra RPC; it can't put a
+// fake queue on the wall, and rotating the display token still fully invalidates
+// the private TV link.
+export function queueChannelName(slug) {
+  return `queue:${slug}`;
+}
+
 // Returns { push, flush, destroy }. Call push() on every state change; it
 // coalesces bursts into one write + one broadcast.
-export function createSessionSync(venueId, displayToken) {
+export function createSessionSync(venueId, displayToken, slug) {
   const channel = supabase.channel(channelName(displayToken), {
     config: { broadcast: { self: false } },
   });
   channel.subscribe();
+
+  // Only when the venue actually has a slug — it's null until schema.sql has
+  // been re-run against an existing database.
+  const queueChannel = slug
+    ? supabase.channel(queueChannelName(slug), { config: { broadcast: { self: false } } })
+    : null;
+  queueChannel?.subscribe();
 
   let timer = null;
   let pending = null;
@@ -58,6 +76,10 @@ export function createSessionSync(venueId, displayToken) {
 
     // Broadcast first: the TV should feel instant even if the write is slow.
     channel.send({ type: 'broadcast', event: 'state', payload: state }).catch(() => {});
+    // Ping only — see queueChannelName above for why the state never goes here.
+    queueChannel
+      ?.send({ type: 'broadcast', event: 'changed', payload: { at: Date.now() } })
+      .catch(() => {});
 
     const { error } = await supabase
       .from('sessions')
@@ -82,6 +104,7 @@ export function createSessionSync(venueId, displayToken) {
       destroyed = true;
       if (timer) clearTimeout(timer);
       supabase.removeChannel(channel);
+      if (queueChannel) supabase.removeChannel(queueChannel);
     },
   };
 }
@@ -105,6 +128,31 @@ export function subscribeToDisplay(token, onState, onStatus) {
 
   channel
     .on('broadcast', { event: 'state' }, ({ payload }) => onState(payload))
+    .subscribe((status) => onStatus?.(status));
+
+  return () => supabase.removeChannel(channel);
+}
+
+// ── Public club board side (spec §F4) ───────────────────────────────────────
+
+// Unauthenticated read keyed by the printable club slug. Same payload as
+// fetchDisplayState minus display_token — see get_display_state_by_slug().
+export async function fetchQueueState(slug) {
+  const { data, error } = await supabase.rpc('get_display_state_by_slug', { p_slug: slug });
+  if (error) throw error;
+  if (!data) throw new Error('NOT_FOUND');
+  return data; // { venueName, slug, state, players }
+}
+
+// Ping-only subscription: onChanged takes no payload, because on a guessable
+// channel the payload can't be trusted. The caller re-fetches instead.
+export function subscribeToQueue(slug, onChanged, onStatus) {
+  const channel = supabase.channel(queueChannelName(slug), {
+    config: { broadcast: { self: false } },
+  });
+
+  channel
+    .on('broadcast', { event: 'changed' }, () => onChanged())
     .subscribe((status) => onStatus?.(status));
 
   return () => supabase.removeChannel(channel);

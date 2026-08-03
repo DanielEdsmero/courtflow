@@ -169,6 +169,60 @@ html {
   box-shadow: 0 10px 28px -12px rgba(0, 0, 0, 0.7);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════
+   PRINT — the club QR poster (spec §F4)
+   The app is dark-only, and a QR printed as white-on-black is both a waste of
+   toner and unreliable to scan. So printing hides the entire app and promotes
+   the one .cf-print wrapper (ClubQrPoster) to a plain black-on-white page.
+   Done with visibility rather than display:none on ancestors, so the poster's
+   own containers can stay laid out while everything around them disappears.
+   ═══════════════════════════════════════════════════════════════════════ */
+@media print {
+  html,
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+
+  /* Hide the whole tree, then re-show only the poster's subtree. */
+  body * {
+    visibility: hidden;
+  }
+  .cf-print,
+  .cf-print * {
+    visibility: visible;
+  }
+
+  .cf-print {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    padding: 1.5rem;
+    background: #ffffff !important;
+    color: #000000 !important;
+    border: 0 !important;
+    box-shadow: none !important;
+  }
+
+  /* Tailwind's zinc/lime text colours are tuned for a dark surface and print as
+     near-invisible grey — force everything inside the poster to solid black. */
+  .cf-print *,
+  .cf-print code {
+    color: #000000 !important;
+    background: transparent !important;
+    animation: none !important;
+    text-shadow: none !important;
+  }
+
+  /* Buttons (copy / open / print) are screen affordances — never on paper. */
+  .cf-print-hide,
+  .cf-print-hide * {
+    display: none !important;
+    visibility: hidden !important;
+  }
+}
+
 /* Honour the OS "reduce motion" setting — drop every animation to a plain,
    instant final state, but keep opacity at 1 so nothing stays invisible. */
 @media (prefers-reduced-motion: reduce) {
