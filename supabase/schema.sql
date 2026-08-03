@@ -17,6 +17,50 @@ create table if not exists venues (
   created_at    timestamptz not null default now()
 );
 
+-- Added after the first release: the public, human-readable club URL
+-- (/queue/<slug>). It is the opposite of display_token in every way — guessable
+-- by design, printed on a poster, and it never rotates. Nullable so the column
+-- can be added to a live table; the backfill below fills every existing row and
+-- the unique index then keeps them distinct.
+alter table venues add column if not exists slug text;
+
+-- Lowercase, non-alphanumerics collapsed to single hyphens, no leading or
+-- trailing hyphen. Returns null when nothing usable is left (a name that's all
+-- emoji, say), which the callers below turn into the 'club' fallback.
+create or replace function slugify(p_text text)
+returns text language sql immutable as $$
+  select nullif(
+           regexp_replace(
+             regexp_replace(lower(coalesce(p_text, '')), '[^a-z0-9]+', '-', 'g'),
+             '(^-+|-+$)', '', 'g'),
+           '');
+$$;
+
+-- One-time backfill for venues created before slugs existed. Two clubs both
+-- called "Riverside" become riverside and riverside-2.
+do $$
+declare
+  v         record;
+  base      text;
+  candidate text;
+  n         int;
+begin
+  for v in select id, name from venues where slug is null order by created_at loop
+    base      := coalesce(slugify(v.name), 'club');
+    candidate := base;
+    n         := 1;
+    while exists (select 1 from venues where slug = candidate) loop
+      n := n + 1;
+      candidate := base || '-' || n;
+    end loop;
+    update venues set slug = candidate where id = v.id;
+  end loop;
+end $$;
+
+-- A unique INDEX rather than a constraint: "if not exists" is supported here so
+-- the file stays re-runnable, and it still permits the transient NULL above.
+create unique index if not exists venues_slug_key on venues (slug);
+
 -- Access keys you hand out. The client can NEVER read this table (see RLS below);
 -- it is only ever touched by redeem_access_key(), which runs as security definer.
 create table if not exists access_keys (
@@ -53,6 +97,19 @@ alter table players add column if not exists payment        text not null defaul
 alter table players add column if not exists checked_in_at  timestamptz not null default now();
 alter table players add column if not exists checked_out_at timestamptz;
 
+-- All-time counters, deliberately separate from wins/losses above. Those are
+-- session-scoped and zeroed by resetAllStats() at the end of every open play,
+-- which is exactly why they can never back a lifetime leaderboard. These three
+-- are never reset — only ever incremented, by record_match_result().
+-- There is no win_rate column on purpose: a stored generated column would force
+-- a table rewrite every time this file is re-run, and the rankings page already
+-- has both numbers in memory.
+alter table players add column if not exists total_wins   int not null default 0;
+alter table players add column if not exists total_losses int not null default 0;
+alter table players add column if not exists total_games  int not null default 0;
+
+-- (The backfill for these three lives below match_history, which it reads from.)
+
 -- The live session: courts, queue, announcement, toggles — one JSON blob per venue.
 -- Ephemeral working state, rewritten constantly, read by the TV display.
 create table if not exists sessions (
@@ -74,6 +131,29 @@ create table if not exists match_history (
 );
 create index if not exists match_history_venue_idx
   on match_history (venue_id, finished_at desc);
+
+-- Backfill players.total_* from the permanent match log, not from wins/losses —
+-- by the time this runs those have almost certainly been zeroed by a session
+-- reset. Only decided games count: a casual or rental row has an empty
+-- winner_ids and is nobody's loss. Guarded on total_games = 0 so re-running the
+-- file never double-counts. Has to sit here rather than up with the ALTERs,
+-- because it reads match_history.
+with tallies as (
+  select pid as player_id,
+         count(*) filter (where pid = any(m.winner_ids))       as wins,
+         count(*) filter (where not (pid = any(m.winner_ids))) as losses
+    from match_history m
+    cross join lateral unnest(m.player_ids) as pid
+   where coalesce(array_length(m.winner_ids, 1), 0) > 0
+   group by pid
+)
+update players p
+   set total_wins   = t.wins,
+       total_losses = t.losses,
+       total_games  = t.wins + t.losses
+  from tallies t
+ where p.id = t.player_id
+   and p.total_games = 0;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- ROW LEVEL SECURITY
@@ -142,6 +222,9 @@ declare
   k access_keys;
   clean_code text;
   clean_name text;
+  base_slug  text;
+  slug_try   text;
+  n          int;
 begin
   if auth.uid() is null then
     raise exception 'You must be signed in to redeem a key.';
@@ -167,7 +250,18 @@ begin
     raise exception 'That access key is invalid or has already been used.';
   end if;
 
-  insert into venues (owner_id, name) values (auth.uid(), clean_name) returning * into v;
+  -- The public club URL is minted here and never changes afterwards: it goes on
+  -- printed posters, so a later venue rename must not invalidate it.
+  base_slug := coalesce(slugify(clean_name), 'club');
+  slug_try  := base_slug;
+  n         := 1;
+  while exists (select 1 from venues where slug = slug_try) loop
+    n := n + 1;
+    slug_try := base_slug || '-' || n;
+  end loop;
+
+  insert into venues (owner_id, name, slug)
+       values (auth.uid(), clean_name, slug_try) returning * into v;
   update access_keys set claimed_by = v.id, claimed_at = now() where code = k.code;
   insert into sessions (venue_id) values (v.id);
 
@@ -204,6 +298,37 @@ as $$
    where v.display_token = p_token;
 $$;
 
+-- The same public read, keyed by the printable club slug instead of the secret
+-- token. It returns the same shape MINUS display_token: handing the token out
+-- here would defeat rotate_display_token() entirely, since the slug is guessable
+-- by design. Anonymous callers are fine — everything below is already on the TV.
+create or replace function get_display_state_by_slug(p_slug text)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select jsonb_build_object(
+    'venueName', v.name,
+    'slug',      v.slug,
+    'state',     coalesce(s.state, '{}'::jsonb),
+    'players',   coalesce(
+                   (select jsonb_agg(
+                      jsonb_build_object(
+                        'id',      p.id,
+                        'name',    p.name,
+                        'skill',   p.skill,
+                        'wins',    p.wins,
+                        'losses',  p.losses,
+                        'photo',   p.photo_url,
+                        'payment', p.payment))
+                      from players p where p.venue_id = v.id), '[]'::jsonb))
+    from venues v
+    left join sessions s on s.venue_id = v.id
+   where v.slug = lower(trim(coalesce(p_slug, '')));
+$$;
+
 -- Rotate the display link, invalidating the old URL.
 create or replace function rotate_display_token()
 returns uuid
@@ -217,13 +342,48 @@ as $$
   returning display_token;
 $$;
 
-revoke all on function redeem_access_key(text, text) from public, anon;
-revoke all on function get_display_state(uuid)       from public;
-revoke all on function rotate_display_token()        from public, anon;
+-- Record a finished match. One round trip, one transaction, real "+1" arithmetic.
+-- The old client-side read-modify-write was survivable while only the session
+-- counters mattered; the all-time counters are not recoverable from a lost
+-- update, and two staff devices finishing different courts at the same moment is
+-- a normal thing. Scoped to current_venue_id() so a security-definer function
+-- can never be pointed at another club's roster.
+create or replace function record_match_result(p_winner_ids uuid[], p_loser_ids uuid[])
+returns void
+language plpgsql
+volatile
+security definer
+set search_path = public
+as $$
+begin
+  update players
+     set wins        = wins + 1,
+         total_wins  = total_wins + 1,
+         total_games = total_games + 1
+   where id = any(coalesce(p_winner_ids, '{}'))
+     and venue_id = current_venue_id();
 
-grant execute on function redeem_access_key(text, text) to authenticated;
-grant execute on function get_display_state(uuid)       to anon, authenticated;
-grant execute on function rotate_display_token()        to authenticated;
+  update players
+     set losses       = losses + 1,
+         total_losses = total_losses + 1,
+         total_games  = total_games + 1
+   where id = any(coalesce(p_loser_ids, '{}'))
+     and venue_id = current_venue_id();
+end;
+$$;
+
+revoke all on function redeem_access_key(text, text)       from public, anon;
+revoke all on function get_display_state(uuid)             from public;
+revoke all on function get_display_state_by_slug(text)     from public;
+revoke all on function rotate_display_token()              from public, anon;
+revoke all on function record_match_result(uuid[], uuid[]) from public, anon;
+revoke all on function slugify(text)                       from public, anon;
+
+grant execute on function redeem_access_key(text, text)       to authenticated;
+grant execute on function get_display_state(uuid)             to anon, authenticated;
+grant execute on function get_display_state_by_slug(text)     to anon, authenticated;
+grant execute on function rotate_display_token()              to authenticated;
+grant execute on function record_match_result(uuid[], uuid[]) to authenticated;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- STORAGE — player photos

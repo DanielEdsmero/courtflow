@@ -7,6 +7,8 @@ import App from './src/App.jsx';
 import AuthPage from './src/pages/AuthPage.jsx';
 import ActivatePage from './src/pages/ActivatePage.jsx';
 import DisplayPage from './src/pages/DisplayPage.jsx';
+import QueuePage from './src/pages/QueuePage.jsx';
+import LeaderboardPage from './src/pages/LeaderboardPage.jsx';
 import RequireVenue from './src/components/RequireVenue.jsx';
 import { AuthProvider } from './src/lib/AuthProvider.jsx';
 
@@ -18,6 +20,11 @@ ReactDOM.createRoot(document.getElementById('root')).render(
     <Routes>
       {/* Public: the TV display. No auth — the token in the URL is the credential. */}
       <Route path="/d/:token" element={<DisplayPage />} />
+
+      {/* Public: the club board behind the printed QR poster. Must live in this
+          OUTER Routes — inside the "/*" element it would be caught by the
+          path="*" redirect below and bounce every visitor to the staff app. */}
+      <Route path="/queue/:slug" element={<QueuePage />} />
 
       <Route
         path="/*"
@@ -32,6 +39,14 @@ ReactDOM.createRoot(document.getElementById('root')).render(
                 element={
                   <RequireVenue>
                     <App />
+                  </RequireVenue>
+                }
+              />
+              <Route
+                path="/leaderboard"
+                element={
+                  <RequireVenue>
+                    <LeaderboardPage />
                   </RequireVenue>
                 }
               />

@@ -13,6 +13,12 @@ const fromRow = (r) => ({
   skill: r.skill,
   wins: r.wins,
   losses: r.losses,
+  // All-time counters (spec §F3). Never zeroed by resetAllStats — the wins and
+  // losses above are. The ?? 0 keeps the app booting against a database where
+  // the schema file hasn't been re-run yet.
+  totalWins: r.total_wins ?? 0,
+  totalLosses: r.total_losses ?? 0,
+  totalGames: r.total_games ?? 0,
   photo: r.photo_url,
   payment: r.payment ?? 'unpaid',
   checkedInAt: r.checked_in_at ? new Date(r.checked_in_at).getTime() : Date.now(),
@@ -89,26 +95,38 @@ export async function updatePlayerPhoto(playerId, photoUrl) {
   if (error) throw error;
 }
 
-// Called when a match is finished. Two ids win, two lose — increments have to be
-// read-modify-write since PostgREST has no atomic "+1", but only one staff device
-// writes at a time so a lost update isn't a practical concern.
-export async function recordResult(players, winnerIds, loserIds) {
-  const updates = [];
-  for (const p of players) {
-    if (winnerIds.includes(p.id)) updates.push({ id: p.id, wins: p.wins + 1 });
-    else if (loserIds.includes(p.id)) updates.push({ id: p.id, losses: p.losses + 1 });
-  }
-  await Promise.all(
-    updates.map(({ id, ...fields }) => supabase.from('players').update(fields).eq('id', id))
-  );
+// Called when a match is finished. One RPC, one transaction: it bumps the
+// session counters AND the all-time ones with real "+1" arithmetic, so two staff
+// devices finishing different courts at the same moment can't clobber each other
+// the way the old client-side read-modify-write could. The session counters were
+// survivable that way; the all-time ones aren't recoverable from a lost update.
+export async function recordResult(winnerIds, loserIds) {
+  const { error } = await supabase.rpc('record_match_result', {
+    p_winner_ids: winnerIds,
+    p_loser_ids: loserIds,
+  });
+  if (error) throw error;
 }
 
+// Session-scoped only. total_wins / total_losses / total_games are deliberately
+// left alone — they're what the all-time rankings page reads (spec §F3).
 export async function resetAllStats(venueId) {
   const { error } = await supabase
     .from('players')
     .update({ wins: 0, losses: 0 })
     .eq('venue_id', venueId);
   if (error) throw error;
+}
+
+// Every game this venue has ever recorded, straight from the permanent log.
+// head:true makes it a count rather than a download of the whole table.
+export async function countMatchHistory(venueId) {
+  const { count, error } = await supabase
+    .from('match_history')
+    .select('id', { count: 'exact', head: true })
+    .eq('venue_id', venueId);
+  if (error) throw error;
+  return count ?? 0;
 }
 
 export async function recordMatchHistory(venueId, entry) {
