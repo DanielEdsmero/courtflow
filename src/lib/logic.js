@@ -228,10 +228,48 @@ export const rankByForm = (players, form) =>
 // the rung below, and so on.
 // Snake-drafting a form-ranked four means each team is one recent winner plus one
 // recent loser, and the two in-form players end up as OPPONENTS, not partners.
+// Taking the top four outright looked right on paper but produced a mixed court
+// in practice: with four courts running there are rarely four recent winners
+// free at the same moment, so the "winners court" quietly filled up with
+// newcomers and then losers, and the result was barely distinguishable from the
+// balanced draft. Instead, slide a window of four down the form-ranked list and
+// take the TIGHTEST rung — the four whose form is closest together. Ties go to
+// the highest window, so the winners' court is still picked first and repeated
+// calls still walk down the ladder.
 export const ladderGroup = (players, history, { formWindow = FORM_WINDOW } = {}) => {
   if (!players || players.length < 4) return null;
   const form = playerForm(history, formWindow);
-  return balancedGroup(rankByForm(players, form).slice(0, 4));
+  const ranked = rankByForm(players, form);
+
+  let best = ranked.slice(0, 4);
+  let bestSpread = Infinity;
+  for (let i = 0; i + 4 <= ranked.length; i++) {
+    const rung = ranked.slice(i, i + 4);
+    // Already form-descending, so the spread is just the ends.
+    const spread = formScore(form[rung[0].id]) - formScore(form[rung[3].id]);
+    if (spread < bestSpread) {
+      bestSpread = spread;
+      best = rung;
+    }
+  }
+
+  // Which rung is settled; now pick HOW to split it. Tightening the rungs made
+  // the same four cluster together repeatedly, so without this the ladder
+  // re-made partnerships about one time in six. The snake split is tried first
+  // and wins every tie, so the two strongest performers still end up opponents.
+  const partners = recentPartners(history);
+  let split = balancedGroup(best);
+  let bestRepeats = Infinity;
+  for (const [a, b, c, d] of SPLITS) {
+    const repeats =
+      partnerWeight(partners, best[a].id, best[b].id) +
+      partnerWeight(partners, best[c].id, best[d].id);
+    if (repeats < bestRepeats) {
+      bestRepeats = repeats;
+      split = [best[a], best[b], best[c], best[d]];
+    }
+  }
+  return split;
 };
 
 /* ─────────────────────────────────────────────
@@ -350,12 +388,26 @@ export const balancedFreshGroup = (
 ) => {
   if (!players || players.length < 4) return null;
 
-  const ranked = [...players].sort(
-    (a, b) => skillRank(b.skill) - skillRank(a.skill) || String(a.id).localeCompare(String(b.id))
-  );
-  const candidates = ranked.slice(0, Math.max(4, pool));
   const partners = recentPartners(history, partnerWindow);
   const rest = recentlyPlayed(history, partnerWindow);
+
+  // WHO is considered, before HOW they're split. Slicing the skill-sorted list
+  // starved the bottom of a big roster outright: with 24 players and a pool of
+  // 8, the eight strongest were the only candidates that ever existed, so the
+  // weakest never got a court no matter how long they waited. Longest-waiting
+  // first, ties by skill — then the pool is re-sorted by skill so the draft and
+  // its position cost behave exactly as before within it.
+  const byRest = [...players].sort(
+    (a, b) =>
+      restCost(rest, a.id) - restCost(rest, b.id) ||
+      skillRank(b.skill) - skillRank(a.skill) ||
+      String(a.id).localeCompare(String(b.id))
+  );
+  const candidates = byRest
+    .slice(0, Math.max(4, pool))
+    .sort(
+      (a, b) => skillRank(b.skill) - skillRank(a.skill) || String(a.id).localeCompare(String(b.id))
+    );
 
   let best = null;
   let bestCost = Infinity;

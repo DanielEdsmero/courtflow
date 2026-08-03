@@ -883,6 +883,49 @@ describe('balancedFreshGroup rest fairness', () => {
     const five = [...tieredFour, { id: 5, skill: 'Beginner' }];
     expect(balancedFreshGroup(five, [])).toEqual(balancedGroup(tieredFour));
   });
+
+  it('does not starve the bottom of a roster larger than the pool', () => {
+    // 12 players, and the eight strongest have all just come off court. The
+    // candidate pool used to be a slice of the SKILL sort, so the four weakest
+    // were never candidates at all and could sit out an entire session.
+    const strong = Array.from({ length: 8 }, (_, i) => ({ id: `s${i}`, skill: 'Pro' }));
+    const weak = Array.from({ length: 4 }, (_, i) => ({ id: `w${i}`, skill: 'Beginner' }));
+    const history = [
+      { players: ['s0', 's1', 's2', 's3'] },
+      { players: ['s4', 's5', 's6', 's7'] },
+    ];
+    const group = ids(balancedFreshGroup([...strong, ...weak], history));
+    expect(group.sort()).toEqual(['w0', 'w1', 'w2', 'w3']);
+  });
+});
+
+describe('ladderGroup rung selection', () => {
+  it('picks the tightest rung rather than the top four', () => {
+    // p1/p2 won; p3-p6 all lost. The top four would be a mixed court
+    // (2 winners + 2 losers); the four losers are the coherent rung.
+    const six = [1, 2, 3, 4, 5, 6].map((id) => ({ id, skill: 'Intermediate' }));
+    const history = [decided([1, 2], [3, 4]), decided([1, 2], [5, 6])];
+    const group = ids(ladderGroup(six, history)).sort();
+    expect(group).toEqual([3, 4, 5, 6]);
+  });
+
+  it('still forms a winners court when four winners are free', () => {
+    const eight = [1, 2, 3, 4, 5, 6, 7, 8].map((id) => ({ id, skill: 'Intermediate' }));
+    const history = [decided([1, 2], [5, 6]), decided([3, 4], [7, 8])];
+    const group = ids(ladderGroup(eight, history)).sort();
+    expect(group).toEqual([1, 2, 3, 4]);
+  });
+
+  it('avoids re-making a partnership inside the rung it picked', () => {
+    // No result recorded, so form is flat and the rung is [1,2,3,4] — but they
+    // last played as [1,4] vs [2,3], which is exactly the snake split.
+    const history = [{ players: [1, 4, 2, 3] }];
+    const group = ids(ladderGroup(evenFour, history));
+    const partnered = (a, b) =>
+      Math.floor(group.indexOf(a) / 2) === Math.floor(group.indexOf(b) / 2);
+    expect(partnered(1, 4)).toBe(false);
+    expect(partnered(2, 3)).toBe(false);
+  });
 });
 
 /* ═══════════════════════════════════════════════════════════════════════

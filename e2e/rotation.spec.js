@@ -137,6 +137,62 @@ test('the Winners / Losers style changes who gets grouped on rotation', async ({
   expect(group).toContain('p6');
 });
 
+test('24 players rotate through six consecutive matches without repeating partners', async ({ page }) => {
+  // The scale the bug was reported at, driven through the real UI: finish a
+  // match, let the app re-match and auto-assign, finish the next, and so on.
+  const roster = Array.from({ length: 24 }, (_, i) => ({
+    ...ROSTER[0],
+    id: `q${String(i + 1).padStart(2, '0')}`,
+    name: `Q${i + 1}`,
+    skill: ['Beginner', 'Novice', 'Intermediate', 'Advanced', 'Pro'][i % 5],
+  }));
+  const session = midMatchSession();
+  session.courts[0].match.players = ['q01', 'q02', 'q03', 'q04'];
+
+  const calls = await stubRest(page, { players: roster, session });
+  await stubRealtime(page);
+  await page.goto('/');
+
+  // Keyed by the line-up itself. A group is written to the session twice — once
+  // when it lands on the queue and again when auto-assign moves it to a court —
+  // and a court still mid-game reappears in every write. Both would read as
+  // repeats. With 24 players an identical re-draft is not a realistic collision.
+  const groups = new Map();
+  for (let round = 0; round < 6; round++) {
+    await page.getByRole('button', { name: 'FINISH MATCH' }).first().click();
+    await page.getByRole('button', { name: /MARK AS WINNER/ }).first().click();
+    await expect
+      .poll(() => calls.lastSessionWrite?.history?.length ?? 0, { timeout: 10_000 })
+      .toBe(round + 1);
+    const s = calls.lastSessionWrite;
+    for (const g of s.queue ?? []) {
+      if (g.players?.length === 4) groups.set(g.players.join('|'), g.players);
+    }
+    for (const c of s.courts ?? []) {
+      if (c.match?.players?.length === 4) groups.set(c.match.players.join('|'), c.match.players);
+    }
+  }
+
+  // Every partnership ever formed, as an order-independent key.
+  const seen = new Set();
+  let repeats = 0;
+  const uniquePlayers = new Set();
+  for (const g of groups.values()) {
+    for (const pair of [[g[0], g[1]], [g[2], g[3]]]) {
+      const key = [...pair].sort().join('|');
+      if (seen.has(key)) repeats += 1;
+      seen.add(key);
+    }
+    g.forEach((id) => uniquePlayers.add(id));
+  }
+
+  // A pairing may recur once the window has aged out, but across six rounds of
+  // a 24-strong roster there is no excuse for it.
+  expect(repeats).toBe(0);
+  // And the floor should actually be rotating, not cycling the same eight.
+  expect(uniquePlayers.size).toBeGreaterThanOrEqual(12);
+});
+
 /* ─────────────────────────────────────────────
    FAILURE VISIBILITY
    Both of these used to fail silently, which is what made them read as missing
