@@ -200,6 +200,10 @@ export default function App() {
   // blob: a club that set up on the desk iPad must not be re-onboarded on the
   // manager's laptop.
   const [onboarded, setOnboarded] = useState(true);
+  // Set when a win/loss write is rejected. Purely a warning surface: the session
+  // keeps working, but staff need to know the numbers on screen are not saved,
+  // because a reload silently reverts them all to zero.
+  const [statsWriteFailed, setStatsWriteFailed] = useState(false);
 
   const [showDisplayLink, setShowDisplayLink] = useState(false);
   const [displayToken, setDisplayToken] = useState(venue.display_token);
@@ -573,8 +577,32 @@ export default function App() {
   // straight back onto the end of the queue, so play rotates without staff having
   // to rebuild the group. Checked-out players are left out; rentals never requeue.
   // Once queued they can be freely dragged to swap opponents or fill a short group.
-  const requeueGroup = (playerIds) => {
+  // `nextHistory` must be the history INCLUDING the game that just finished —
+  // React state hasn't flushed yet at the call site, and re-matching against a
+  // stale history is precisely what would let the finished pairings repeat.
+  const requeueGroup = (playerIds, nextHistory) => {
     if (!autoAssign) return;
+
+    // The four coming off court are free again; anyone else on a court or
+    // already sitting in the queue is not.
+    const leaving = new Set(playerIds);
+    const stillBusy = new Set([...busyPlayerIds].filter(id => !leaving.has(id)));
+    const available = players.filter(p => !p.checkedOut && !stillBusy.has(p.id));
+
+    // Re-match instead of re-queueing the same four. Handing the group straight
+    // back its own line-up was the bug: it bypassed the matcher entirely, so
+    // repeat-partner avoidance and the Winners/Losers style never got a say in
+    // the rotation that produces almost every group on a busy floor.
+    const group = buildAutoGroup(available, nextHistory, matchingStyle);
+    if (group) {
+      setQueue(prev => [...prev, {
+        id: Date.now() + Math.random(), players: group.map(p => p.id), type: 'requeue',
+      }]);
+      return;
+    }
+
+    // Fewer than four free to draft from — keep the finishers together rather
+    // than dropping them off the queue altogether.
     const eligible = playerIds.filter(id => {
       const p = players.find(pl => pl.id === id);
       return p && !p.checkedOut;
@@ -609,7 +637,7 @@ export default function App() {
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
     recordMatchHistory(venueId, { ...entry, courtName: court.name });
     // Open-play groups rotate back into the queue when Auto-Filling is on.
-    if (court.type !== 'rental') requeueGroup(court.match.players);
+    if (court.type !== 'rental') requeueGroup(court.match.players, [entry, ...history]);
   };
 
   const finishMatch = (courtId, winningPair) => {
@@ -646,11 +674,17 @@ export default function App() {
 
     // Fire-and-forget: the UI has already moved on, and both of these are
     // recoverable (stats can be corrected, history is for later analysis).
-    recordResult(winners, losers).catch(err =>
-      console.error('Failed to save win/loss:', err));
+    // Not silent on failure any more: the optimistic update above makes a broken
+    // write invisible until staff reload and find every W/L back at zero. The
+    // usual cause is record_match_result() missing because schema.sql hasn't
+    // been re-run against this database.
+    recordResult(winners, losers).catch(err => {
+      console.error('Failed to save win/loss:', err);
+      setStatsWriteFailed(true);
+    });
     recordMatchHistory(venueId, { ...entry, courtName: court.name });
     // Both teams rotate back into the queue when Auto-Filling is on.
-    requeueGroup(court.match.players);
+    requeueGroup(court.match.players, [entry, ...history]);
   };
 
   const addCourt = () => {
@@ -1074,6 +1108,27 @@ export default function App() {
         )}
       </header>
 
+      {/* Stats are updated optimistically, so a rejected write leaves correct
+          numbers on screen that vanish on the next reload. Say so rather than
+          letting staff discover it after a full session of scorekeeping. */}
+      {statsWriteFailed && (
+        <div className="bg-rose-950 border-b border-rose-800 px-4 sm:px-6 py-2 flex items-center gap-3 shrink-0">
+          <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+          <p className="text-rose-200 text-sm flex-1 min-w-0">
+            <span className="font-bold">Win/loss results aren’t being saved.</span>{' '}
+            They’ll reset when this page reloads. Your database is likely missing the
+            latest <code className="text-rose-300">supabase/schema.sql</code> — re-run it,
+            then finish a match to clear this.
+          </p>
+          <button
+            onClick={() => setStatsWriteFailed(false)}
+            className="text-rose-400 hover:text-rose-200 text-xs font-semibold shrink-0"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {/* ── VIEWS ───────────────────────────────
           `min-h-0` is what lets this flex child shrink to the leftover height
           instead of growing to fit its content — without it the 100vh lock on
@@ -1286,19 +1341,33 @@ function DisplayLinkModal({ token, slug, venueName, onRegenerate, onClose }) {
         </a>
       </div>
 
-      {/* The club board (spec §F4). Only once the venue actually has a slug —
-          it's null until schema.sql has been re-run on an existing database. */}
-      {slug && (
-        <div className="border-t border-zinc-800 pt-4 mb-5">
-          <h4 className="font-display text-lg mb-1">Club queue link</h4>
-          <p className="text-zinc-400 text-sm mb-3">
-            Print this for the front desk — players scan it to see the queue on their
-            phone. It never changes, so regenerating the TV link above leaves every
-            printed copy working.
-          </p>
-          <ClubQrPoster venueName={venueName} slug={slug} />
-        </div>
-      )}
+      {/* The club board (spec §F4). Needs venues.slug, which is null until
+          schema.sql has been re-run on an existing database — in which case say
+          so, because silently rendering nothing reads as "the QR feature is
+          missing" rather than "your database is out of date". */}
+      <div className="border-t border-zinc-800 pt-4 mb-5">
+        <h4 className="font-display text-lg mb-1">Club queue link</h4>
+        {slug ? (
+          <>
+            <p className="text-zinc-400 text-sm mb-3">
+              Print this for the front desk — players scan it to see the queue on their
+              phone. It never changes, so regenerating the TV link above leaves every
+              printed copy working.
+            </p>
+            <ClubQrPoster venueName={venueName} slug={slug} />
+          </>
+        ) : (
+          <div className="bg-amber-950 bg-opacity-40 border border-amber-800 rounded-lg p-3 flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <p className="text-amber-200 text-sm">
+              <span className="font-bold">No printable QR code yet.</span> This club has no
+              queue address, which means the database is missing the latest{' '}
+              <code className="text-amber-300">supabase/schema.sql</code>. Re-run it and
+              reload — the QR poster appears here automatically.
+            </p>
+          </div>
+        )}
+      </div>
 
       <div className="border-t border-zinc-800 pt-4">
         <button

@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { Activity, ArrowLeft, Crown, Medal, Users } from 'lucide-react';
 import { useAuth } from '../lib/AuthProvider';
 import { listPlayers, countMatchHistory } from '../lib/players';
-import { allTimeLeaderboard, RANKED_MIN_GAMES } from '../lib/logic';
+import { allTimeLeaderboard, gamesToRank, RANKED_MIN_GAMES } from '../lib/logic';
 
 /* ─────────────────────────────────────────────
    ALL-TIME RANKINGS (spec §F3)
@@ -123,8 +123,15 @@ export default function LeaderboardPage() {
           {rows === null ? (
             <p className="text-zinc-500 text-center py-8 cf-breathe">Loading…</p>
           ) : board.ranked.length === 0 ? (
+            /* Two different empty states, and conflating them produced the
+               contradiction this page used to show ("nobody qualifies yet" sat
+               directly above "everyone who has played is ranked"). Nobody
+               qualifying is only worth explaining when somebody is actually
+               working towards it — otherwise the roster is simply empty. */
             <p className="text-zinc-500 text-center py-8">
-              Nobody has played {RANKED_MIN_GAMES} games yet. Rankings appear once they do.
+              {board.unranked.length > 0
+                ? `No rankings yet — ${RANKED_MIN_GAMES} games needed to qualify. Everyone playing is listed below.`
+                : 'No games recorded yet. Finish a match to start the rankings.'}
             </p>
           ) : (
             <div className="space-y-1">
@@ -164,14 +171,14 @@ export default function LeaderboardPage() {
             </div>
           )}
 
-          {rows !== null && (
+          {/* Only rendered when there is something to put in it — an empty
+              section under an empty ranking is what created the contradiction. */}
+          {rows !== null && board.unranked.length > 0 && (
             <div className="mt-4 pt-4 border-t border-zinc-800">
               <div className="text-xs text-zinc-500 font-bold tracking-widest mb-2">
                 NOT YET RANKED
               </div>
-              {board.unranked.length === 0 ? (
-                <p className="text-zinc-600 text-sm py-2">Everyone who has played is ranked.</p>
-              ) : (
+              {(
                 <>
                   <div className="space-y-1">
                     {board.unranked.map((p) => (
@@ -183,8 +190,13 @@ export default function LeaderboardPage() {
                           <span className="text-zinc-300 truncate">{p.name}</span>
                           <span className="text-zinc-600"> · {p.skill}</span>
                         </div>
-                        <span className="text-zinc-500 shrink-0">
-                          {p.games}/{RANKED_MIN_GAMES} games
+                        {/* Their record matters to them even before it counts for
+                            ranking — showing only "3/10 games" hid it. */}
+                        <span className="text-zinc-400 shrink-0 tabular-nums">
+                          {p.wins}W {p.defeats}L
+                        </span>
+                        <span className="text-zinc-500 shrink-0 text-xs w-36 text-right">
+                          {gamesToRank(p.games)}
                         </span>
                       </div>
                     ))}

@@ -139,7 +139,11 @@ export const MATCHING_STYLES = {
     value: 'balanced',
     label: 'Balanced',
     short: 'Balanced',
-    blurb: 'Pairs the strongest with the weakest, and avoids repeating partners.',
+    // Describes what the matcher now actually does — the repeat-partner claim
+    // was true of balancedFreshGroup but not of the rotation path that formed
+    // most real groups, and the rest-fairness half is new.
+    blurb:
+      'Pairs the strongest with the weakest, avoids repeating partners, and gives waiting players the next court.',
   },
   winnersLosers: {
     value: 'winnersLosers',
@@ -267,6 +271,34 @@ export const recentPartners = (history, window = PARTNER_WINDOW) => {
 
 export const partnerWeight = (counts, a, b) => counts.get(pairKey(a, b)) ?? 0;
 
+/* ─────────────────────────────────────────────
+   REST FAIRNESS
+   Repeat-partner avoidance alone still lets the same strong four monopolise a
+   court: they are the top of the skill-sorted pool every time, so the draft
+   keeps picking them and only reshuffles who partners whom. This adds the other
+   half — someone who has just come off court sorts below someone who has been
+   waiting, so the pool actually rotates.
+   ───────────────────────────────────────────── */
+
+// → Map<playerId, 0..1> where 1 means "played the game that just finished" and
+// values decay to 0 at the edge of the window. Only a player's MOST RECENT
+// appearance counts: playing twice in a row is no more tiring, for scheduling
+// purposes, than playing once just now.
+export const recentlyPlayed = (history, window = PARTNER_WINDOW) => {
+  const rest = new Map();
+  (history ?? []).slice(0, window).forEach((h, i) => {
+    const ids = Array.isArray(h?.players) ? h.players : [];
+    const w = (window - i) / window;
+    for (const id of ids) {
+      const k = String(id);
+      if (!rest.has(k) || rest.get(k) < w) rest.set(k, w);
+    }
+  });
+  return rest;
+};
+
+export const restCost = (rest, id) => rest.get(String(id)) ?? 0;
+
 // Every 4-subset of `arr`, as index tuples, in a fixed ascending order. Index
 // tuples rather than objects so the caller gets "how far down the pool did we
 // reach" for free. Bounded: the caller caps the pool at POOL_SIZE, so this is at
@@ -296,10 +328,19 @@ export const POOL_SIZE = 8;
 
 // Lexicographic priorities, encoded as weights so it stays a single comparison:
 //   1. avoid recent partners                            (dominant)
-//   2. stay near the top of the skill-sorted pool — i.e. behave like the old
+//   2. favour players who have been waiting             (rotates the pool)
+//   3. stay near the top of the skill-sorted pool — i.e. behave like the old
 //      "top four" rule whenever nothing else is at stake
-//   3. keep the two teams even                          (picks the split)
-const REPEAT_WEIGHT = 100;
+//   4. keep the two teams even                          (picks the split)
+// The bands have to be read against their worst cases, not their nominal sizes:
+//   position — index 0..7 per player, so 6 (top four) to 22 (bottom four) → ≤220
+//   rest     — 0..1 per player                                            → ≤400
+//   repeat   — one partnership from last round alone                      → 4000
+// So rest genuinely outranks position (a pool of eight equals rotates instead
+// of the first four always playing) while a single repeated pairing still costs
+// more than any amount of tiredness or position can.
+const REPEAT_WEIGHT = 1000;
+const REST_WEIGHT = 100;
 const POSITION_WEIGHT = 10;
 
 export const balancedFreshGroup = (
@@ -314,6 +355,7 @@ export const balancedFreshGroup = (
   );
   const candidates = ranked.slice(0, Math.max(4, pool));
   const partners = recentPartners(history, partnerWindow);
+  const rest = recentlyPlayed(history, partnerWindow);
 
   let best = null;
   let bestCost = Infinity;
@@ -322,13 +364,19 @@ export const balancedFreshGroup = (
     const four = idx.map((i) => candidates[i]); // still skill-descending
     const positionCost = idx[0] + idx[1] + idx[2] + idx[3]; // top four → 6, the minimum
     const ranks = four.map((p) => skillRank(p.skill));
+    // Depends only on WHICH four, not how they're split, so it's hoisted.
+    const tiredness = four.reduce((n, p) => n + restCost(rest, p.id), 0);
 
     for (const [a, b, c, d] of SPLITS) {
       const repeats =
         partnerWeight(partners, four[a].id, four[b].id) +
         partnerWeight(partners, four[c].id, four[d].id);
       const imbalance = Math.abs(ranks[a] + ranks[b] - ranks[c] - ranks[d]);
-      const cost = REPEAT_WEIGHT * repeats + POSITION_WEIGHT * positionCost + imbalance;
+      const cost =
+        REPEAT_WEIGHT * repeats +
+        REST_WEIGHT * tiredness +
+        POSITION_WEIGHT * positionCost +
+        imbalance;
       // Strict < keeps the FIRST minimum found, and both loops run in a fixed
       // order, so identical inputs always produce identical output.
       if (cost < bestCost) {
@@ -399,6 +447,15 @@ export const allTimeLeaderboard = (players, minGames = RANKED_MIN_GAMES) => {
     // rankings page shows the venue's own count from match_history instead.
     totalGames: rows.reduce((n, r) => n + r.games, 0),
   };
+};
+
+// The label under an unranked player. Phrased as what's left to do rather than
+// as a bare "3/10", which reads like a score and buries the actual ask.
+// Singular-aware: "Needs 1 more games" looks like a bug.
+export const gamesToRank = (games, minGames = RANKED_MIN_GAMES) => {
+  const remaining = Math.max(0, minGames - (games ?? 0));
+  if (remaining === 0) return 'Ready to rank';
+  return `Needs ${remaining} more game${remaining === 1 ? '' : 's'} to rank`;
 };
 
 /* ─────────────────────────────────────────────

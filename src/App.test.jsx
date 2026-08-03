@@ -22,6 +22,9 @@ import {
   buildAutoGroup,
   allTimeLeaderboard,
   RANKED_MIN_GAMES,
+  gamesToRank,
+  recentlyPlayed,
+  restCost,
   slugify,
   isValidSlug,
 } from './lib/logic.js';
@@ -793,6 +796,92 @@ describe('allTimeLeaderboard', () => {
   it('honours a custom minimum', () => {
     const rows = [player(1, 'Short', 2, 1)];
     expect(allTimeLeaderboard(rows, 3).ranked.map((r) => r.id)).toEqual([1]);
+  });
+});
+
+describe('gamesToRank', () => {
+  it('counts down the games still needed', () => {
+    expect(gamesToRank(3)).toBe('Needs 7 more games to rank');
+    expect(gamesToRank(0)).toBe('Needs 10 more games to rank');
+  });
+  it('uses the singular for the last game', () => {
+    expect(gamesToRank(9)).toBe('Needs 1 more game to rank');
+  });
+  it('never counts below zero', () => {
+    expect(gamesToRank(10)).toBe('Ready to rank');
+    expect(gamesToRank(40)).toBe('Ready to rank');
+  });
+  it('is null-safe and honours a custom minimum', () => {
+    expect(gamesToRank(undefined)).toBe('Needs 10 more games to rank');
+    expect(gamesToRank(1, 3)).toBe('Needs 2 more games to rank');
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+   REST FAIRNESS — stops the same strong four monopolising a court
+   ═══════════════════════════════════════════════════════════════════════ */
+describe('recentlyPlayed', () => {
+  it('scores the players from the game that just finished highest', () => {
+    const rest = recentlyPlayed([{ players: [1, 2, 3, 4] }, { players: [5, 6, 7, 8] }]);
+    expect(restCost(rest, 1)).toBeGreaterThan(restCost(rest, 5));
+  });
+
+  it('scores someone who has not played at all as 0', () => {
+    const rest = recentlyPlayed([{ players: [1, 2, 3, 4] }]);
+    expect(restCost(rest, 99)).toBe(0);
+  });
+
+  it('keeps only a player’s most recent appearance', () => {
+    // Playing twice running is no more tiring, for scheduling, than once just now.
+    const twice = recentlyPlayed([{ players: [1, 2, 3, 4] }, { players: [1, 2, 5, 6] }]);
+    const once = recentlyPlayed([{ players: [1, 2, 3, 4] }]);
+    expect(restCost(twice, 1)).toBe(restCost(once, 1));
+  });
+
+  it('never exceeds 1 and decays with age', () => {
+    const rest = recentlyPlayed([
+      { players: [1, 2, 3, 4] },
+      { players: [5, 6, 7, 8] },
+      { players: [9, 10, 11, 12] },
+    ]);
+    expect(restCost(rest, 1)).toBe(1);
+    expect(restCost(rest, 5)).toBeLessThan(1);
+    expect(restCost(rest, 9)).toBeLessThan(restCost(rest, 5));
+  });
+
+  it('respects the window and an empty history', () => {
+    const rest = recentlyPlayed([{ players: [1, 2, 3, 4] }, { players: [5, 6, 7, 8] }], 1);
+    expect(restCost(rest, 1)).toBe(1);
+    expect(restCost(rest, 5)).toBe(0);
+    expect(recentlyPlayed([]).size).toBe(0);
+    expect(recentlyPlayed(undefined).size).toBe(0);
+  });
+});
+
+describe('balancedFreshGroup rest fairness', () => {
+  it('prefers rested players over the four who just came off court', () => {
+    // Eight equals: 1-4 have just played, 5-8 have been waiting. Nothing but
+    // rest separates them, so the waiting four must get the court.
+    const eight = [1, 2, 3, 4, 5, 6, 7, 8].map((id) => ({ id: String(id), skill: 'Intermediate' }));
+    const group = balancedFreshGroup(eight, [{ players: ['1', '2', '3', '4'] }]);
+    expect(ids(group).sort()).toEqual(['5', '6', '7', '8']);
+  });
+
+  it('still lets skill and repeat-avoidance outrank rest', () => {
+    // A repeated partnership costs far more than tiredness ever can, so the
+    // pairing that just happened must not come back just because those two
+    // are the most rested option.
+    const four = [1, 2, 3, 4].map((id) => ({ id: String(id), skill: 'Intermediate' }));
+    const group = ids(balancedFreshGroup(four, [{ players: ['1', '2', '3', '4'] }]));
+    const partnered = (a, b) =>
+      Math.floor(group.indexOf(a) / 2) === Math.floor(group.indexOf(b) / 2);
+    expect(partnered('1', '2')).toBe(false);
+    expect(partnered('3', '4')).toBe(false);
+  });
+
+  it('is unchanged with no history (the backwards-compat guard still holds)', () => {
+    const five = [...tieredFour, { id: 5, skill: 'Beginner' }];
+    expect(balancedFreshGroup(five, [])).toEqual(balancedGroup(tieredFour));
   });
 });
 
