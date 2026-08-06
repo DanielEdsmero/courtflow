@@ -2,10 +2,14 @@ import { test, expect } from '@playwright/test';
 import { stubRest, stubRealtime, signIn } from './stub-supabase.js';
 
 /* ─────────────────────────────────────────────
-   MATCH REVEAL + SETTINGS
-   The reveal is a ~7s full-screen overlay, so these specs mostly assert on
-   TIMING and on the fact that state is committed independently of it — the
-   whole design rests on the court being assigned before the animation starts.
+   QUEUE → COURT FLIGHT + SETTINGS
+   The reveal happens in place now: players appear inside their queue group
+   card, the card glows, then they fly up into the court card.
+
+   The assertions that matter most are about WHO OWNS the players at each
+   moment — the flight only works because exactly one side renders a given
+   layoutId at a time — and about the assignment being committed up front,
+   independently of the animation.
    ───────────────────────────────────────────── */
 
 function row(id, name) {
@@ -33,7 +37,7 @@ const ROSTER = [
 ];
 
 // Auto-Filling off, one free court, one complete group waiting — so the test
-// drives the assignment itself rather than racing the auto-assign effect.
+// drives the assignment rather than racing the auto-assign effect.
 const readyToAssign = () => ({
   competitiveMode: true,
   autoAssign: false,
@@ -54,7 +58,6 @@ async function open(page, prefs) {
   return calls;
 }
 
-// Queue → "Assign to court" → pick a duration on Court 1.
 async function assignToCourt(page) {
   await page.getByRole('button', { name: /Assign to court/ }).click();
   const dialog = page.getByRole('dialog', { name: 'Assign to court' });
@@ -62,74 +65,104 @@ async function assignToCourt(page) {
   await dialog.getByRole('button', { name: 'Open', exact: true }).click();
 }
 
-const overlay = (page) => page.locator('[data-match-reveal]');
+const ghost = (page) => page.locator('[data-flight-ghost]');
+const courtCard = (page) => page.locator('[data-court-id="1"]');
+const flightItems = (page) => page.locator('[data-flight-player]');
 
-/* ── the sequence ───────────────────────────── */
+/* ── phase 1: reveal inside the queue ───────── */
 
-test('assigning a court plays the reveal with all four players', async ({ page }) => {
+test('the four are revealed inside the queue group, not in a centre overlay', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
 
-  await expect(overlay(page)).toBeVisible();
-  await expect(overlay(page).locator('[data-reveal-card]')).toHaveCount(4);
+  await expect(ghost(page)).toBeVisible();
+  await expect(ghost(page).locator('[data-flight-player]')).toHaveCount(4);
   for (const name of ['Ann Alpha', 'Ben Bravo', 'Cal Charlie', 'Dee Delta']) {
-    await expect(overlay(page).getByText(name)).toBeVisible();
+    await expect(ghost(page).getByText(name)).toBeVisible();
   }
 });
 
-test('every player shows an avatar, not just a name', async ({ page }) => {
+test('the ghost sits in the queue column, below the courts band', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
+  await expect(ghost(page)).toBeVisible();
 
-  // These four have no photo_url, so each avatar is the initials disc. Either
-  // way there must be exactly one avatar per card.
-  const cards = overlay(page).locator('[data-reveal-card]');
-  await expect(cards).toHaveCount(4);
-  for (const initials of ['AA', 'BB', 'CC', 'DD']) {
-    await expect(overlay(page).getByText(initials, { exact: true })).toBeVisible();
-  }
+  // The whole point of the redesign: the players start low on the page and the
+  // court is up top, so the flight reads as travel.
+  const from = await ghost(page).boundingBox();
+  const to = await courtCard(page).boundingBox();
+  expect(from.y).toBeGreaterThan(to.y);
 });
 
-test('the four stay on screen for at least five seconds', async ({ page }) => {
-  await open(page, { animations: true, sound: false });
-  const started = Date.now();
-  await assignToCourt(page);
-  await expect(overlay(page)).toBeVisible();
+/* ── the layoutId handover ──────────────────── */
 
-  // Still showing all four at the 5s mark — the minimum the brief asks for.
-  await page.waitForTimeout(5000 - (Date.now() - started));
-  await expect(overlay(page).locator('[data-reveal-card]')).toHaveCount(4);
+test('only one side owns each player while the flight is pending', async ({ page }) => {
+  await open(page, { animations: true, sound: false });
+  await assignToCourt(page);
+  await expect(ghost(page)).toBeVisible();
+
+  // Duplicated layoutIds are what break a Framer morph — during phases 1-2 the
+  // court must render none of the four.
+  await expect(flightItems(page)).toHaveCount(4);
+  await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(0);
 });
 
-test('the court label appears during the hold phase, not at the start', async ({ page }) => {
+test('the court takes ownership once the flight starts', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
+  await expect(ghost(page)).toBeVisible();
 
-  // Phase 1 is the deal; "Matched!" belongs to phase 2 at the 4s mark.
-  await expect(overlay(page).getByText('Matched!')).toHaveCount(0);
-  await expect(overlay(page).getByText('Matched!')).toBeVisible({ timeout: 8000 });
-  await expect(overlay(page).getByText('Going to Court 1')).toBeVisible();
+  // Phase 3 hands the ids over: the ghost empties, the court fills.
+  await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4, { timeout: 8000 });
+  await expect(ghost(page).locator('[data-flight-player]')).toHaveCount(0);
+  // And still exactly four in the document — never eight.
+  await expect(flightItems(page)).toHaveCount(4);
 });
 
-test('the overlay clears itself and the court ends up in play', async ({ page }) => {
+/* ── phase 2: hold and label ────────────────── */
+
+test('the court label appears in the hold phase, not at the start', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(overlay(page)).toBeVisible();
 
-  await expect(overlay(page)).toHaveCount(0, { timeout: 12_000 });
+  await expect(ghost(page).getByText('Going to Court 1')).toHaveCount(0);
+  await expect(ghost(page).getByText('Going to Court 1')).toBeVisible({ timeout: 6000 });
+});
+
+test('the group card glows once it is ready to move', async ({ page }) => {
+  await open(page, { animations: true, sound: false });
+  await assignToCourt(page);
+
+  await expect(ghost(page)).not.toHaveClass(/border-lime-500/);
+  await expect(ghost(page)).toHaveClass(/border-lime-500/, { timeout: 6000 });
+});
+
+/* ── the whole sequence ─────────────────────── */
+
+test('the ghost clears and the court ends up in play', async ({ page }) => {
+  await open(page, { animations: true, sound: false });
+  await assignToCourt(page);
+  await expect(ghost(page)).toBeVisible();
+
+  await expect(ghost(page)).toHaveCount(0, { timeout: 12_000 });
   await expect(page.getByRole('button', { name: 'FINISH MATCH' })).toBeVisible();
+  await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4);
 });
 
 test('clicking anywhere skips the sequence', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(overlay(page)).toBeVisible();
+  await expect(ghost(page)).toBeVisible();
 
+  // The skip listener arms after the click that started the sequence has
+  // finished propagating, so wait past that before clicking.
+  await page.waitForTimeout(600);
   const skippedAt = Date.now();
-  await overlay(page).click({ position: { x: 10, y: 10 } });
-  await expect(overlay(page)).toHaveCount(0, { timeout: 4000 });
-  // Well inside the ~7s the full sequence would have taken.
+  await page.getByRole('heading', { name: 'ROSTER' }).click();
+
+  await expect(ghost(page)).toHaveCount(0, { timeout: 4000 });
   expect(Date.now() - skippedAt).toBeLessThan(4000);
+  await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4);
 });
 
 /* ── the assignment is not hostage to the animation ── */
@@ -137,26 +170,43 @@ test('clicking anywhere skips the sequence', async ({ page }) => {
 test('the court is committed before the animation finishes', async ({ page }) => {
   const calls = await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(overlay(page)).toBeVisible();
+  await expect(ghost(page)).toBeVisible();
 
-  // Still mid-sequence, but the session write already has the match on Court 1
-  // and the queue emptied. A reload here must not lose the assignment.
+  // Mid-sequence the session write already has the match on Court 1 and the
+  // queue emptied. A reload here must not lose the assignment.
   await expect
     .poll(() => calls.lastSessionWrite?.courts?.[0]?.match?.players, { timeout: 5000 })
     .toEqual(['p1', 'p2', 'p3', 'p4']);
   expect(calls.lastSessionWrite.queue).toEqual([]);
 });
 
+test('reloading mid-flight shows the true state, not the ghost', async ({ page }) => {
+  const calls = await open(page, { animations: true, sound: false });
+  await assignToCourt(page);
+  await expect(ghost(page)).toBeVisible();
+
+  // Session writes are debounced ~600ms, so wait for the assignment to actually
+  // reach the server before reloading — otherwise this measures the debounce,
+  // not the ghost. Still comfortably mid-sequence.
+  await expect
+    .poll(() => calls.lastSessionWrite?.courts?.[0]?.match?.players, { timeout: 5000 })
+    .toEqual(['p1', 'p2', 'p3', 'p4']);
+
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  await expect(ghost(page)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'FINISH MATCH' })).toBeVisible();
+});
+
 /* ── animations off ─────────────────────────── */
 
-test('with animations off the court fills instantly and no overlay appears', async ({ page }) => {
+test('with animations off the court fills instantly and no ghost appears', async ({ page }) => {
   const calls = await open(page, { animations: false, sound: false });
   await assignToCourt(page);
 
   await expect(page.getByRole('button', { name: 'FINISH MATCH' })).toBeVisible();
-  await expect(overlay(page)).toHaveCount(0);
-  // The session write is debounced, so poll rather than reading it the instant
-  // the button appears.
+  await expect(ghost(page)).toHaveCount(0);
+  await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4);
   await expect
     .poll(() => calls.lastSessionWrite?.courts?.[0]?.match?.players, { timeout: 5000 })
     .toEqual(['p1', 'p2', 'p3', 'p4']);
@@ -173,7 +223,6 @@ test('the gear menu exposes both toggles independently', async ({ page }) => {
   await expect(animations).toHaveAttribute('aria-checked', 'true');
   await expect(sound).toHaveAttribute('aria-checked', 'true');
 
-  // Turning sound off must leave animations alone.
   await sound.click();
   await expect(sound).toHaveAttribute('aria-checked', 'false');
   await expect(animations).toHaveAttribute('aria-checked', 'true');
@@ -201,13 +250,13 @@ test('animations switched off in the menu take effect immediately', async ({ pag
 
   await assignToCourt(page);
   await expect(page.getByRole('button', { name: 'FINISH MATCH' })).toBeVisible();
-  await expect(overlay(page)).toHaveCount(0);
+  await expect(ghost(page)).toHaveCount(0);
 });
 
 test('sound off still plays the full animation', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(overlay(page)).toBeVisible();
-  await expect(overlay(page).locator('[data-reveal-card]')).toHaveCount(4);
-  await expect(overlay(page).getByText('Matched!')).toBeVisible({ timeout: 8000 });
+  await expect(ghost(page)).toBeVisible();
+  await expect(ghost(page).locator('[data-flight-player]')).toHaveCount(4);
+  await expect(ghost(page).getByText('Going to Court 1')).toBeVisible({ timeout: 6000 });
 });

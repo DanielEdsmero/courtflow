@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { AnimatePresence } from 'motion/react';
+import { LayoutGroup } from 'motion/react';
 import {
   Plus, Trophy, RotateCcw, X, Check, Search, Zap, Monitor,
   Settings, Users, ChevronRight, Clock, Trash2, UserPlus,
@@ -30,11 +30,14 @@ import ModalShell from './components/ModalShell';
 import OnboardingWizard from './components/OnboardingWizard';
 import ClubQrPoster from './components/ClubQrPoster';
 import SettingsMenu from './components/SettingsMenu';
-import MatchRevealOverlay from './components/MatchRevealOverlay';
 import PlayerAvatar from './components/PlayerAvatar';
+import {
+  FlightPlayerItem, GhostQueueGroup,
+  STAGGER_MS, REVEAL_END_MS, HOLD_END_MS, TOTAL_MS,
+} from './components/matchFlight';
 import { skillStyle, skillStyleSolid } from './lib/skillStyles';
 import { loadPrefs, savePrefs } from './lib/prefs';
-import { setSoundEnabled } from './lib/sound';
+import { setSoundEnabled, playTick, playChime, playThud } from './lib/sound';
 
 // Pure logic lives in ./lib/logic.js so tests can import it without booting the
 // Supabase client. Re-exported here because existing callers import from App.
@@ -234,14 +237,66 @@ export default function App() {
   // the auto-assign paths. Returns silently when animations are off, when a
   // reveal is already playing, or for a group that isn't a full four — a
   // celebration of a half-empty court would be worse than none.
-  const startReveal = (playerIds, court) => {
+  //
+  // `groupIndex` is where the group sat in the queue, so the ghost card appears
+  // in its place rather than jumping to the top of the list.
+  const startReveal = (playerIds, court, groupIndex) => {
     if (!prefs.animations || revealRef.current || !court) return;
     const revealed = playerIds.map(playerById).filter(Boolean);
     if (revealed.length < 4) return;
-    const next = { players: revealed, courtId: court.id, courtName: court.name };
+    const next = {
+      token: `${court.id}-${Date.now()}`, // stable key for the phase timers
+      players: revealed,
+      courtId: court.id,
+      courtName: court.name,
+      groupIndex: Math.max(0, groupIndex),
+      phase: 1,
+    };
     revealRef.current = next; // claim the lock now, not on the next render
     setReveal(next);
   };
+
+  const endReveal = () => { revealRef.current = null; setReveal(null); };
+
+  // Drives the three phases. Keyed on `token` rather than the whole object, so
+  // advancing the phase inside the effect doesn't restart the timeline.
+  const revealToken = reveal?.token;
+  useEffect(() => {
+    if (!revealToken) return;
+    const timers = [];
+    const at = (ms, fn) => timers.push(setTimeout(fn, ms));
+    const soundOn = prefs.sound;
+
+    // One tick per player, matched to the reveal stagger.
+    if (soundOn) reveal.players.forEach((_, i) => at(i * STAGGER_MS, playTick));
+
+    at(REVEAL_END_MS, () => {
+      setReveal(r => (r ? { ...r, phase: 2 } : r));
+      if (soundOn) playChime();
+    });
+    at(HOLD_END_MS, () => {
+      // Phase 3 is the unmount that hands the layoutIds to the court card.
+      setReveal(r => (r ? { ...r, phase: 3 } : r));
+      if (soundOn) playThud();
+    });
+    at(TOTAL_MS, endReveal);
+
+    // Skip on any click, once the click that STARTED the sequence has finished
+    // propagating — without the delay the assign button's own click would land
+    // here and cancel the animation instantly.
+    let skip = null;
+    const armSkip = setTimeout(() => {
+      skip = () => endReveal();
+      document.addEventListener('click', skip);
+    }, 400);
+
+    return () => {
+      timers.forEach(clearTimeout);
+      clearTimeout(armSkip);
+      if (skip) document.removeEventListener('click', skip);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [revealToken]);
   // Staff-only peek at the hidden values (spec §1). Deliberately plain state:
   // it is not persisted and not in the session blob, so it is off again on every
   // reload and can never reach the TV display or the public club board.
@@ -384,7 +439,7 @@ export default function App() {
     };
     setCourts(prev => prev.map(c => c.id === freeCourt.id ? { ...c, match } : c));
     setQueue(prev => prev.filter(g => g.id !== nextGroup.id));
-    startReveal(nextGroup.players, freeCourt);
+    startReveal(nextGroup.players, freeCourt, 0); // auto-assign always takes the head
     // startReveal reads prefs/playerById but re-running this effect when those
     // change would re-assign a court, so it is deliberately not a dependency.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -550,10 +605,11 @@ export default function App() {
       endsAt: durationMin ? now + durationMin * 60 * 1000 : null,
       durationMin: durationMin || null,
     };
+    const groupIndex = queue.findIndex(g => g.id === groupId);
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match } : c));
     setQueue(prev => prev.filter(g => g.id !== groupId));
     setShowAssign(null);
-    startReveal(group.players, court);
+    startReveal(group.players, court, groupIndex);
   };
 
   const assignRental = (courtId, hostId, durationMin) => {
@@ -1242,6 +1298,8 @@ export default function App() {
           autoGroup={autoGroup}
           showValues={showValues}
           setShowValues={setShowValues}
+          reveal={reveal}
+          onSkipReveal={endReveal}
           setShowAssign={setShowAssign}
           setShowRental={setShowRental}
           removeFromQueue={removeFromQueue}
@@ -1373,20 +1431,6 @@ export default function App() {
           onClose={() => setShowDisplayLink(false)}
         />
       )}
-      {/* Sits above every modal: it is a full-screen moment, and a dialog
-          opening underneath it would be invisible anyway. */}
-      <AnimatePresence>
-        {reveal && (
-          <MatchRevealOverlay
-            key="match-reveal"
-            players={reveal.players}
-            courtId={reveal.courtId}
-            courtName={reveal.courtName}
-            soundOn={prefs.sound}
-            onDone={() => { revealRef.current = null; setReveal(null); }}
-          />
-        )}
-      </AnimatePresence>
       {showWizard && (
         <OnboardingWizard
           courtCount={courts.length}
@@ -1721,8 +1765,13 @@ function StaffView(props) {
     draggingPlayerId, setDraggingPlayerId,
     setFinishingCourt, clearCourtCasual,
     addCourt, removeCourt, toggleCourtType, renameCourt, playerById,
-    showValues, setShowValues,
+    showValues, setShowValues, reveal, onSkipReveal,
   } = props;
+
+  // While players are in flight the two scrollers have to stop clipping, or the
+  // items get cut off at the edge of the courts band on their way in.
+  const flying = !!reveal;
+  const scrollClass = flying ? 'overflow-visible' : 'overflow-y-auto';
 
   const [dragOverZone, setDragOverZone] = useState(null);
   // The specific queued player a drag is hovering — the one who'll be swapped out.
@@ -1741,10 +1790,15 @@ function StaffView(props) {
   const checkedOutPlayers = players.filter(p => p.checkedOut);
 
   return (
-    /* Desktop: a fixed-height column — courts band on top, then the three
-       working panels sharing the leftover height. Each panel scrolls internally
-       so the page itself never grows past the viewport. */
-    <div className="p-3 sm:p-4 flex flex-col gap-3 lg:h-full lg:overflow-hidden">
+    /* Desktop: a fixed-height column — courts band on top, then the two working
+       panels sharing the leftover height. Each panel scrolls internally so the
+       page itself never grows past the viewport.
+
+       The LayoutGroup spans BOTH the courts band and the queue: it is what lets
+       a player's layoutId in the queue find the matching one in a court card,
+       so the four can physically fly up between two separate components. */
+    <LayoutGroup id="queue-flight">
+    <div className={`p-3 sm:p-4 flex flex-col gap-3 lg:h-full ${flying ? '' : 'lg:overflow-hidden'}`}>
       {/* COURTS */}
       <section className="shrink-0 flex flex-col min-h-0">
         <div className="flex items-center justify-between mb-1.5 shrink-0">
@@ -1768,7 +1822,7 @@ function StaffView(props) {
             50% each, 4 → 25%, and beyond that they wrap. `min(230px,100%)`
             keeps a single narrow-screen card from overflowing its container.
             The band scrolls internally once courts wrap past one row. */}
-        <div className="overflow-y-auto lg:max-h-[38vh] grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr))]">
+        <div className={`${scrollClass} lg:max-h-[38vh] grid gap-3 [grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr))]`}>
           {courts.map((court, i) => (
             <CourtCardStaff
               index={i}
@@ -1776,6 +1830,9 @@ function StaffView(props) {
               competitiveMode={competitiveMode}
               court={court}
               playerById={playerById}
+              // Phases 1–2 the ghost owns these players' layoutIds; the court
+              // must not render them too or the ids would be duplicated.
+              awaitingFlight={!!reveal && reveal.courtId === court.id && reveal.phase < 3}
               onFinish={() => setFinishingCourt(court.id)}
               onClear={() => clearCourtCasual(court.id)}
               onRemove={() => removeCourt(court.id)}
@@ -1971,7 +2028,18 @@ function StaffView(props) {
                 : <><Shuffle className="w-4 h-4" /> Auto</>}
             </button>
           </div>
-          <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-0.5">
+          {/* flex + `order` rather than plain stacking: it lets the ghost slot
+              back into the position its group occupied without restructuring
+              the list below it. Cards take odd slots, the ghost an even one. */}
+          <div className={`flex-1 min-h-0 ${scrollClass} flex flex-col gap-2 pr-0.5`}>
+            {/* The group that is on its way to a court. Its real entry has
+                already left `queue` — this stands in where staff last saw it,
+                so the four fly from the right place. */}
+            {reveal && (
+              <div style={{ order: reveal.groupIndex * 2 }}>
+                <GhostQueueGroup reveal={reveal} onSkip={onSkipReveal} />
+              </div>
+            )}
             {queue.map((g, idx) => {
               const groupPlayers = g.players.map(playerById).filter(Boolean);
               const avgSkill = groupPlayers.length
@@ -1986,7 +2054,7 @@ function StaffView(props) {
               return (
                 <div
                   key={g.id}
-                  style={{ animationDelay: `${Math.min(idx, 8) * 60}ms` }}
+                  style={{ animationDelay: `${Math.min(idx, 8) * 60}ms`, order: idx * 2 + 1 }}
                   className={`cf-fade-up bg-zinc-900 rounded-xl border p-2.5 transition ${
                     dragOverZone === g.id
                       ? 'border-lime-500 ring-1 ring-lime-600 bg-lime-950/10'
@@ -2144,16 +2212,17 @@ function StaffView(props) {
         </section>
       </div>
     </div>
+    </LayoutGroup>
   );
 }
 
-/* PlayerAvatar now lives in ./components/PlayerAvatar.jsx so the match reveal
-   overlay can render a player without importing App.jsx. */
+/* PlayerAvatar now lives in ./components/PlayerAvatar.jsx so the flight items
+   can render a player without importing App.jsx. */
 
 /* ─────────────────────────────────────────────
    COURT CARD (STAFF) — double-click name to rename
    ───────────────────────────────────────────── */
-function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinish, onClear, onRemove, onToggleType, onRename, onBookRental }) {
+function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinish, onClear, onRemove, onToggleType, onRename, onBookRental, awaitingFlight = false }) {
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(court.name);
   const inputRef = useRef(null);
@@ -2283,17 +2352,22 @@ function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinis
               ) : null;
             })()
           ) : (
-            /* Open play — 4-player grid */
-            <div className="grid grid-cols-1 gap-1 mb-2">
-              {court.match.players.map((id, i) => {
+            /* Open play — 4-player grid.
+               While a flight is inbound this list stays EMPTY: the ghost group
+               down in the queue is holding these players' layoutIds, and having
+               both mounted at once would duplicate every id. The moment the
+               ghost drops them (phase 3) these mount and Framer flies them up.
+               The row keeps its height reserved so the card doesn't jump. */
+            <div className="grid grid-cols-1 gap-1 mb-2" style={awaitingFlight ? { minHeight: 4 * 34 } : undefined}>
+              {!awaitingFlight && court.match.players.map((id, i) => {
                 const p = playerById(id);
                 if (!p) return null;
                 const teamLabel = i < 2 ? 'T1' : 'T2';
                 return (
                   <div key={id} className="flex items-center gap-2 bg-zinc-950 bg-opacity-50 rounded px-2 py-1">
                     <span className="text-xs text-zinc-500 font-mono w-6">{teamLabel}</span>
-                    <PlayerAvatar player={p} size="sm" />
-                    <span className="text-sm font-semibold flex-1 truncate">{p.name}</span>
+                    {/* Identical subtree to the queue side — see matchFlight.jsx */}
+                    <FlightPlayerItem player={p} />
                     <PaymentBadge payment={p.payment} dot title={`${p.name} — ${paymentInfo(p.payment).label}`} />
                     <span className="text-[10px] text-zinc-500">{p.skill}</span>
                   </div>

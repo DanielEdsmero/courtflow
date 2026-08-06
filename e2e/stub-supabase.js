@@ -213,7 +213,10 @@ export async function stubRest(page, opts = {}) {
     if (path === '/rest/v1/sessions') {
       if (req.method() === 'GET') {
         calls.sessionLoads = (calls.sessionLoads ?? 0) + 1;
-        const blob = { state: state.session ?? queueState() };
+        // Reads see the most recent write, the way Postgres would. Without this
+        // a reload replays the seeded fixture and silently discards everything
+        // the app did — which makes "does this survive a refresh?" untestable.
+        const blob = { state: calls.lastSessionWrite ?? state.session ?? queueState() };
         return json(route, wantsObject ? blob : [blob]);
       }
       // Keep the most recent upsert. It is the staff app's own view of courts,
