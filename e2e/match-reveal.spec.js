@@ -2,14 +2,12 @@ import { test, expect } from '@playwright/test';
 import { stubRest, stubRealtime, signIn } from './stub-supabase.js';
 
 /* ─────────────────────────────────────────────
-   QUEUE → COURT FLIGHT + SETTINGS
-   The reveal happens in place now: players appear inside their queue group
-   card, the card glows, then they fly up into the court card.
-
-   The assertions that matter most are about WHO OWNS the players at each
-   moment — the flight only works because exactly one side renders a given
-   layoutId at a time — and about the assignment being committed up front,
-   independently of the animation.
+   FULL-SCREEN MATCH REVEAL + SETTINGS
+   The reveal covers the whole viewport and is portalled to <body>, so no
+   panel's width, stacking context or overflow box can confine it. An earlier
+   version rendered inside the queue panel and was squeezed into a column —
+   `is portalled to body, not trapped in a panel` and `covers the whole
+   viewport` are the regression cover for exactly that.
    ───────────────────────────────────────────── */
 
 function row(id, name) {
@@ -65,102 +63,170 @@ async function assignToCourt(page) {
   await dialog.getByRole('button', { name: 'Open', exact: true }).click();
 }
 
-const ghost = (page) => page.locator('[data-flight-ghost]');
+const overlay = (page) => page.locator('[data-match-reveal]');
 const courtCard = (page) => page.locator('[data-court-id="1"]');
 const flightItems = (page) => page.locator('[data-flight-player]');
 
-/* ── phase 1: reveal inside the queue ───────── */
+/* ── it is a real full-screen overlay ───────── */
 
-test('the four are revealed inside the queue group, not in a centre overlay', async ({ page }) => {
+test('is portalled to body, not trapped inside a panel', async ({ page }) => {
+  await open(page, { animations: true, sound: false });
+  await assignToCourt(page);
+  await expect(overlay(page)).toBeVisible();
+
+  // The regression: rendered as a child of the queue section, the overlay
+  // inherited that column's width and overflow box.
+  const parentIsBody = await overlay(page).evaluate(el => el.parentElement === document.body);
+  expect(parentIsBody).toBe(true);
+
+  const insideQueuePanel = await overlay(page).evaluate(el => !!el.closest('section'));
+  expect(insideQueuePanel).toBe(false);
+});
+
+test('covers the whole viewport', async ({ page }) => {
+  await open(page, { animations: true, sound: false });
+  await assignToCourt(page);
+  await expect(overlay(page)).toBeVisible();
+
+  const viewport = page.viewportSize();
+  const box = await overlay(page).boundingBox();
+  expect(box.x).toBe(0);
+  expect(box.y).toBe(0);
+  expect(box.width).toBe(viewport.width);
+  expect(box.height).toBe(viewport.height);
+});
+
+test('sits above the courts, the roster and the toolbar', async ({ page }) => {
+  await open(page, { animations: true, sound: false });
+  await assignToCourt(page);
+  await expect(overlay(page)).toBeVisible();
+
+  // Whatever is at the middle of the screen must be the overlay or part of it.
+  const viewport = page.viewportSize();
+  const onTop = await page.evaluate(([x, y]) => {
+    const el = document.elementFromPoint(x, y);
+    return !!el?.closest('[data-match-reveal]');
+  }, [Math.floor(viewport.width / 2), Math.floor(viewport.height / 2)]);
+  expect(onTop).toBe(true);
+});
+
+/* ── the reveal ─────────────────────────────── */
+
+test('deals four cards horizontally across the centre', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
 
-  await expect(ghost(page)).toBeVisible();
-  await expect(ghost(page).locator('[data-flight-player]')).toHaveCount(4);
+  const cards = overlay(page).locator('[data-reveal-card]');
+  await expect(cards).toHaveCount(4);
   for (const name of ['Ann Alpha', 'Ben Bravo', 'Cal Charlie', 'Dee Delta']) {
-    await expect(ghost(page).getByText(name)).toBeVisible();
+    await expect(overlay(page).getByText(name)).toBeVisible();
+  }
+
+  // Measure only once the deal has settled — mid-spring the cards are still
+  // dropping in from different heights and every y would differ.
+  await expect(overlay(page).getByText('Matched!')).toBeVisible({ timeout: 6000 });
+
+  // Horizontal, not the vertical column the old in-queue version produced:
+  // four distinct x positions, all sharing one row.
+  const boxes = await cards.evaluateAll(els => els.map(e => e.getBoundingClientRect()));
+  expect(new Set(boxes.map(b => Math.round(b.x))).size).toBe(4);
+  const ys = boxes.map(b => b.y);
+  expect(Math.max(...ys) - Math.min(...ys)).toBeLessThan(2);
+});
+
+test('player names are legible against the dark backdrop', async ({ page }) => {
+  await open(page, { animations: true, sound: false });
+  await assignToCourt(page);
+  await expect(overlay(page).getByText('Ann Alpha')).toBeVisible();
+
+  // The regression this guards: the overlay portals to document.body, which is
+  // outside the app wrapper that sets the text colour, so an unstyled name
+  // inherited the document default and rendered black on a black backdrop.
+  const colours = await overlay(page)
+    .locator('[data-reveal-card] span.font-display')
+    .evaluateAll(els => els.map(e => getComputedStyle(e).color));
+
+  expect(colours).toHaveLength(4);
+  for (const colour of colours) {
+    const [r, g, b] = colour.match(/\d+/g).map(Number);
+    // Green, and bright enough to read.
+    expect(g).toBeGreaterThan(150);
+    expect(g).toBeGreaterThan(b);
+    expect(r + g + b).toBeGreaterThan(200);
   }
 });
 
-test('the ghost sits in the queue column, below the courts band', async ({ page }) => {
+test('every card shows an avatar', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(ghost(page)).toBeVisible();
+  await expect(overlay(page).locator('[data-reveal-card]')).toHaveCount(4);
 
-  // The whole point of the redesign: the players start low on the page and the
-  // court is up top, so the flight reads as travel.
-  const from = await ghost(page).boundingBox();
-  const to = await courtCard(page).boundingBox();
-  expect(from.y).toBeGreaterThan(to.y);
+  // No photo_url on these four, so each avatar is the initials disc.
+  for (const initials of ['AA', 'BB', 'CC', 'DD']) {
+    await expect(overlay(page).getByText(initials, { exact: true })).toBeVisible();
+  }
+});
+
+test('holds the four on screen for at least five seconds', async ({ page }) => {
+  await open(page, { animations: true, sound: false });
+  const started = Date.now();
+  await assignToCourt(page);
+  await expect(overlay(page)).toBeVisible();
+
+  await page.waitForTimeout(Math.max(0, 5000 - (Date.now() - started)));
+  await expect(overlay(page).locator('[data-reveal-card]')).toHaveCount(4);
+});
+
+test('the Matched! label arrives after the cards, not with them', async ({ page }) => {
+  await open(page, { animations: true, sound: false });
+  await assignToCourt(page);
+
+  await expect(overlay(page).getByText('Matched!')).toHaveCount(0);
+  await expect(overlay(page).getByText('Matched!')).toBeVisible({ timeout: 6000 });
+  await expect(overlay(page).getByText('Going to Court 1')).toBeVisible();
 });
 
 /* ── the layoutId handover ──────────────────── */
 
-test('only one side owns each player while the flight is pending', async ({ page }) => {
+test('only one side owns each player while the overlay is up', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(ghost(page)).toBeVisible();
+  await expect(overlay(page)).toBeVisible();
 
-  // Duplicated layoutIds are what break a Framer morph — during phases 1-2 the
-  // court must render none of the four.
+  // Duplicated layoutIds are what break a Framer morph.
   await expect(flightItems(page)).toHaveCount(4);
   await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(0);
 });
 
-test('the court takes ownership once the flight starts', async ({ page }) => {
+test('the court takes ownership once the cards fly', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(ghost(page)).toBeVisible();
+  await expect(overlay(page)).toBeVisible();
 
-  // Phase 3 hands the ids over: the ghost empties, the court fills.
-  await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4, { timeout: 8000 });
-  await expect(ghost(page).locator('[data-flight-player]')).toHaveCount(0);
-  // And still exactly four in the document — never eight.
+  await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4, { timeout: 12_000 });
+  // Never eight — the overlay has let go by the time the court holds them.
   await expect(flightItems(page)).toHaveCount(4);
 });
 
-/* ── phase 2: hold and label ────────────────── */
-
-test('the court label appears in the hold phase, not at the start', async ({ page }) => {
+test('the overlay clears itself and the court ends up in play', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
+  await expect(overlay(page)).toBeVisible();
 
-  await expect(ghost(page).getByText('Going to Court 1')).toHaveCount(0);
-  await expect(ghost(page).getByText('Going to Court 1')).toBeVisible({ timeout: 6000 });
-});
-
-test('the group card glows once it is ready to move', async ({ page }) => {
-  await open(page, { animations: true, sound: false });
-  await assignToCourt(page);
-
-  await expect(ghost(page)).not.toHaveClass(/border-lime-500/);
-  await expect(ghost(page)).toHaveClass(/border-lime-500/, { timeout: 6000 });
-});
-
-/* ── the whole sequence ─────────────────────── */
-
-test('the ghost clears and the court ends up in play', async ({ page }) => {
-  await open(page, { animations: true, sound: false });
-  await assignToCourt(page);
-  await expect(ghost(page)).toBeVisible();
-
-  await expect(ghost(page)).toHaveCount(0, { timeout: 12_000 });
+  await expect(overlay(page)).toHaveCount(0, { timeout: 14_000 });
   await expect(page.getByRole('button', { name: 'FINISH MATCH' })).toBeVisible();
   await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4);
 });
 
-test('clicking anywhere skips the sequence', async ({ page }) => {
+test('clicking anywhere on the overlay skips it', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(ghost(page)).toBeVisible();
+  await expect(overlay(page)).toBeVisible();
 
-  // The skip listener arms after the click that started the sequence has
-  // finished propagating, so wait past that before clicking.
-  await page.waitForTimeout(600);
   const skippedAt = Date.now();
-  await page.getByRole('heading', { name: 'ROSTER' }).click();
+  await overlay(page).click({ position: { x: 12, y: 12 } });
 
-  await expect(ghost(page)).toHaveCount(0, { timeout: 4000 });
+  await expect(overlay(page)).toHaveCount(0, { timeout: 4000 });
   expect(Date.now() - skippedAt).toBeLessThan(4000);
   await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4);
 });
@@ -170,42 +236,40 @@ test('clicking anywhere skips the sequence', async ({ page }) => {
 test('the court is committed before the animation finishes', async ({ page }) => {
   const calls = await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(ghost(page)).toBeVisible();
+  await expect(overlay(page)).toBeVisible();
 
-  // Mid-sequence the session write already has the match on Court 1 and the
-  // queue emptied. A reload here must not lose the assignment.
   await expect
     .poll(() => calls.lastSessionWrite?.courts?.[0]?.match?.players, { timeout: 5000 })
     .toEqual(['p1', 'p2', 'p3', 'p4']);
   expect(calls.lastSessionWrite.queue).toEqual([]);
 });
 
-test('reloading mid-flight shows the true state, not the ghost', async ({ page }) => {
+test('reloading mid-sequence shows the true state, not the overlay', async ({ page }) => {
   const calls = await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(ghost(page)).toBeVisible();
+  await expect(overlay(page)).toBeVisible();
 
-  // Session writes are debounced ~600ms, so wait for the assignment to actually
-  // reach the server before reloading — otherwise this measures the debounce,
-  // not the ghost. Still comfortably mid-sequence.
+  // Session writes are debounced ~600ms, so wait for the assignment to reach
+  // the server before reloading — otherwise this measures the debounce. Still
+  // comfortably mid-sequence.
   await expect
     .poll(() => calls.lastSessionWrite?.courts?.[0]?.match?.players, { timeout: 5000 })
     .toEqual(['p1', 'p2', 'p3', 'p4']);
 
   await page.reload();
   await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
-  await expect(ghost(page)).toHaveCount(0);
+  await expect(overlay(page)).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'FINISH MATCH' })).toBeVisible();
 });
 
 /* ── animations off ─────────────────────────── */
 
-test('with animations off the court fills instantly and no ghost appears', async ({ page }) => {
+test('with animations off the court fills instantly and no overlay appears', async ({ page }) => {
   const calls = await open(page, { animations: false, sound: false });
   await assignToCourt(page);
 
   await expect(page.getByRole('button', { name: 'FINISH MATCH' })).toBeVisible();
-  await expect(ghost(page)).toHaveCount(0);
+  await expect(overlay(page)).toHaveCount(0);
   await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4);
   await expect
     .poll(() => calls.lastSessionWrite?.courts?.[0]?.match?.players, { timeout: 5000 })
@@ -250,13 +314,13 @@ test('animations switched off in the menu take effect immediately', async ({ pag
 
   await assignToCourt(page);
   await expect(page.getByRole('button', { name: 'FINISH MATCH' })).toBeVisible();
-  await expect(ghost(page)).toHaveCount(0);
+  await expect(overlay(page)).toHaveCount(0);
 });
 
 test('sound off still plays the full animation', async ({ page }) => {
   await open(page, { animations: true, sound: false });
   await assignToCourt(page);
-  await expect(ghost(page)).toBeVisible();
-  await expect(ghost(page).locator('[data-flight-player]')).toHaveCount(4);
-  await expect(ghost(page).getByText('Going to Court 1')).toBeVisible({ timeout: 6000 });
+  await expect(overlay(page)).toBeVisible();
+  await expect(overlay(page).locator('[data-reveal-card]')).toHaveCount(4);
+  await expect(overlay(page).getByText('Matched!')).toBeVisible({ timeout: 6000 });
 });
