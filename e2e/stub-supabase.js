@@ -89,10 +89,33 @@ export function displayPayload(overrides = {}) {
   };
 }
 
+/* Device preferences (animations, sound) live in localStorage. Seeded before any
+   app script runs, same reasoning as signIn below.
+
+   signIn() defaults ANIMATIONS OFF, which is the opposite of the app's own
+   default. The match reveal is a ~7 second full-screen overlay that intercepts
+   clicks, so leaving it on would make every assignment in every spec slow and
+   would swallow the next click. Specs that are actually testing the reveal call
+   this themselves with { animations: true }. */
+export async function setPrefs(page, prefs) {
+  await page.addInitScript(
+    ([key, value]) => {
+      // Seed only when nothing is stored yet. addInitScript re-runs on every
+      // navigation, so writing unconditionally would overwrite whatever the app
+      // saved and make a persistence bug impossible to see across a reload.
+      if (!window.localStorage.getItem(key)) {
+        window.localStorage.setItem(key, JSON.stringify(value));
+      }
+    },
+    ['courtflow:prefs', { animations: false, sound: false, ...prefs }]
+  );
+}
+
 /* Seeds a signed-in session before any app script runs. addInitScript rather
    than an evaluate-after-goto, because AuthProvider reads storage during its
    first effect — writing it afterwards would race the redirect to /login. */
-export async function signIn(page) {
+export async function signIn(page, prefs = {}) {
+  await setPrefs(page, prefs);
   await page.addInitScript(
     ([key, venue]) => {
       window.localStorage.setItem(

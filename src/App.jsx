@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
+import { AnimatePresence } from 'motion/react';
 import {
   Plus, Trophy, RotateCcw, X, Check, Search, Zap, Monitor,
   Settings, Users, ChevronRight, Clock, Trash2, UserPlus,
@@ -28,6 +29,12 @@ import {
 import ModalShell from './components/ModalShell';
 import OnboardingWizard from './components/OnboardingWizard';
 import ClubQrPoster from './components/ClubQrPoster';
+import SettingsMenu from './components/SettingsMenu';
+import MatchRevealOverlay from './components/MatchRevealOverlay';
+import PlayerAvatar from './components/PlayerAvatar';
+import { skillStyle, skillStyleSolid } from './lib/skillStyles';
+import { loadPrefs, savePrefs } from './lib/prefs';
+import { setSoundEnabled } from './lib/sound';
 
 // Pure logic lives in ./lib/logic.js so tests can import it without booting the
 // Supabase client. Re-exported here because existing callers import from App.
@@ -56,25 +63,6 @@ async function hasCamera() {
     return false;
   }
 }
-
-/* ─────────────────────────────────────────────
-   SKILL STYLES
-   ───────────────────────────────────────────── */
-const skillStyle = (s) => ({
-  Beginner:     'bg-slate-700 text-slate-200 border-slate-600',
-  Novice:       'bg-emerald-900 text-emerald-200 border-emerald-700',
-  Intermediate: 'bg-sky-900 text-sky-200 border-sky-700',
-  Advanced:     'bg-amber-900 text-amber-200 border-amber-700',
-  Pro:          'bg-rose-900 text-rose-200 border-rose-700',
-}[s] || 'bg-slate-700 text-slate-200');
-
-const skillStyleSolid = (s) => ({
-  Beginner:     'bg-slate-500',
-  Novice:       'bg-emerald-500',
-  Intermediate: 'bg-sky-500',
-  Advanced:     'bg-amber-500',
-  Pro:          'bg-rose-500',
-}[s] || 'bg-slate-500');
 
 // Subtle vertical divider between toolbar button groups (spec §4A). Hidden when
 // the toolbar wraps to a second row on narrow screens.
@@ -225,6 +213,35 @@ export default function App() {
   const [showSessionRank, setShowSessionRank] = useState(false);
   // { playerId, groupId } while staff decide who takes a vacated queue slot.
   const [replacing, setReplacing] = useState(null);
+
+  // Animations + sound. Per-device (localStorage), not per-club — the desk
+  // tablet and the office laptop can reasonably disagree. Read once on mount so
+  // the very first render already has the right answer.
+  const [prefs, setPrefs] = useState(loadPrefs);
+  const updatePrefs = (next) => { setPrefs(next); savePrefs(next); };
+  // The sound module holds its own enabled flag so deep callers don't have to
+  // thread the preference down to every cue.
+  useEffect(() => { setSoundEnabled(prefs.sound); }, [prefs.sound]);
+
+  // The match reveal currently playing: { players, courtId, courtName }.
+  // Non-null also acts as the lock that stops a second assignment stacking a
+  // second overlay on top of the first.
+  const [reveal, setReveal] = useState(null);
+  const revealRef = useRef(null);
+  revealRef.current = reveal;
+
+  // Called AFTER the court has already been assigned, by both the manual and
+  // the auto-assign paths. Returns silently when animations are off, when a
+  // reveal is already playing, or for a group that isn't a full four — a
+  // celebration of a half-empty court would be worse than none.
+  const startReveal = (playerIds, court) => {
+    if (!prefs.animations || revealRef.current || !court) return;
+    const revealed = playerIds.map(playerById).filter(Boolean);
+    if (revealed.length < 4) return;
+    const next = { players: revealed, courtId: court.id, courtName: court.name };
+    revealRef.current = next; // claim the lock now, not on the next render
+    setReveal(next);
+  };
   // Staff-only peek at the hidden values (spec §1). Deliberately plain state:
   // it is not persisted and not in the session blob, so it is off again on every
   // reload and can never reach the TV display or the public club board.
@@ -367,6 +384,10 @@ export default function App() {
     };
     setCourts(prev => prev.map(c => c.id === freeCourt.id ? { ...c, match } : c));
     setQueue(prev => prev.filter(g => g.id !== nextGroup.id));
+    startReveal(nextGroup.players, freeCourt);
+    // startReveal reads prefs/playerById but re-running this effect when those
+    // change would re-assign a court, so it is deliberately not a dependency.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [courts, queue, autoAssign, competitiveMode, defaultOpenDuration]);
 
   const busyPlayerIds = useMemo(() => {
@@ -532,6 +553,7 @@ export default function App() {
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match } : c));
     setQueue(prev => prev.filter(g => g.id !== groupId));
     setShowAssign(null);
+    startReveal(group.players, court);
   };
 
   const assignRental = (courtId, hostId, durationMin) => {
@@ -1023,6 +1045,10 @@ export default function App() {
                         </select>
                       </div>
 
+                      {/* Animations + sound. Sits with Auto and the timer
+                          because it changes how assigning a court behaves. */}
+                      <SettingsMenu prefs={prefs} onChange={updatePrefs} />
+
                       {/* Competitive mode */}
                       <button
                         onClick={() => setCompetitiveMode(v => !v)}
@@ -1347,6 +1373,20 @@ export default function App() {
           onClose={() => setShowDisplayLink(false)}
         />
       )}
+      {/* Sits above every modal: it is a full-screen moment, and a dialog
+          opening underneath it would be invisible anyway. */}
+      <AnimatePresence>
+        {reveal && (
+          <MatchRevealOverlay
+            key="match-reveal"
+            players={reveal.players}
+            courtId={reveal.courtId}
+            courtName={reveal.courtName}
+            soundOn={prefs.sound}
+            onDone={() => { revealRef.current = null; setReveal(null); }}
+          />
+        )}
+      </AnimatePresence>
       {showWizard && (
         <OnboardingWizard
           courtCount={courts.length}
@@ -2107,25 +2147,8 @@ function StaffView(props) {
   );
 }
 
-/* ─────────────────────────────────────────────
-   PLAYER AVATAR
-   ───────────────────────────────────────────── */
-function PlayerAvatar({ player, size }) {
-  const sizeClass =
-    size === 'sm' ? 'w-7 h-7 text-[10px]' :
-    size === 'lg' ? 'w-14 h-14 text-sm' :
-    size === 'xl' ? 'w-24 h-24 text-xl' :
-    'w-10 h-10 text-xs';
-  const initials = player.name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
-  if (player.photo) {
-    return <img src={player.photo} alt={player.name} className={`${sizeClass} rounded-full object-cover shrink-0`} />;
-  }
-  return (
-    <div className={`${sizeClass} rounded-full flex items-center justify-center shrink-0 font-bold ${skillStyleSolid(player.skill)}`}>
-      <span className="text-zinc-950">{initials}</span>
-    </div>
-  );
-}
+/* PlayerAvatar now lives in ./components/PlayerAvatar.jsx so the match reveal
+   overlay can render a player without importing App.jsx. */
 
 /* ─────────────────────────────────────────────
    COURT CARD (STAFF) — double-click name to rename
@@ -2166,6 +2189,8 @@ function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinis
 
   return (
     <div
+      // The match reveal measures this at flight time to know where to land.
+      data-court-id={court.id}
       className={`cf-fade-up rounded-xl border p-3 transition ${borderClass}`}
       style={{ animationDelay: `${index * 60}ms` }}
     >

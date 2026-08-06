@@ -13,6 +13,7 @@ export { wizard } from './wizard';
 export { sessionRank, leaderboardModal, allTime } from './rankings';
 export { auth, activate } from './auth';
 export { tvDisplay, clubBoard, connection, qrPoster } from './board';
+export { settings, matchReveal } from './settings';
 export { matchingStyles, payments } from './matching';
 
 // Namespaced rather than spread: `modals.checkout.title` reads better than a

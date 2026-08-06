@@ -17,6 +17,7 @@ never need to go hunting through the components.
 | `rankings.js` | Session Rankings, the in-app Leaderboard pop-up, and the all-time Rankings page |
 | `auth.js` | Sign in, create account, and the access-key activation screen |
 | `board.js` | The TV display and the public club board — only their messages, not the court cards |
+| `settings.js` | The gear menu's toggles, and the match reveal sequence ("Matched! Going to Court 1") |
 | `matching.js` | The names and descriptions of the matching styles, and the payment labels |
 
 ## How to edit
