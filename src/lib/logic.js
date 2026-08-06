@@ -4,6 +4,10 @@
    Supabase client (which throws when env vars are absent).
    ───────────────────────────────────────────── */
 
+// Wording lives in ../copy — this module owns behaviour, not text.
+import { matchingStyles, payments } from '../copy/matching';
+import { allTime } from '../copy/rankings';
+
 export const SKILL_TIERS = ['Beginner', 'Novice', 'Intermediate', 'Advanced', 'Pro'];
 export const skillRank = (s) => SKILL_TIERS.indexOf(s);
 
@@ -36,9 +40,7 @@ export const fmtDuration = (ms) => {
 export const PAYMENT_STATUSES = {
   online: {
     value: 'online',
-    label: 'Paid — Online',
-    short: 'Paid',
-    method: 'Online',
+    ...payments.online,
     icon: '✅',
     // Solid pill styles (dark theme, green = confirmed).
     badge: 'bg-emerald-500 text-zinc-950 border-emerald-400',
@@ -47,9 +49,7 @@ export const PAYMENT_STATUSES = {
   },
   cash: {
     value: 'cash',
-    label: 'Paid — Cash',
-    short: 'Cash',
-    method: 'Cash',
+    ...payments.cash,
     icon: '💵',
     badge: 'bg-amber-400 text-zinc-950 border-amber-300',
     dot: 'bg-amber-400',
@@ -57,9 +57,7 @@ export const PAYMENT_STATUSES = {
   },
   unpaid: {
     value: 'unpaid',
-    label: 'Unpaid',
-    short: 'Unpaid',
-    method: null,
+    ...payments.unpaid,
     icon: '🔴',
     badge: 'bg-rose-500 text-zinc-950 border-rose-400',
     dot: 'bg-rose-500',
@@ -135,22 +133,8 @@ export const balancedGroup = (sortedPlayers) => {
 export const DEFAULT_MATCHING_STYLE = 'balanced';
 
 export const MATCHING_STYLES = {
-  balanced: {
-    value: 'balanced',
-    label: 'Balanced',
-    short: 'Balanced',
-    // Describes what the matcher now actually does — the repeat-partner claim
-    // was true of balancedFreshGroup but not of the rotation path that formed
-    // most real groups, and the rest-fairness half is new.
-    blurb:
-      'Pairs the strongest with the weakest, avoids repeating partners, and gives waiting players the next court.',
-  },
-  winnersLosers: {
-    value: 'winnersLosers',
-    label: 'Winners / Losers',
-    short: 'Ladder',
-    blurb: 'Groups players who are on form together — a winners court and a losers court.',
-  },
+  balanced: { value: 'balanced', ...matchingStyles.balanced },
+  winnersLosers: { value: 'winnersLosers', ...matchingStyles.winnersLosers },
 };
 
 export const MATCHING_STYLE_ORDER = ['balanced', 'winnersLosers'];
@@ -337,107 +321,148 @@ export const recentlyPlayed = (history, window = PARTNER_WINDOW) => {
 
 export const restCost = (rest, id) => rest.get(String(id)) ?? 0;
 
-// Every 4-subset of `arr`, as index tuples, in a fixed ascending order. Index
-// tuples rather than objects so the caller gets "how far down the pool did we
-// reach" for free. Bounded: the caller caps the pool at POOL_SIZE, so this is at
-// most C(8,4) = 70 tuples. It cannot loop and cannot fail to return.
-const combinations4 = (arr) => {
-  const out = [];
-  for (let i = 0; i <= arr.length - 4; i++)
-    for (let j = i + 1; j <= arr.length - 3; j++)
-      for (let k = j + 1; k <= arr.length - 2; k++)
-        for (let l = k + 1; l <= arr.length - 1; l++) out.push([i, j, k, l]);
-  return out;
-};
-
-// The three ways to split a skill-sorted [w,x,y,z] into two teams, as indexes
-// into that array. The first is the snake draft — provably the most skill-even
-// of the three for any sorted four — and is listed first so it wins every tie.
+// The three ways to split a value-sorted [w,x,y,z] into two teams, as indexes
+// into that array. The first is the snake draft — provably the most even of the
+// three for any sorted four — and is listed first so it wins every tie.
 const SPLITS = [
   [0, 3, 1, 2], // w+z vs x+y  (snake)
   [0, 2, 1, 3], // w+y vs x+z
   [0, 1, 2, 3], // w+x vs y+z
 ];
 
-// Only the strongest N available are considered. This keeps the search tiny AND
-// stops repeat-avoidance from dragging a beginner onto a court full of Pros: the
-// pool is already skill-adjacent, so any reshuffle inside it stays sensible.
-export const POOL_SIZE = 8;
+/* ─────────────────────────────────────────────
+   PLAYER VALUE (hidden)
+   A per-session number that says how today has gone: +1 a win, -0.5 a loss.
+   Everyone starts a session on 0.
 
-// Lexicographic priorities, encoded as weights so it stays a single comparison:
-//   1. avoid recent partners                            (dominant)
-//   2. favour players who have been waiting             (rotates the pool)
-//   3. stay near the top of the skill-sorted pool — i.e. behave like the old
-//      "top four" rule whenever nothing else is at stake
-//   4. keep the two teams even                          (picks the split)
-// The bands have to be read against their worst cases, not their nominal sizes:
-//   position — index 0..7 per player, so 6 (top four) to 22 (bottom four) → ≤220
-//   rest     — 0..1 per player                                            → ≤400
-//   repeat   — one partnership from last round alone                      → 4000
-// So rest genuinely outranks position (a pool of eight equals rotates instead
-// of the first four always playing) while a single repeated pairing still costs
-// more than any amount of tiredness or position can.
-const REPEAT_WEIGHT = 1000;
-const REST_WEIGHT = 100;
-const POSITION_WEIGHT = 10;
+   It is DERIVED from the session win/loss counters rather than stored in a
+   column of its own, and that is the whole trick:
+     • those counters are already zeroed by resetSession(), so "values reset at
+       the start of every session" is true for free — there is no second piece
+       of state to forget to clear;
+     • they are exact, where the session `history` array is trimmed to the last
+       50 entries before it is synced, so a long day would quietly lose the
+       early games;
+     • it updates the instant a result is recorded, because finishMatch()
+       already bumps them.
+   Never rendered to players. The staff-only roster toggle in App.jsx is the one
+   place it surfaces at all.
+   ───────────────────────────────────────────── */
+export const VALUE_WIN = 1;
+export const VALUE_LOSS = -0.5;
 
-export const balancedFreshGroup = (
+export const playerValue = (p) => (p?.wins ?? 0) * VALUE_WIN + (p?.losses ?? 0) * VALUE_LOSS;
+
+// How close two players' values must be to count as a match, tried in order.
+// Anything past the last tier is "closest four available, whatever the spread".
+export const VALUE_TIERS = [1, 2];
+
+// "Who did you play WITH in the last 2 games" (spec §3) — deliberately shorter
+// than PARTNER_WINDOW, which the ladder still uses.
+export const VALUE_PARTNER_WINDOW = 2;
+
+// Inside a tier every group is already close enough on value, so partner
+// freshness decides between them: one partnership repeated from the game that
+// just finished (weight 2) costs 8, more than the widest spread a tier permits.
+// Across tiers it can never win — the tier gate is applied first.
+const VALUE_REPEAT_WEIGHT = 4;
+
+/* ─────────────────────────────────────────────
+   VALUE-BASED GROUPING (spec §2)
+   Replaces the old skill-tier snake draft outright. Two questions, in order:
+   WHICH four (closest values, then freshest partnerships) and HOW to split them
+   (always the snake, so the group's best and worst are partners).
+   ───────────────────────────────────────────── */
+export const valueGroup = (
   players,
   history,
-  { partnerWindow = PARTNER_WINDOW, pool = POOL_SIZE } = {}
+  { partnerWindow = VALUE_PARTNER_WINDOW, tiers = VALUE_TIERS } = {}
 ) => {
   if (!players || players.length < 4) return null;
 
   const partners = recentPartners(history, partnerWindow);
   const rest = recentlyPlayed(history, partnerWindow);
 
-  // WHO is considered, before HOW they're split. Slicing the skill-sorted list
-  // starved the bottom of a big roster outright: with 24 players and a pool of
-  // 8, the eight strongest were the only candidates that ever existed, so the
-  // weakest never got a court no matter how long they waited. Longest-waiting
-  // first, ties by skill — then the pool is re-sorted by skill so the draft and
-  // its position cost behave exactly as before within it.
-  const byRest = [...players].sort(
+  // Value descending. The rest tie-break only ever separates players who are on
+  // exactly the SAME value, so value proximity is untouched by it — it decides
+  // which of several identical players gets the court. Without it a roster that
+  // is mostly still on 0 would hand the first four the game every time, which
+  // is the starvation bug the ladder had.
+  const ranked = [...players].sort(
     (a, b) =>
+      playerValue(b) - playerValue(a) ||
       restCost(rest, a.id) - restCost(rest, b.id) ||
-      skillRank(b.skill) - skillRank(a.skill) ||
       String(a.id).localeCompare(String(b.id))
   );
-  const candidates = byRest
-    .slice(0, Math.max(4, pool))
-    .sort(
-      (a, b) => skillRank(b.skill) - skillRank(a.skill) || String(a.id).localeCompare(String(b.id))
-    );
 
-  let best = null;
-  let bestCost = Infinity;
+  // In a sorted list the four closest values are always contiguous, so sliding
+  // a window of four is already an exhaustive search of the tightest groups —
+  // no need to enumerate all C(n,4) subsets the way the old matcher did.
+  const windows = [];
+  for (let i = 0; i + 4 <= ranked.length; i++) {
+    const four = ranked.slice(i, i + 4);
+    windows.push({
+      four,
+      spread: playerValue(four[0]) - playerValue(four[3]),
+      // The split is always the snake, so these two are the only partnerships
+      // this group can produce — no point costing the alternatives.
+      repeats:
+        partnerWeight(partners, four[0].id, four[3].id) +
+        partnerWeight(partners, four[1].id, four[2].id),
+    });
+  }
 
-  for (const idx of combinations4(candidates)) {
-    const four = idx.map((i) => candidates[i]); // still skill-descending
-    const positionCost = idx[0] + idx[1] + idx[2] + idx[3]; // top four → 6, the minimum
-    const ranks = four.map((p) => skillRank(p.skill));
-    // Depends only on WHICH four, not how they're split, so it's hoisted.
-    const tiredness = four.reduce((n, p) => n + restCost(rest, p.id), 0);
-
-    for (const [a, b, c, d] of SPLITS) {
-      const repeats =
-        partnerWeight(partners, four[a].id, four[b].id) +
-        partnerWeight(partners, four[c].id, four[d].id);
-      const imbalance = Math.abs(ranks[a] + ranks[b] - ranks[c] - ranks[d]);
-      const cost =
-        REPEAT_WEIGHT * repeats +
-        REST_WEIGHT * tiredness +
-        POSITION_WEIGHT * positionCost +
-        imbalance;
-      // Strict < keeps the FIRST minimum found, and both loops run in a fixed
+  // ±1, then ±2, then everyone. Value proximity is a hard gate: the repeat
+  // penalty only ever chooses between groups that already cleared the same
+  // tier, so a close-value group with a repeated pair still beats a far-value
+  // group of strangers — exactly the priority the spec asks for.
+  for (const limit of [...tiers, Infinity]) {
+    const eligible = windows.filter((w) => w.spread <= limit);
+    if (eligible.length === 0) continue;
+    let best = eligible[0];
+    let bestCost = Infinity;
+    for (const w of eligible) {
+      const cost = VALUE_REPEAT_WEIGHT * w.repeats + w.spread;
+      // Strict < keeps the first minimum, and `windows` is built in a fixed
       // order, so identical inputs always produce identical output.
       if (cost < bestCost) {
         bestCost = cost;
-        best = [four[a], four[b], four[c], four[d]];
+        best = w;
       }
     }
+    // [a,d,b,c] — highest+lowest against 2nd+3rd.
+    return balancedGroup(best.four);
   }
-  return best;
+  return null;
+};
+
+/* ─────────────────────────────────────────────
+   REPLACEMENT (spec §4)
+   Someone is pulled out of a queued group mid-session; the stand-in is whoever
+   is free with the nearest value, so the group stays as tight as the matcher
+   made it. Staff picking a replacement by hand go through the normal drag/click
+   path instead, which is unfiltered and shows no values.
+   ───────────────────────────────────────────── */
+// The other way to fill a vacated slot: a straight draw. Offered alongside the
+// closest-value pick because always taking the tightest stand-in can stack the
+// same strong group all evening — a random draw is the honest tie-breaker when
+// staff would rather spread the play around. `rng` is injectable so the choice
+// is testable rather than a coin flip in a test suite.
+export const randomFrom = (candidates, rng = Math.random) => {
+  if (!candidates || candidates.length === 0) return null;
+  return candidates[Math.floor(rng() * candidates.length)] ?? candidates[candidates.length - 1];
+};
+
+export const closestByValue = (candidates, targetValue, history, opts = {}) => {
+  const { partnerWindow = VALUE_PARTNER_WINDOW } = opts;
+  if (!candidates || candidates.length === 0) return null;
+  const rest = recentlyPlayed(history, partnerWindow);
+  return [...candidates].sort(
+    (a, b) =>
+      Math.abs(playerValue(a) - targetValue) - Math.abs(playerValue(b) - targetValue) ||
+      restCost(rest, a.id) - restCost(rest, b.id) ||
+      String(a.id).localeCompare(String(b.id))
+  )[0];
 };
 
 /* ─────────────────────────────────────────────
@@ -455,7 +480,7 @@ export const buildAutoGroup = (
   if (!available || available.length < 4) return null;
   return matchingStyle === 'winnersLosers'
     ? ladderGroup(available, history, opts)
-    : balancedFreshGroup(available, history, opts);
+    : valueGroup(available, history, opts);
 };
 
 /* ─────────────────────────────────────────────
@@ -501,13 +526,64 @@ export const allTimeLeaderboard = (players, minGames = RANKED_MIN_GAMES) => {
   };
 };
 
+/* ─────────────────────────────────────────────
+   SESSION RANKINGS (spec §6)
+   Today only, and a different question from allTimeLeaderboard: that one asks
+   who is good, this one asks who is winning right now. So it ranks on raw wins
+   rather than win rate, and has no minimum-games gate — one game is enough to
+   appear. Built from the session counters and the session history, both of
+   which resetSession() clears, so the board empties itself.
+   Carries no value field on purpose: this screen is player-facing.
+   ───────────────────────────────────────────── */
+
+// How many recent results the streak chip shows.
+export const SESSION_STREAK_LENGTH = 5;
+
+// A player's own results, newest first, as 'W' / 'L'. Entries with no recorded
+// result (casual court clears, rentals) carry neither array and are skipped, so
+// only decided games count.
+export const sessionStreak = (history, playerId, limit = SESSION_STREAK_LENGTH) => {
+  const out = [];
+  const target = String(playerId);
+  for (const h of history ?? []) {
+    if (out.length >= limit) break;
+    const winners = Array.isArray(h?.winners) ? h.winners : [];
+    const losers = Array.isArray(h?.losers) ? h.losers : [];
+    if (winners.some((id) => String(id) === target)) out.push('W');
+    else if (losers.some((id) => String(id) === target)) out.push('L');
+  }
+  return out;
+};
+
+// → rows, most wins first. Fewer losses breaks a tie (8-1 outranks 8-4), then
+// name so the order is stable rather than roster-insertion order.
+export const sessionLeaderboard = (
+  players,
+  history,
+  { streakLength = SESSION_STREAK_LENGTH } = {}
+) =>
+  (players ?? [])
+    .map((p) => ({
+      id: p.id,
+      name: p.name,
+      skill: p.skill,
+      photo: p.photo,
+      wins: p.wins ?? 0,
+      losses: p.losses ?? 0,
+      games: (p.wins ?? 0) + (p.losses ?? 0),
+      streak: sessionStreak(history, p.id, streakLength),
+    }))
+    .filter((r) => r.games > 0)
+    .sort(
+      (a, b) => b.wins - a.wins || a.losses - b.losses || String(a.name).localeCompare(String(b.name))
+    );
+
 // The label under an unranked player. Phrased as what's left to do rather than
 // as a bare "3/10", which reads like a score and buries the actual ask.
 // Singular-aware: "Needs 1 more games" looks like a bug.
 export const gamesToRank = (games, minGames = RANKED_MIN_GAMES) => {
   const remaining = Math.max(0, minGames - (games ?? 0));
-  if (remaining === 0) return 'Ready to rank';
-  return `Needs ${remaining} more game${remaining === 1 ? '' : 's'} to rank`;
+  return remaining === 0 ? allTime.readyToRank : allTime.needsMoreGames(remaining);
 };
 
 /* ─────────────────────────────────────────────

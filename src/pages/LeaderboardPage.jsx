@@ -4,6 +4,7 @@ import { Activity, ArrowLeft, Crown, Medal, Users } from 'lucide-react';
 import { useAuth } from '../lib/AuthProvider';
 import { listPlayers, countMatchHistory } from '../lib/players';
 import { allTimeLeaderboard, gamesToRank, RANKED_MIN_GAMES } from '../lib/logic';
+import { brand, buttons, screens, allTime } from '../copy';
 
 /* ─────────────────────────────────────────────
    ALL-TIME RANKINGS (spec §F3)
@@ -49,23 +50,23 @@ export default function LeaderboardPage() {
     return (
       <div className="font-body min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-6 text-center">
         <div>
-          <div className="font-display text-4xl text-lime-400 mb-3">COURTFLOW</div>
-          <p className="text-zinc-300 mb-1">Couldn’t load the rankings.</p>
+          <div className="font-display text-4xl text-lime-400 mb-3">{brand.name}</div>
+          <p className="text-zinc-300 mb-1">{screens.rankingsLoadFailed.title}</p>
           <p className="text-zinc-500 text-sm mb-6 max-w-xs">
-            Check this device’s internet connection. Nothing has been lost.
+            {screens.rankingsLoadFailed.body}
           </p>
           <div className="flex items-center justify-center gap-2">
             <button
               onClick={retry}
               className="bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold px-6 py-2.5 rounded-lg transition"
             >
-              Try again
+              {buttons.tryAgain}
             </button>
             <Link
               to="/"
               className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-semibold px-6 py-2.5 rounded-lg transition"
             >
-              Back
+              {buttons.back}
             </Link>
           </div>
         </div>
@@ -84,7 +85,7 @@ export default function LeaderboardPage() {
               <Activity className="w-5 h-5 text-zinc-950" strokeWidth={3} />
             </div>
             <div className="min-w-0">
-              <h1 className="font-display text-xl text-lime-400 leading-none">COURTFLOW</h1>
+              <h1 className="font-display text-xl text-lime-400 leading-none">{brand.name}</h1>
               <p className="text-[11px] text-zinc-500 mt-0.5 truncate">{venue.name}</p>
             </div>
           </div>
@@ -93,7 +94,7 @@ export default function LeaderboardPage() {
             to="/"
             className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2 shrink-0"
           >
-            <ArrowLeft className="w-4 h-4" /> Back
+            <ArrowLeft className="w-4 h-4" /> {buttons.back}
           </Link>
         </div>
       </header>
@@ -101,27 +102,27 @@ export default function LeaderboardPage() {
       <main className="max-w-3xl mx-auto px-4 sm:px-6 py-6">
         <div className="flex items-center gap-2 mb-4">
           <Medal className="w-5 h-5 text-lime-400 shrink-0" />
-          <h2 className="font-display text-xl text-zinc-200 tracking-wide">ALL-TIME RANKINGS</h2>
+          <h2 className="font-display text-xl text-zinc-200 tracking-wide">{allTime.heading}</h2>
         </div>
 
         <div className="grid grid-cols-2 gap-3 mb-6">
           <StatCard
             icon={<Users className="w-4 h-4" />}
-            label="Total Players"
+            label={allTime.statPlayers}
             value={board.totalPlayers}
           />
           {/* Venue games, from match_history — NOT board.totalGames, which counts
               player-games and so reads about four times higher for doubles. */}
           <StatCard
             icon={<Activity className="w-4 h-4" />}
-            label="Total Games"
+            label={allTime.statGames}
             value={venueGames}
           />
         </div>
 
         <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-3 sm:p-4">
           {rows === null ? (
-            <p className="text-zinc-500 text-center py-8 cf-breathe">Loading…</p>
+            <p className="text-zinc-500 text-center py-8 cf-breathe">{screens.loading}</p>
           ) : board.ranked.length === 0 ? (
             /* Two different empty states, and conflating them produced the
                contradiction this page used to show ("nobody qualifies yet" sat
@@ -130,8 +131,8 @@ export default function LeaderboardPage() {
                working towards it — otherwise the roster is simply empty. */
             <p className="text-zinc-500 text-center py-8">
               {board.unranked.length > 0
-                ? `No rankings yet — ${RANKED_MIN_GAMES} games needed to qualify. Everyone playing is listed below.`
-                : 'No games recorded yet. Finish a match to start the rankings.'}
+                ? allTime.noneQualified(RANKED_MIN_GAMES)
+                : allTime.noGamesAtAll}
             </p>
           ) : (
             <div className="space-y-1">
@@ -176,7 +177,7 @@ export default function LeaderboardPage() {
           {rows !== null && board.unranked.length > 0 && (
             <div className="mt-4 pt-4 border-t border-zinc-800">
               <div className="text-xs text-zinc-500 font-bold tracking-widest mb-2">
-                NOT YET RANKED
+                {allTime.unrankedHeading}
               </div>
               {(
                 <>
@@ -202,7 +203,7 @@ export default function LeaderboardPage() {
                     ))}
                   </div>
                   <p className="text-xs text-zinc-600 mt-2">
-                    Play {RANKED_MIN_GAMES}+ games to get ranked
+                    {allTime.unrankedFooter(RANKED_MIN_GAMES)}
                   </p>
                 </>
               )}

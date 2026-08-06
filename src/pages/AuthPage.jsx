@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Link, Navigate, useLocation } from 'react-router-dom';
 import { Activity } from 'lucide-react';
 import { useAuth } from '../lib/AuthProvider';
+import { brand, auth as t } from '../copy';
 
 export default function AuthPage({ mode }) {
   const isSignUp = mode === 'signup';
@@ -26,7 +27,7 @@ export default function AuthPage({ mode }) {
       if (isSignUp) {
         const { needsConfirmation } = await signUp(email.trim(), password);
         if (needsConfirmation) {
-          setNotice('Check your email for a confirmation link, then sign in.');
+          setNotice(t.confirmEmailNotice);
           setBusy(false);
           return;
         }
@@ -35,7 +36,7 @@ export default function AuthPage({ mode }) {
       }
       // On success the auth listener flips `session` and the redirect above fires.
     } catch (err) {
-      setError(err.message ?? 'Something went wrong. Try again.');
+      setError(err.message ?? t.genericError);
       setBusy(false);
     }
   }
@@ -54,22 +55,22 @@ export default function AuthPage({ mode }) {
             <Activity className="w-6 h-6 text-zinc-950" strokeWidth={3} />
           </div>
           <div>
-            <div className="font-display text-3xl text-lime-400 leading-none" aria-label="COURTFLOW">
-              {'COURTFLOW'.split('').map((ch, i) => (
+            <div className="font-display text-3xl text-lime-400 leading-none" aria-label={brand.name}>
+              {brand.name.split('').map((ch, i) => (
                 <span key={i} className="cf-letter" style={{ '--cf-delay': `${150 + i * 55}ms` }} aria-hidden>
                   {ch}
                 </span>
               ))}
             </div>
             <p className="text-zinc-500 text-xs mt-1">
-              {isSignUp ? 'Create your venue account' : 'Sign in to your venue'}
+              {isSignUp ? t.taglineSignUp : t.taglineSignIn}
             </p>
           </div>
         </div>
 
         <form onSubmit={handleSubmit}>
           <label className="block text-xs font-semibold text-zinc-400 mb-1.5" htmlFor="email">
-            Email
+            {t.emailLabel}
           </label>
           <input
             id="email"
@@ -81,7 +82,7 @@ export default function AuthPage({ mode }) {
           />
 
           <label className="block text-xs font-semibold text-zinc-400 mb-1.5" htmlFor="password">
-            Password
+            {t.passwordLabel}
           </label>
           <input
             id="password"
@@ -92,7 +93,7 @@ export default function AuthPage({ mode }) {
             className="w-full bg-zinc-950 border border-zinc-700 focus:border-lime-500 focus:outline-none focus:ring-2 focus:ring-lime-500/25 focus:shadow-[0_0_18px_-6px_rgba(190,242,100,0.5)] rounded-xl px-4 py-3 text-sm text-white mb-2 transition duration-200"
           />
           {isSignUp && (
-            <p className="text-zinc-600 text-xs mb-3">At least 6 characters.</p>
+            <p className="text-zinc-600 text-xs mb-3">{t.passwordHint}</p>
           )}
 
           {error && <p className="text-rose-400 text-sm mb-3">{error}</p>}
@@ -103,23 +104,23 @@ export default function AuthPage({ mode }) {
             disabled={!ready || busy}
             className="w-full bg-lime-400 hover:bg-lime-300 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:scale-100 text-zinc-950 font-bold rounded-xl py-3 mt-2 transition-all duration-150 will-change-transform"
           >
-            {busy ? 'Working…' : isSignUp ? 'Create account' : 'Sign in'}
+            {busy ? t.submitBusy : isSignUp ? t.submitSignUp : t.submitSignIn}
           </button>
         </form>
 
         <p className="text-zinc-500 text-sm text-center mt-5">
           {isSignUp ? (
             <>
-              Already have an account?{' '}
+              {t.haveAccount}{' '}
               <Link to="/login" className="text-lime-400 hover:text-lime-300 font-semibold">
-                Sign in
+                {t.haveAccountLink}
               </Link>
             </>
           ) : (
             <>
-              Have an access key?{' '}
+              {t.haveKey}{' '}
               <Link to="/signup" className="text-lime-400 hover:text-lime-300 font-semibold">
-                Create an account
+                {t.haveKeyLink}
               </Link>
             </>
           )}

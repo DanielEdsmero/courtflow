@@ -43,7 +43,7 @@ const midMatchSession = () => {
         id: 1,
         name: 'Court 1',
         type: 'open',
-        match: { players: ['p1', 'p2', 'p3', 'p4'], startedAt, endsAt: null, arrived: true },
+        match: { players: ['p1', 'p2', 'p3', 'p4'], startedAt, endsAt: null },
       },
       { id: 2, name: 'Court 2', type: 'open', match: null },
     ],

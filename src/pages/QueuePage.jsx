@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom';
 import { DisplayView } from '../App';
 import { fetchQueueState, subscribeToQueue } from '../lib/session';
 import { hydrateCourts, isValidSlug } from '../lib/logic';
+import { brand, screens, clubBoard, connection } from '../copy';
 
 /* ─────────────────────────────────────────────
    PUBLIC CLUB BOARD (spec §F4)
@@ -100,9 +101,9 @@ export default function QueuePage() {
 
   // Error copy differs from the TV's on purpose: this link came off a poster or a
   // QR code, so the reader is a player standing in the club, not staff.
-  if (error === 'NOT_FOUND') return <Message title="Club not found" body="Check the address on the poster, or ask the front desk for today’s queue." />;
-  if (error === 'LOAD_FAILED') return <Message title="Can’t reach CourtFlow" body="Check your connection. This page retries on its own." />;
-  if (!data) return <Message title="Loading…" body="" />;
+  if (error === 'NOT_FOUND') return <Message title={clubBoard.notFoundTitle} body={clubBoard.notFoundBody} />;
+  if (error === 'LOAD_FAILED') return <Message title={clubBoard.unreachableTitle} body={clubBoard.unreachableBody} />;
+  if (!data) return <Message title={screens.loading} body="" />;
 
   return (
     <div className="font-body min-h-screen bg-zinc-950 text-zinc-100">
@@ -118,7 +119,7 @@ export default function QueuePage() {
       />
       {!live && (
         <div className="fixed bottom-3 right-3 text-[11px] text-zinc-600 bg-zinc-900/90 border border-zinc-800 rounded-full px-3 py-1">
-          reconnecting…
+          {connection.reconnecting}
         </div>
       )}
     </div>
@@ -129,7 +130,7 @@ function Message({ title, body }) {
   return (
     <div className="font-body min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-6 text-center">
       <div>
-        <div className="font-display text-4xl text-lime-400 mb-3">COURTFLOW</div>
+        <div className="font-display text-4xl text-lime-400 mb-3">{brand.name}</div>
         <p className="text-xl text-zinc-300 mb-2">{title}</p>
         {body && <p className="text-zinc-500 max-w-sm">{body}</p>}
       </div>

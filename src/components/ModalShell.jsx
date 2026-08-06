@@ -14,6 +14,9 @@ export default function ModalShell({ children, onClose, title, wide }) {
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
         className={`bg-zinc-900 border border-zinc-800 rounded-2xl p-4 sm:p-6 w-full ${wide ? 'max-w-2xl' : 'max-w-md'} max-h-[85vh] overflow-y-auto overscroll-contain`}
         onClick={e => e.stopPropagation()}
       >

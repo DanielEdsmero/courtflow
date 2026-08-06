@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import QRCode from 'react-qr-code';
 import { Copy, Check, ExternalLink, Printer } from 'lucide-react';
+import { qrPoster } from '../copy';
 
 /* ─────────────────────────────────────────────
    CLUB QR POSTER (spec §F4)
@@ -39,7 +40,7 @@ export default function ClubQrPoster({ venueName, slug }) {
         <div className="min-w-0 flex-1 text-center sm:text-left">
           <div className="font-display text-2xl leading-tight mb-0.5">{venueName}</div>
           <div className="text-zinc-400 text-sm font-semibold tracking-wide mb-2">
-            SCAN FOR THE LIVE QUEUE
+            {qrPoster.scanLine}
           </div>
           <code className="text-lime-400 text-xs break-all leading-relaxed">{url}</code>
         </div>
@@ -50,7 +51,9 @@ export default function ClubQrPoster({ venueName, slug }) {
           onClick={copy}
           className="flex-1 bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold py-2 rounded-lg flex items-center justify-center gap-2 transition"
         >
-          {copied ? <><Check className="w-4 h-4" /> Copied</> : <><Copy className="w-4 h-4" /> Copy link</>}
+          {copied
+            ? <><Check className="w-4 h-4" /> {qrPoster.copied}</>
+            : <><Copy className="w-4 h-4" /> {qrPoster.copy}</>}
         </button>
         <a
           href={url}
@@ -58,13 +61,13 @@ export default function ClubQrPoster({ venueName, slug }) {
           rel="noopener noreferrer"
           className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-semibold py-2 rounded-lg flex items-center justify-center gap-2 transition"
         >
-          <ExternalLink className="w-4 h-4" /> Open
+          <ExternalLink className="w-4 h-4" /> {qrPoster.open}
         </a>
         <button
           onClick={() => window.print()}
           className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-semibold py-2 rounded-lg flex items-center justify-center gap-2 transition"
         >
-          <Printer className="w-4 h-4" /> Print poster
+          <Printer className="w-4 h-4" /> {qrPoster.print}
         </button>
       </div>
     </div>

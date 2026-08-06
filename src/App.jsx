@@ -4,7 +4,7 @@ import {
   Settings, Users, ChevronRight, Clock, Trash2, UserPlus,
   Shuffle, Crown, Activity, Megaphone, BarChart2, Camera,
   Copy, LogOut, RefreshCw, ExternalLink, AlertTriangle, ClipboardList,
-  LogIn, DollarSign, Medal, HelpCircle,
+  LogIn, DollarSign, Medal, HelpCircle, Eye, EyeOff,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
@@ -16,6 +16,15 @@ import {
   updatePlayerPayment, recheckInPlayer, checkOutPlayer, recordResult, resetAllStats, recordMatchHistory,
 } from './lib/players';
 import { uploadPhoto } from './lib/photos';
+// All user-facing wording lives in ./copy — see ./copy/README.md. The courts and
+// queue panels deliberately keep theirs inline.
+import {
+  brand, buttons, screens, toolbar, announcementBar,
+  roster as rosterCopy, checkIn, checkedOut as checkedOutCopy,
+  confirms, alerts, statsWriteBanner,
+  sessionRank as sessionRankCopy, leaderboardModal as leaderboardCopy,
+  modals,
+} from './copy';
 import ModalShell from './components/ModalShell';
 import OnboardingWizard from './components/OnboardingWizard';
 import ClubQrPoster from './components/ClubQrPoster';
@@ -27,11 +36,9 @@ import {
   defaultCourts, hydrateCourts, matchRoster, findExactPlayer,
   PAYMENT_STATUSES, PAYMENT_ORDER, paymentInfo, isPaid,
   buildAutoGroup, DEFAULT_MATCHING_STYLE, MATCHING_STYLE_ORDER, matchingStyleInfo,
+  playerValue, closestByValue, randomFrom, sessionLeaderboard,
 } from './lib/logic';
 export { SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, estimateWait, balancedGroup };
-
-// Minutes a called group has to start playing before staff get a no-show nudge.
-const NO_SHOW_MINUTES = 5;
 
 // Bounds the in-memory activity log carried in the session blob.
 const MAX_AUDIT = 100;
@@ -212,10 +219,16 @@ export default function App() {
   const [newPlayerSkill, setNewPlayerSkill] = useState('Intermediate');
   const [newPlayerPayment, setNewPlayerPayment] = useState('unpaid');
   const [search, setSearch]           = useState('');
-  const [draftGroup, setDraftGroup]   = useState([]);
   const [showLeaderboard, setShowLeaderboard] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
   const [showActivityLog, setShowActivityLog] = useState(false);
+  const [showSessionRank, setShowSessionRank] = useState(false);
+  // { playerId, groupId } while staff decide who takes a vacated queue slot.
+  const [replacing, setReplacing] = useState(null);
+  // Staff-only peek at the hidden values (spec §1). Deliberately plain state:
+  // it is not persisted and not in the session blob, so it is off again on every
+  // reload and can never reach the TV display or the public club board.
+  const [showValues, setShowValues] = useState(false);
   const [finishingCourt, setFinishingCourt]   = useState(null);
   // Id of the player being checked out (spec §3). Checkout is a roster action —
   // a person leaving for the day — not something a court ending triggers.
@@ -351,8 +364,6 @@ export default function App() {
       endsAt: dur ? now + dur * 60 * 1000 : null,
       durationMin: dur,
       autoAssigned: true,
-      calledAt: now,
-      arrived: false,
     };
     setCourts(prev => prev.map(c => c.id === freeCourt.id ? { ...c, match } : c));
     setQueue(prev => prev.filter(g => g.id !== nextGroup.id));
@@ -433,7 +444,7 @@ export default function App() {
       if (await hasCamera()) setPendingPhotoPlayerId(player.id);
     } catch (err) {
       console.error('Failed to add player:', err);
-      alert(`Couldn't add ${n}. Check your connection and try again.`);
+      alert(alerts.addPlayerFailed(n));
       setNewPlayerName(n);
       setNewPlayerPayment(payment);
     }
@@ -460,7 +471,6 @@ export default function App() {
     if (busyPlayerIds.has(id)) return;
     const previous = players;
     setPlayers(prev => prev.filter(p => p.id !== id));
-    setDraftGroup(prev => prev.filter(x => x !== id));
     try {
       await deletePlayer(id);
     } catch (err) {
@@ -469,29 +479,40 @@ export default function App() {
     }
   };
 
-  const togglePlayerInDraft = (id) => {
-    if (busyPlayerIds.has(id)) return;
-    setDraftGroup(prev =>
-      prev.includes(id) ? prev.filter(x => x !== id) : prev.length < 4 ? [...prev, id] : prev
-    );
+  // Groups are built in the queue itself: a roster player joins the first group
+  // with a free slot, and only starts a new one when every group is full. Click
+  // does the same thing as a drag so the roster still works on a tablet, where
+  // dragging across panels is fiddly.
+  const addPlayerToQueue = (playerId) => {
+    if (busyPlayerIds.has(playerId)) return;
+    setQueue(prev => {
+      const target = prev.find(g => g.players.length < 4);
+      return target
+        ? prev.map(g => g.id === target.id ? { ...g, players: [...g.players, playerId] } : g)
+        : [...prev, { id: Date.now(), players: [playerId], type: 'manual' }];
+    });
   };
 
-  const saveDraftGroup = () => {
-    if (draftGroup.length === 0) return;
-    setQueue(prev => [...prev, { id: Date.now(), players: [...draftGroup], type: 'manual' }]);
-    setDraftGroup([]);
+  // Dropping on the "start a new group" strip: the player leaves whatever group
+  // they were in and opens a fresh one at the back of the line. Lets staff hold
+  // a group open for people who haven't arrived yet.
+  const startQueueGroup = (playerId) => {
+    setQueue(prev => [
+      ...prev
+        .map(g => g.players.includes(playerId) ? { ...g, players: g.players.filter(x => x !== playerId) } : g)
+        .filter(g => g.players.length > 0),
+      { id: Date.now(), players: [playerId], type: 'manual' },
+    ]);
   };
 
   // Ranking, repeat-partner avoidance and the snake draft all live in logic.js so
   // they stay testable without React — this owns only the roster filter and the
   // failure message. Which of the two algorithms runs is the club's matchingStyle.
   const autoGroup = () => {
-    const available = players.filter(
-      p => !p.checkedOut && !busyPlayerIds.has(p.id) && !draftGroup.includes(p.id)
-    );
+    const available = players.filter(p => !p.checkedOut && !busyPlayerIds.has(p.id));
     const group = buildAutoGroup(available, history, matchingStyle);
     if (!group) {
-      alert('Need at least 4 available players to auto-group.');
+      alert(alerts.notEnoughToAutoGroup);
       return;
     }
     setQueue(prev => [...prev, { id: Date.now(), players: group.map(p => p.id), type: 'auto' }]);
@@ -507,9 +528,6 @@ export default function App() {
       startedAt: now,
       endsAt: durationMin ? now + durationMin * 60 * 1000 : null,
       durationMin: durationMin || null,
-      // Called-to-court but not yet confirmed present — drives the no-show nudge.
-      calledAt: now,
-      arrived: false,
     };
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match } : c));
     setQueue(prev => prev.filter(g => g.id !== groupId));
@@ -531,24 +549,6 @@ export default function App() {
     setShowRental(null);
   };
 
-  // ── No-show handling (spec §7) ────────────────────────────────────────────
-  // Staff confirm the called group actually showed up; that dismisses the nudge.
-  const markArrived = (courtId) => {
-    setCourts(prev => prev.map(c =>
-      c.id === courtId && c.match ? { ...c, match: { ...c.match, arrived: true } } : c
-    ));
-  };
-
-  // The group never turned up: free the court (they're dropped, not requeued) so
-  // auto-assign — or staff — can put the next group on. Logged for the audit trail.
-  const removeNoShow = (courtId) => {
-    const court = courts.find(c => c.id === courtId);
-    if (!court?.match) return;
-    const names = court.match.players.map(id => playerById(id)?.name).filter(Boolean).join(', ');
-    logEvent({ type: 'noshow', playerName: names || '(unknown)', courtName: court.name });
-    setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
-  };
-
   // ── Checkout (spec §3) ────────────────────────────────────────────────────
   // Checkout is a ROSTER action, not a court one. Clearing a court just sends its
   // players back to the roster to play again; a player only checks out when
@@ -565,7 +565,6 @@ export default function App() {
       sessionMs: now - p.checkedInAt, payment: p.payment,
     });
     setPlayers(prev => prev.map(pl => pl.id === p.id ? { ...pl, checkedOut: true } : pl));
-    setDraftGroup(prev => prev.filter(x => x !== p.id));
     setCheckoutPlayerId(null);
     checkOutPlayer(p.id).catch(err => {
       console.error('Failed to check out player:', err);
@@ -615,10 +614,37 @@ export default function App() {
   // peel one person off a group (e.g. to check them out) without deleting the
   // whole group. Removing them clears their busy flag, so they reappear in the
   // roster automatically. A group emptied by the removal is dropped.
-  const removePlayerFromQueue = (playerId) =>
+  //
+  // Replacement (spec §4) is a CHOICE, not something that happens to staff. The
+  // closest-value stand-in is offered first because that is what keeps the group
+  // as tight as the matcher made it — but always taking it can quietly stack one
+  // strong group all evening, so the same prompt offers a random draw, a free
+  // pick from everyone available, and leaving the spot open. With nobody free
+  // there is nothing to choose between, so the removal just happens.
+  const removePlayerFromQueue = (playerId) => {
+    const group = queue.find(g => g.players.includes(playerId));
+    const anyFree = players.some(p => !p.checkedOut && !busyPlayerIds.has(p.id));
+    if (group && anyFree) {
+      setReplacing({ playerId, groupId: group.id });
+      return;
+    }
+    applyQueueReplacement(playerId, null);
+  };
+
+  // The single writer for "player X leaves their group". A replacementId takes
+  // their exact slot so the on-court teams don't shuffle; null drops them and
+  // lets the group go short.
+  const applyQueueReplacement = (playerId, replacementId) => {
     setQueue(prev => prev
-      .map(g => (g.players.includes(playerId) ? { ...g, players: g.players.filter(id => id !== playerId) } : g))
+      .map(g => {
+        if (!g.players.includes(playerId)) return g;
+        return replacementId
+          ? { ...g, players: g.players.map(id => id === playerId ? replacementId : id) }
+          : { ...g, players: g.players.filter(id => id !== playerId) };
+      })
       .filter(g => g.players.length > 0));
+    setReplacing(null);
+  };
 
   const clearCourtCasual = (courtId) => {
     const court = courts.find(c => c.id === courtId);
@@ -668,6 +694,17 @@ export default function App() {
       finishedAt: now,
     };
     setHistory(prev => [entry, ...prev]);
+    // Names are resolved and stored on the entry rather than looked up when the
+    // log renders: a player can be removed later, and the log is a record of what
+    // happened, not a live view of the roster.
+    const nameList = (ids) => ids.map(id => playerById(id)?.name).filter(Boolean).join(' & ');
+    logEvent({
+      type: 'result',
+      playerName: nameList(winners) || '(unknown)',
+      loserNames: nameList(losers) || '(unknown)',
+      courtName: court.name,
+      durationMs: entry.duration,
+    });
     // Winners and losers both go back to the roster — checkout is separate.
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
     setFinishingCourt(null);
@@ -789,11 +826,10 @@ export default function App() {
   };
 
   const resetSession = async () => {
-    if (!confirm('Reset session? Clears courts, queue, stats, and announcements.')) return;
+    if (!confirm(confirms.resetSession)) return;
     const clearedCourts = courts.map(c => ({ ...c, match: null }));
     setCourts(clearedCourts);
     setQueue([]);
-    setDraftGroup([]);
     setHistory([]);
     setAuditLog([]);
     setAnnouncement('');
@@ -819,10 +855,10 @@ export default function App() {
   };
 
   const regenerateDisplayLink = async () => {
-    if (!confirm('Generate a new display link? The old one stops working immediately.')) return;
+    if (!confirm(confirms.regenerateDisplayLink)) return;
     const { data, error } = await supabase.rpc('rotate_display_token');
     if (error) {
-      alert('Could not regenerate the link. Check your connection and try again.');
+      alert(alerts.regenerateFailed);
       return;
     }
     setDisplayToken(data);
@@ -847,20 +883,36 @@ export default function App() {
     [players]
   );
 
+  // Who can take a vacated queue slot. The departing player is still in the
+  // group when this runs, so busyPlayerIds already excludes them — nobody can be
+  // offered as their own replacement.
+  const replacementCandidates = useMemo(
+    () => players.filter(p => !p.checkedOut && !busyPlayerIds.has(p.id)),
+    [players, busyPlayerIds]
+  );
+
+  // Today's board (spec §6). Both inputs are session state that resetSession()
+  // clears, so this empties itself on reset — and because it's derived, it is
+  // already up to date the moment finishMatch() records a result.
+  const sessionRanking = useMemo(
+    () => sessionLeaderboard(players, history),
+    [players, history]
+  );
+
   if (loadFailed) {
     return (
       <div className="font-body min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-6 text-center">
         <div>
-          <div className="font-display text-4xl text-lime-400 mb-3">COURTFLOW</div>
-          <p className="text-zinc-300 mb-1">Couldn’t load your session.</p>
+          <div className="font-display text-4xl text-lime-400 mb-3">{brand.name}</div>
+          <p className="text-zinc-300 mb-1">{screens.sessionLoadFailed.title}</p>
           <p className="text-zinc-500 text-sm mb-6 max-w-xs">
-            Check this device’s internet connection. Nothing has been lost.
+            {screens.sessionLoadFailed.body}
           </p>
           <button
             onClick={() => setReloadNonce(n => n + 1)}
             className="bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold px-6 py-2.5 rounded-lg transition"
           >
-            Try again
+            {buttons.tryAgain}
           </button>
         </div>
       </div>
@@ -870,7 +922,7 @@ export default function App() {
   if (booting) {
     return (
       <div className="font-body min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center">
-        <div className="font-display text-4xl text-lime-400 animate-pulse">COURTFLOW</div>
+        <div className="font-display text-4xl text-lime-400 animate-pulse">{brand.name}</div>
       </div>
     );
   }
@@ -889,7 +941,7 @@ export default function App() {
               <Activity className="w-5 h-5 text-zinc-950" strokeWidth={3} />
             </div>
             <div className="min-w-0">
-              <h1 className="font-display text-xl text-lime-400 leading-none">COURTFLOW</h1>
+              <h1 className="font-display text-xl text-lime-400 leading-none">{brand.name}</h1>
               <p className="text-[11px] text-zinc-500 mt-0.5 truncate">{venue.name}</p>
             </div>
           </div>
@@ -905,7 +957,7 @@ export default function App() {
                       view === 'staff' ? 'bg-lime-400 text-zinc-950' : 'text-zinc-400 hover:text-zinc-200'
                     }`}
                   >
-                    <Settings className="w-4 h-4" /> Staff
+                    <Settings className="w-4 h-4" /> {toolbar.viewStaff}
                   </button>
                   <button
                     onClick={() => setView('display')}
@@ -913,7 +965,7 @@ export default function App() {
                       view === 'display' ? 'bg-lime-400 text-zinc-950' : 'text-zinc-400 hover:text-zinc-200'
                     }`}
                   >
-                    <Monitor className="w-4 h-4" /> Preview
+                    <Monitor className="w-4 h-4" /> {toolbar.viewPreview}
                   </button>
                 </div>
 
@@ -930,12 +982,10 @@ export default function App() {
                             ? 'bg-cyan-500 text-zinc-950 border-cyan-400 hover:bg-cyan-400'
                             : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
                         }`}
-                        title={autoAssign
-                          ? 'Auto-assign ON — queue groups feed open-play courts automatically'
-                          : 'Auto-assign OFF — staff manually assigns every group'}
+                        title={autoAssign ? toolbar.autoTitleOn : toolbar.autoTitleOff}
                       >
                         <Zap className="w-4 h-4" />
-                        Auto {autoAssign ? 'ON' : 'OFF'}
+                        {autoAssign ? toolbar.autoOn : toolbar.autoOff}
                       </button>
 
                       {/* Default open-play session time */}
@@ -945,15 +995,12 @@ export default function App() {
                           value={defaultOpenDuration === null ? 'none' : String(defaultOpenDuration)}
                           onChange={e => setDefaultOpenDuration(e.target.value === 'none' ? null : Number(e.target.value))}
                           className="bg-transparent text-sm font-semibold text-zinc-300 focus:outline-none cursor-pointer"
-                          title="Default open-play session time — applied when auto-assigning"
+                          title={toolbar.durationTitle}
                         >
-                          <option value="none">No timer</option>
-                          <option value="10">10 min</option>
-                          <option value="15">15 min</option>
-                          <option value="20">20 min</option>
-                          <option value="30">30 min</option>
-                          <option value="45">45 min</option>
-                          <option value="60">60 min</option>
+                          <option value="none">{toolbar.durationNone}</option>
+                          {[10, 15, 20, 30, 45, 60].map(m => (
+                            <option key={m} value={String(m)}>{toolbar.durationMinutes(m)}</option>
+                          ))}
                         </select>
                       </div>
 
@@ -984,12 +1031,10 @@ export default function App() {
                             ? 'bg-rose-500 text-zinc-950 border-rose-400 hover:bg-rose-400'
                             : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
                         }`}
-                        title={competitiveMode
-                          ? 'Competitive mode ON — winners tracked, leaderboard active'
-                          : 'Casual mode — no winner tracking, courts auto-clear when timer ends'}
+                        title={competitiveMode ? toolbar.competitiveTitleOn : toolbar.competitiveTitleOff}
                       >
                         <Trophy className="w-4 h-4" />
-                        {competitiveMode ? 'Competitive' : 'Casual'}
+                        {competitiveMode ? toolbar.competitive : toolbar.casual}
                       </button>
 
                       {competitiveMode && (
@@ -1009,9 +1054,9 @@ export default function App() {
                       <button
                         onClick={() => setShowDisplayLink(true)}
                         className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
-                        title="Get the link to open on your TV"
+                        title={toolbar.displayLinkTitle}
                       >
-                        <Monitor className="w-4 h-4" /> Display Link
+                        <Monitor className="w-4 h-4" /> {toolbar.displayLink}
                       </button>
 
                       <button
@@ -1023,47 +1068,55 @@ export default function App() {
                             ? 'bg-zinc-800 border-zinc-600 text-zinc-200'
                             : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
                         }`}
-                        title="Broadcast announcement to the customer display screen"
+                        title={toolbar.announceTitle}
                       >
                         <Megaphone className="w-4 h-4" />
-                        {announcement ? 'Announcement' : 'Announce'}
+                        {announcement ? toolbar.announcement : toolbar.announce}
                       </button>
 
                       <button
                         onClick={() => setShowActivityLog(true)}
                         className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
-                        title="Check-in, checkout and payment history"
+                        title={toolbar.logTitle}
                       >
-                        <ClipboardList className="w-4 h-4" /> Log
+                        <ClipboardList className="w-4 h-4" /> {toolbar.log}
+                      </button>
+
+                      <button
+                        onClick={() => setShowSessionRank(true)}
+                        className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
+                        title={toolbar.sessionRankTitle}
+                      >
+                        <Trophy className="w-4 h-4" /> {toolbar.sessionRank}
                       </button>
 
                       <Link
                         to="/leaderboard"
                         className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
-                        title="All-time rankings across every session"
+                        title={toolbar.rankingsTitle}
                       >
-                        <Medal className="w-4 h-4" /> Rankings
+                        <Medal className="w-4 h-4" /> {toolbar.rankings}
                       </Link>
 
                       <button
                         onClick={() => setShowWizard(true)}
                         className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-zinc-800 text-sm font-semibold flex items-center gap-2"
-                        title="Walk through setting up open play"
+                        title={toolbar.guideMeTitle}
                       >
-                        <HelpCircle className="w-4 h-4" /> Guide me
+                        <HelpCircle className="w-4 h-4" /> {toolbar.guideMe}
                       </button>
 
                       <button
                         onClick={resetSession}
                         className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-300 hover:bg-rose-950 hover:text-rose-300 hover:border-rose-900 text-sm font-semibold flex items-center gap-2"
                       >
-                        <RotateCcw className="w-4 h-4" /> Reset
+                        <RotateCcw className="w-4 h-4" /> {toolbar.reset}
                       </button>
 
                       <button
                         onClick={signOut}
                         className="px-2.5 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-zinc-500 hover:text-zinc-200 text-sm font-semibold flex items-center gap-2"
-                        title="Sign out"
+                        title={toolbar.signOutTitle}
                       >
                         <LogOut className="w-4 h-4" />
                       </button>
@@ -1081,7 +1134,7 @@ export default function App() {
               <input
                 value={announcement}
                 onChange={e => setAnnouncement(e.target.value)}
-                placeholder="Type a message for the customer display..."
+                placeholder={announcementBar.placeholder}
                 className="flex-1 bg-zinc-950 border border-zinc-800 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-lime-500"
                 autoFocus
               />
@@ -1089,7 +1142,7 @@ export default function App() {
                 <button
                   onClick={() => setAnnouncement('')}
                   className="text-zinc-500 hover:text-rose-400 shrink-0"
-                  title="Clear announcement"
+                  title={announcementBar.clearTitle}
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -1098,11 +1151,11 @@ export default function App() {
                 onClick={() => setShowAnnouncementBar(false)}
                 className="text-xs text-zinc-500 hover:text-zinc-300 font-semibold px-3 py-1.5 rounded border border-zinc-700 hover:border-zinc-500 shrink-0"
               >
-                Done
+                {buttons.done}
               </button>
             </div>
             {announcement && (
-              <p className="text-xs text-lime-500 mt-1.5 ml-7">Live on customer display</p>
+              <p className="text-xs text-lime-500 mt-1.5 ml-7">{announcementBar.live}</p>
             )}
           </div>
         )}
@@ -1115,16 +1168,16 @@ export default function App() {
         <div className="bg-rose-950 border-b border-rose-800 px-4 sm:px-6 py-2 flex items-center gap-3 shrink-0">
           <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
           <p className="text-rose-200 text-sm flex-1 min-w-0">
-            <span className="font-bold">Win/loss results aren’t being saved.</span>{' '}
-            They’ll reset when this page reloads. Your database is likely missing the
-            latest <code className="text-rose-300">supabase/schema.sql</code> — re-run it,
-            then finish a match to clear this.
+            <span className="font-bold">{statsWriteBanner.headline}</span>{' '}
+            {statsWriteBanner.body}{' '}
+            <code className="text-rose-300">{statsWriteBanner.fileName}</code>{' '}
+            {statsWriteBanner.bodyAfter}
           </p>
           <button
             onClick={() => setStatsWriteFailed(false)}
             className="text-rose-400 hover:text-rose-200 text-xs font-semibold shrink-0"
           >
-            Dismiss
+            {buttons.dismiss}
           </button>
         </div>
       )}
@@ -1142,7 +1195,6 @@ export default function App() {
           filteredPlayers={filteredPlayers}
           courts={courts}
           queue={queue}
-          draftGroup={draftGroup}
           busyPlayerIds={busyPlayerIds}
           search={search}
           newPlayerName={newPlayerName}
@@ -1159,9 +1211,11 @@ export default function App() {
           onCheckoutPlayer={setCheckoutPlayerId}
           removePlayer={removePlayer}
           setPlayerPayment={setPlayerPayment}
-          togglePlayerInDraft={togglePlayerInDraft}
-          saveDraftGroup={saveDraftGroup}
+          addPlayerToQueue={addPlayerToQueue}
+          startQueueGroup={startQueueGroup}
           autoGroup={autoGroup}
+          showValues={showValues}
+          setShowValues={setShowValues}
           setShowAssign={setShowAssign}
           setShowRental={setShowRental}
           removeFromQueue={removeFromQueue}
@@ -1172,8 +1226,6 @@ export default function App() {
           setDraggingPlayerId={setDraggingPlayerId}
           setFinishingCourt={setFinishingCourt}
           clearCourtCasual={clearCourtCasual}
-          markArrived={markArrived}
-          removeNoShow={removeNoShow}
           addCourt={addCourt}
           removeCourt={removeCourt}
           toggleCourtType={toggleCourtType}
@@ -1233,6 +1285,27 @@ export default function App() {
         <ActivityLogModal
           auditLog={auditLog}
           onClose={() => setShowActivityLog(false)}
+        />
+      )}
+      {showSessionRank && (
+        <SessionRankModal
+          rows={sessionRanking}
+          onClose={() => setShowSessionRank(false)}
+        />
+      )}
+      {replacing && (
+        <ReplaceQueuePlayerModal
+          leaving={playerById(replacing.playerId)}
+          groupIndex={queue.findIndex(g => g.id === replacing.groupId)}
+          available={replacementCandidates}
+          suggested={closestByValue(
+            replacementCandidates,
+            playerValue(playerById(replacing.playerId)),
+            history,
+          )}
+          onReplace={(id) => applyQueueReplacement(replacing.playerId, id)}
+          onLeaveOpen={() => applyQueueReplacement(replacing.playerId, null)}
+          onClose={() => setReplacing(null)}
         />
       )}
       {showRental !== null && (
@@ -1314,11 +1387,8 @@ function DisplayLinkModal({ token, slug, venueName, onRegenerate, onClose }) {
   };
 
   return (
-    <ModalShell onClose={onClose} title="Customer Display" wide>
-      <p className="text-zinc-400 text-sm mb-4">
-        Open this link in the browser on your TV, then put it full screen. It updates
-        live and is read-only — nobody can change anything from it.
-      </p>
+    <ModalShell onClose={onClose} title={modals.displayLink.title} wide>
+      <p className="text-zinc-400 text-sm mb-4">{modals.displayLink.intro}</p>
 
       <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3 mb-3">
         <code className="text-lime-400 text-xs break-all leading-relaxed">{url}</code>
@@ -1329,7 +1399,9 @@ function DisplayLinkModal({ token, slug, venueName, onRegenerate, onClose }) {
           onClick={copy}
           className="flex-1 bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold py-2.5 rounded-lg flex items-center justify-center gap-2 transition"
         >
-          {copied ? <><Check className="w-4 h-4" /> Copied</> : <><Copy className="w-4 h-4" /> Copy link</>}
+          {copied
+            ? <><Check className="w-4 h-4" /> {modals.displayLink.copied}</>
+            : <><Copy className="w-4 h-4" /> {modals.displayLink.copy}</>}
         </button>
         <a
           href={url}
@@ -1337,7 +1409,7 @@ function DisplayLinkModal({ token, slug, venueName, onRegenerate, onClose }) {
           rel="noopener noreferrer"
           className="flex-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-semibold py-2.5 rounded-lg flex items-center justify-center gap-2 transition"
         >
-          <ExternalLink className="w-4 h-4" /> Open
+          <ExternalLink className="w-4 h-4" /> {modals.displayLink.open}
         </a>
       </div>
 
@@ -1346,24 +1418,20 @@ function DisplayLinkModal({ token, slug, venueName, onRegenerate, onClose }) {
           so, because silently rendering nothing reads as "the QR feature is
           missing" rather than "your database is out of date". */}
       <div className="border-t border-zinc-800 pt-4 mb-5">
-        <h4 className="font-display text-lg mb-1">Club queue link</h4>
+        <h4 className="font-display text-lg mb-1">{modals.displayLink.clubHeading}</h4>
         {slug ? (
           <>
-            <p className="text-zinc-400 text-sm mb-3">
-              Print this for the front desk — players scan it to see the queue on their
-              phone. It never changes, so regenerating the TV link above leaves every
-              printed copy working.
-            </p>
+            <p className="text-zinc-400 text-sm mb-3">{modals.displayLink.clubIntro}</p>
             <ClubQrPoster venueName={venueName} slug={slug} />
           </>
         ) : (
           <div className="bg-amber-950 bg-opacity-40 border border-amber-800 rounded-lg p-3 flex items-start gap-2.5">
             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
             <p className="text-amber-200 text-sm">
-              <span className="font-bold">No printable QR code yet.</span> This club has no
-              queue address, which means the database is missing the latest{' '}
-              <code className="text-amber-300">supabase/schema.sql</code>. Re-run it and
-              reload — the QR poster appears here automatically.
+              <span className="font-bold">{modals.displayLink.noQrHeadline}</span>{' '}
+              {modals.displayLink.noQrBody}{' '}
+              <code className="text-amber-300">{modals.displayLink.noQrFileName}</code>.{' '}
+              {modals.displayLink.noQrBodyAfter}
             </p>
           </div>
         )}
@@ -1374,12 +1442,9 @@ function DisplayLinkModal({ token, slug, venueName, onRegenerate, onClose }) {
           onClick={onRegenerate}
           className="text-zinc-500 hover:text-rose-400 text-xs font-semibold flex items-center gap-2 transition"
         >
-          <RefreshCw className="w-3.5 h-3.5" /> Generate a new link
+          <RefreshCw className="w-3.5 h-3.5" /> {modals.displayLink.regenerate}
         </button>
-        <p className="text-zinc-600 text-xs mt-1.5">
-          Use this if the link was shared somewhere it shouldn’t have been. The old
-          one stops working straight away.
-        </p>
+        <p className="text-zinc-600 text-xs mt-1.5">{modals.displayLink.regenerateNote}</p>
       </div>
     </ModalShell>
   );
@@ -1441,7 +1506,7 @@ function PlayerCheckInField({
           onKeyDown={onKeyDown}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
-          placeholder="New player name..."
+          placeholder={checkIn.namePlaceholder}
           className="flex-1 bg-zinc-950 border border-zinc-800 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-lime-500"
           autoComplete="off"
           role="combobox"
@@ -1458,7 +1523,7 @@ function PlayerCheckInField({
         <button
           onClick={addPlayer}
           className="bg-lime-400 text-zinc-950 rounded-md px-3 hover:bg-lime-300"
-          title="Add player"
+          title={checkIn.addTitle}
         >
           <UserPlus className="w-4 h-4" />
         </button>
@@ -1467,7 +1532,7 @@ function PlayerCheckInField({
       {open && (
         <div className="absolute left-0 right-0 top-full mt-1 z-30 bg-zinc-900 border border-zinc-700 rounded-lg shadow-xl overflow-hidden">
           <div className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-zinc-500 border-b border-zinc-800 flex items-center gap-1.5">
-            <Search className="w-3 h-3" /> Returning players
+            <Search className="w-3 h-3" /> {checkIn.returningHeading}
           </div>
           {matches.map((p, i) => {
             const busy = busyPlayerIds.has(p.id);
@@ -1492,12 +1557,14 @@ function PlayerCheckInField({
                 </span>
                 {busy ? (
                   <span className="text-[10px] font-bold uppercase tracking-wide text-zinc-500 shrink-0">
-                    Active
+                    {checkIn.alreadyActive}
                   </span>
                 ) : (
                   <>
                     <PaymentBadge payment={p.payment} />
-                    <span className="text-[10px] font-bold uppercase tracking-wide text-lime-400 shrink-0">Check in</span>
+                    <span className="text-[10px] font-bold uppercase tracking-wide text-lime-400 shrink-0">
+                      {checkIn.checkInAction}
+                    </span>
                   </>
                 )}
               </button>
@@ -1511,7 +1578,7 @@ function PlayerCheckInField({
               className="w-full flex items-center gap-2 px-3 py-2 text-left text-sm text-zinc-300 hover:bg-zinc-800 border-t border-zinc-800 transition"
             >
               <UserPlus className="w-3.5 h-3.5 text-lime-400 shrink-0" />
-              Add new player “<span className="font-semibold">{newPlayerName.trim()}</span>”
+              {checkIn.addNewPrefix} “<span className="font-semibold">{newPlayerName.trim()}</span>”
             </button>
           )}
         </div>
@@ -1546,13 +1613,13 @@ function CheckedOutBox({ players, onCheckIn }) {
         className="w-full flex items-center gap-2 py-1.5 text-zinc-300 hover:text-zinc-100 transition"
       >
         <ChevronRight className={`w-4 h-4 text-zinc-500 transition-transform ${open ? 'rotate-90' : ''}`} />
-        <span className="font-display text-sm tracking-wide">CHECKED OUT</span>
+        <span className="font-display text-sm tracking-wide">{checkedOutCopy.heading}</span>
         <span className="text-zinc-600 text-xs">({players.length})</span>
       </button>
       {open && (
         <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden">
           {players.length === 0 ? (
-            <p className="p-2.5 text-xs text-zinc-500 text-center">No one’s checked out yet.</p>
+            <p className="p-2.5 text-xs text-zinc-500 text-center">{checkedOutCopy.empty}</p>
           ) : (
             <>
               <div className="p-2 border-b border-zinc-800">
@@ -1561,14 +1628,14 @@ function CheckedOutBox({ players, onCheckIn }) {
                   <input
                     value={search}
                     onChange={e => setSearch(e.target.value)}
-                    placeholder="Search checked-out players..."
+                    placeholder={checkedOutCopy.searchPlaceholder}
                     className="w-full bg-zinc-950 border border-zinc-800 rounded-md pl-9 pr-3 py-1.5 text-sm focus:outline-none focus:border-lime-500"
                   />
                 </div>
               </div>
               <div className="max-h-[140px] overflow-y-auto">
                 {list.length === 0 && (
-                  <p className="p-2.5 text-xs text-zinc-500 text-center">No checked-out players match.</p>
+                  <p className="p-2.5 text-xs text-zinc-500 text-center">{checkedOutCopy.noneMatch}</p>
                 )}
                 {list.map(p => (
                   <div
@@ -1583,8 +1650,8 @@ function CheckedOutBox({ players, onCheckIn }) {
                     <button
                       onClick={() => onCheckIn(p.id, 'unpaid')}
                       className="p-1.5 rounded-md bg-lime-400 text-zinc-950 hover:bg-lime-300 shrink-0"
-                      title={`Check ${p.name} back in`}
-                      aria-label={`Check ${p.name} back in`}
+                      title={checkedOutCopy.checkBackInTitle(p.name)}
+                      aria-label={checkedOutCopy.checkBackInTitle(p.name)}
                     >
                       <LogIn className="w-3.5 h-3.5" />
                     </button>
@@ -1605,15 +1672,16 @@ function CheckedOutBox({ players, onCheckIn }) {
 function StaffView(props) {
   const {
     competitiveMode, autoAssign,
-    players, filteredPlayers, courts, queue, draftGroup, busyPlayerIds,
+    players, filteredPlayers, courts, queue, busyPlayerIds,
     search, newPlayerName, newPlayerSkill, newPlayerPayment,
     avgGameDurationMs, openPlayCourtCount,
     setSearch, setNewPlayerName, setNewPlayerSkill, setNewPlayerPayment,
-    addPlayer, checkInExisting, onCheckoutPlayer, removePlayer, setPlayerPayment, togglePlayerInDraft, saveDraftGroup, autoGroup,
+    addPlayer, checkInExisting, onCheckoutPlayer, removePlayer, setPlayerPayment, addPlayerToQueue, startQueueGroup, autoGroup,
     setShowAssign, setShowRental, removeFromQueue, removePlayerFromQueue, movePlayerToQueueGroup, dropOnQueuePlayer,
     draggingPlayerId, setDraggingPlayerId,
-    setFinishingCourt, clearCourtCasual, markArrived, removeNoShow,
+    setFinishingCourt, clearCourtCasual,
     addCourt, removeCourt, toggleCourtType, renameCourt, playerById,
+    showValues, setShowValues,
   } = props;
 
   const [dragOverZone, setDragOverZone] = useState(null);
@@ -1674,21 +1742,37 @@ function StaffView(props) {
               onToggleType={() => toggleCourtType(court.id)}
               onRename={(name) => renameCourt(court.id, name)}
               onBookRental={() => setShowRental(court.id)}
-              onArrived={() => markArrived(court.id)}
-              onNoShow={() => removeNoShow(court.id)}
             />
           ))}
         </div>
       </section>
 
-      {/* ROSTER + GROUP BUILDER + QUEUE */}
+      {/* ROSTER + QUEUE */}
       {/* `lg:grid-rows-1` is load-bearing: it pins the single row to
           `minmax(0, 1fr)` of the frame's leftover height. Left auto-sized, the
           row would grow to its tallest column's content and overflow the lock. */}
       <div className="grid grid-cols-1 lg:grid-cols-12 lg:grid-rows-1 gap-3 lg:flex-1 lg:min-h-0">
         {/* ROSTER */}
-        <section className="lg:col-span-4 flex flex-col min-h-0">
-          <h2 className="font-display text-xl text-zinc-200 tracking-wide mb-1.5 shrink-0">ROSTER</h2>
+        <section className="lg:col-span-5 flex flex-col min-h-0">
+          <div className="flex items-center justify-between gap-3 mb-1.5 shrink-0">
+            <h2 className="font-display text-xl text-zinc-200 tracking-wide">{rosterCopy.heading}</h2>
+            {/* Staff-only peek at the hidden match values (spec §1). Off by
+                default and never persisted, so players never see it over a
+                shoulder unless staff deliberately turn it on. */}
+            <button
+              onClick={() => setShowValues(v => !v)}
+              className={`text-[11px] font-semibold px-2 py-1 rounded-md border transition flex items-center gap-1.5 ${
+                showValues
+                  ? 'bg-zinc-800 border-zinc-600 text-zinc-300'
+                  : 'bg-transparent border-transparent text-zinc-700 hover:text-zinc-400'
+              }`}
+              title={rosterCopy.valuesToggleTitle}
+              aria-pressed={showValues}
+            >
+              {showValues ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+              {rosterCopy.valuesToggle}
+            </button>
+          </div>
           <div className="bg-zinc-900 rounded-xl border border-zinc-800 overflow-hidden flex-1 min-h-0 flex flex-col">
             <div className="p-2.5 border-b border-zinc-800 space-y-2 shrink-0">
               <PlayerCheckInField
@@ -1730,7 +1814,7 @@ function StaffView(props) {
                 <input
                   value={search}
                   onChange={e => setSearch(e.target.value)}
-                  placeholder="Search players..."
+                  placeholder={rosterCopy.searchPlaceholder}
                   className="w-full bg-zinc-950 border border-zinc-800 rounded-md pl-9 pr-3 py-1.5 text-sm focus:outline-none focus:border-lime-500"
                 />
               </div>
@@ -1740,12 +1824,11 @@ function StaffView(props) {
                 its returning-player autocomplete dropdown. */}
             <div className="flex-1 min-h-0 overflow-y-auto">
               {filteredPlayers.length === 0 && (
-                <p className="p-3 text-xs text-zinc-500 text-center">No players match.</p>
+                <p className="p-3 text-xs text-zinc-500 text-center">{rosterCopy.noneMatch}</p>
               )}
               {filteredPlayers.map((p, i) => {
                 const busy = busyPlayerIds.has(p.id);
-                const inDraft = draftGroup.includes(p.id);
-                const canDrag = !busy && !inDraft;
+                const canDrag = !busy;
                 return (
                   <div
                     key={p.id}
@@ -1760,10 +1843,11 @@ function StaffView(props) {
                     style={{ '--cf-delay': `${Math.min(i, 12) * 40}ms` }}
                     className={`cf-slide-in px-3 py-2 flex items-center gap-2 border-b border-zinc-800 last:border-0 transition ${
                       busy ? 'opacity-40' : 'hover:bg-zinc-800'
-                    } ${inDraft ? 'bg-lime-950' : ''} ${
-                      draggingPlayerId === p.id ? 'opacity-40' : ''
-                    } ${canDrag ? 'cursor-grab' : 'cursor-pointer'}`}
-                    onClick={() => !busy && togglePlayerInDraft(p.id)}
+                    } ${draggingPlayerId === p.id ? 'opacity-40' : ''} ${
+                      canDrag ? 'cursor-grab' : 'cursor-default'
+                    }`}
+                    onClick={() => !busy && addPlayerToQueue(p.id)}
+                    title={busy ? undefined : rosterCopy.addToQueueTitle(p.name)}
                   >
                     <div className={`w-2 h-2 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
                     <div className="flex-1 min-w-0">
@@ -1772,12 +1856,21 @@ function StaffView(props) {
                         {p.skill} • {p.wins}W {p.losses}L
                       </div>
                     </div>
+                    {showValues && (
+                      <span
+                        className="text-[11px] font-mono font-bold px-1.5 py-0.5 rounded bg-zinc-950 border border-zinc-700 text-zinc-400 shrink-0"
+                        title={rosterCopy.valueChipTitle(p.wins, p.losses)}
+                      >
+                        {playerValue(p) > 0 ? '+' : ''}{playerValue(p)}
+                      </span>
+                    )}
                     {/* Payment badge doubles as the editor (spec §2, §8) */}
                     <PaymentEditor payment={p.payment} onChange={(status) => setPlayerPayment(p.id, status)} />
-                    {inDraft && <Check className="w-4 h-4 text-lime-400 shrink-0" />}
                     {busy && (
                       <span className="text-xs text-zinc-500 shrink-0">
-                        {courts.some(c => c.match?.players.includes(p.id)) ? 'Playing' : 'Queued'}
+                        {courts.some(c => c.match?.players.includes(p.id))
+                          ? rosterCopy.statusPlaying
+                          : rosterCopy.statusQueued}
                       </span>
                     )}
                     {!busy && (
@@ -1788,8 +1881,8 @@ function StaffView(props) {
                         <button
                           onClick={e => { e.stopPropagation(); onCheckoutPlayer(p.id); }}
                           className="text-zinc-600 hover:text-lime-400 p-2 -m-1 shrink-0 transition-colors duration-150"
-                          title={`Check out ${p.name}`}
-                          aria-label={`Check out ${p.name}`}
+                          title={rosterCopy.checkOutTitle(p.name)}
+                          aria-label={rosterCopy.checkOutTitle(p.name)}
                         >
                           <LogOut className="w-3.5 h-3.5" />
                         </button>
@@ -1797,8 +1890,8 @@ function StaffView(props) {
                         <button
                           onClick={e => { e.stopPropagation(); removePlayer(p.id); }}
                           className="text-zinc-600 hover:text-rose-400 p-2 -m-1 shrink-0 transition-colors duration-150"
-                          title={`Remove ${p.name}`}
-                          aria-label={`Remove ${p.name}`}
+                          title={rosterCopy.removeTitle(p.name)}
+                          aria-label={rosterCopy.removeTitle(p.name)}
                         >
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
@@ -1809,7 +1902,7 @@ function StaffView(props) {
               })}
             </div>
             <div className="px-3 py-1.5 text-[11px] text-zinc-500 border-t border-zinc-800 shrink-0">
-              {activeCount} checked in · {activeCount - busyPlayerIds.size} available
+              {rosterCopy.countLine(activeCount, activeCount - busyPlayerIds.size)}
             </div>
           </div>
 
@@ -1819,95 +1912,26 @@ function StaffView(props) {
           <CheckedOutBox players={checkedOutPlayers} onCheckIn={checkInExisting} />
         </section>
 
-        {/* GROUP BUILDER */}
-        <section className="lg:col-span-4 flex flex-col min-h-0">
-          <h2 className="font-display text-xl text-zinc-200 tracking-wide mb-1.5 shrink-0">GROUP BUILDER</h2>
-          <div className="bg-zinc-900 rounded-xl border border-zinc-800 p-2.5 space-y-2 flex-1 min-h-0 flex flex-col">
-            <p className="text-xs text-zinc-400 shrink-0">
-              Click roster names to add. <span className="text-zinc-500">{draftGroup.length}/4 selected.</span>
-            </p>
-            <div
-              className={`space-y-2 min-h-[4.5rem] flex-1 lg:min-h-0 overflow-y-auto rounded-lg p-1 transition ${
-                dragOverZone === 'builder' ? 'bg-lime-950/30 ring-2 ring-lime-600' : ''
-              }`}
-              onDragOver={e => {
-                // The builder takes available roster players only — a player
-                // already in a queue group can be moved group-to-group, but not
-                // dropped back here, so don't invite it.
-                if (!_dragId || busyPlayerIds.has(_dragId) || draftGroup.length >= 4 || draftGroup.includes(_dragId)) return;
-                e.preventDefault();
-                setDragOverZone('builder');
-              }}
-              onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOverZone(null); }}
-              onDrop={e => {
-                e.preventDefault();
-                setDragOverZone(null);
-                const id = _dragId || Number(e.dataTransfer.getData('text/plain'));
-                if (id && !draftGroup.includes(id) && draftGroup.length < 4)
-                  togglePlayerInDraft(id);
-              }}
-            >
-              {draftGroup.length === 0 && (
-                <div className={`text-xs text-center py-4 border border-dashed rounded-lg transition ${
-                  draggingPlayerId
-                    ? 'text-lime-400 border-lime-600 bg-lime-950/20'
-                    : 'text-zinc-600 italic border-zinc-800'
-                }`}>
-                  {draggingPlayerId ? 'Drop player here' : 'No players selected'}
-                </div>
-              )}
-              {draftGroup.map(id => {
-                const p = playerById(id);
-                if (!p) return null;
-                return (
-                  <div key={id} className="flex items-center gap-2 bg-zinc-950 rounded-lg px-2 py-1.5 border border-zinc-800">
-                    <span className={`text-xs px-2 py-0.5 rounded border ${skillStyle(p.skill)}`}>{p.skill}</span>
-                    <span className="flex-1 text-sm font-semibold truncate">{p.name}</span>
-                    <PaymentBadge payment={p.payment} />
-                    <button onClick={() => togglePlayerInDraft(id)} className="text-zinc-500 hover:text-rose-400 shrink-0">
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-            <div className="flex gap-2 shrink-0">
-              <button
-                onClick={saveDraftGroup}
-                disabled={draftGroup.length === 0}
-                className="flex-1 bg-lime-400 text-zinc-950 font-bold py-2 rounded-lg hover:bg-lime-300 disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                title="Save groups with fewer than 4 to hold spots for arriving players"
-              >
-                <Users className="w-4 h-4" /> Save group
-              </button>
-              <button
-                onClick={runAutoGroup}
-                disabled={autoBusy}
-                className={`relative overflow-hidden bg-zinc-800 text-zinc-200 font-semibold py-2 px-4 rounded-lg hover:bg-zinc-700 flex items-center gap-2 transition-colors disabled:cursor-wait ${autoBusy ? 'cf-shimmer' : ''}`}
-                title="Auto-group 4 available players and balance the teams (best+worst vs 2nd+3rd)"
-              >
-                {autoBusy
-                  ? <><RefreshCw className="w-4 h-4 animate-spin" /> Balancing…</>
-                  : <><Shuffle className="w-4 h-4" /> Auto</>}
-              </button>
-            </div>
-          </div>
-        </section>
-
-        {/* QUEUE */}
-        <section className="lg:col-span-4 flex flex-col min-h-0">
-          <div className="flex items-center gap-3 mb-1.5 shrink-0">
+        {/* QUEUE — groups are built here directly: click or drag a roster name
+            to fill the first open slot, drag between groups to rearrange, or
+            drop on the strip at the bottom to start a fresh group. */}
+        <section className="lg:col-span-7 flex flex-col min-h-0">
+          <div className="flex items-center justify-between gap-3 mb-1.5 shrink-0">
             <h2 className="font-display text-xl text-zinc-200 tracking-wide">
               QUEUE <span className="text-zinc-600 text-sm">({queue.length})</span>
             </h2>
+            <button
+              onClick={runAutoGroup}
+              disabled={autoBusy}
+              className={`relative overflow-hidden bg-zinc-800 text-zinc-200 text-sm font-semibold py-1.5 px-3 rounded-lg hover:bg-zinc-700 flex items-center gap-2 transition-colors disabled:cursor-wait ${autoBusy ? 'cf-shimmer' : ''}`}
+              title="Groups players with similar values for fair matches, then balances teams within each group."
+            >
+              {autoBusy
+                ? <><RefreshCw className="w-4 h-4 animate-spin" /> Balancing…</>
+                : <><Shuffle className="w-4 h-4" /> Auto</>}
+            </button>
           </div>
           <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-0.5">
-            {queue.length === 0 && (
-              <div className="flex flex-col items-center gap-2 px-3 py-4 border border-dashed border-zinc-800 rounded-xl text-center">
-                <Users className="cf-breathe w-6 h-6 text-zinc-600" />
-                <span className="cf-breathe text-sm text-zinc-500 italic">Waiting for groups…</span>
-              </div>
-            )}
             {queue.map((g, idx) => {
               const groupPlayers = g.players.map(playerById).filter(Boolean);
               const avgSkill = groupPlayers.length
@@ -2043,6 +2067,39 @@ function StaffView(props) {
                 </div>
               );
             })}
+
+            {/* Start a new group. Groups otherwise fill front-to-back, so this is
+                how staff deliberately open a fresh one — e.g. to hold slots for
+                players still walking in. Doubles as the queue's empty state, so
+                there is always somewhere to drop. */}
+            <div
+              onDragOver={e => { if (!_dragId) return; e.preventDefault(); setDragOverZone('newgroup'); }}
+              onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOverZone(null); }}
+              onDrop={e => {
+                e.preventDefault();
+                setDragOverZone(null);
+                const id = _dragId || Number(e.dataTransfer.getData('text/plain'));
+                if (id) startQueueGroup(id);
+              }}
+              className={`flex flex-col items-center gap-1.5 px-3 py-4 border border-dashed rounded-xl text-center transition ${
+                dragOverZone === 'newgroup'
+                  ? 'border-lime-500 bg-lime-950/30 ring-1 ring-lime-600'
+                  : draggingPlayerId ? 'border-lime-700 text-lime-400'
+                  : 'border-zinc-800'
+              }`}
+            >
+              {draggingPlayerId ? (
+                <span className="text-sm font-semibold text-lime-400">Drop to start a new group</span>
+              ) : queue.length === 0 ? (
+                <>
+                  <Users className="cf-breathe w-6 h-6 text-zinc-600" />
+                  <span className="cf-breathe text-sm text-zinc-500 italic">Waiting for groups…</span>
+                  <span className="text-xs text-zinc-600">Click a roster name to add them</span>
+                </>
+              ) : (
+                <span className="text-xs text-zinc-600">Drag a player here to start a new group</span>
+              )}
+            </div>
           </div>
         </section>
       </div>
@@ -2073,7 +2130,7 @@ function PlayerAvatar({ player, size }) {
 /* ─────────────────────────────────────────────
    COURT CARD (STAFF) — double-click name to rename
    ───────────────────────────────────────────── */
-function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinish, onClear, onRemove, onToggleType, onRename, onBookRental, onArrived, onNoShow }) {
+function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinish, onClear, onRemove, onToggleType, onRename, onBookRental }) {
   const [editing, setEditing] = useState(false);
   const [editName, setEditName] = useState(court.name);
   const inputRef = useRef(null);
@@ -2095,11 +2152,6 @@ function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinis
   const remaining  = hasTimer ? court.match.endsAt - now : 0;
   const timeUp     = hasTimer && remaining <= 0;
   const showTimeUp = timeUp && !isRental && competitiveMode;
-
-  // No-show tracking (spec §7): a called group that hasn't been confirmed present.
-  const awaitingArrival = isPlaying && !isRental && court.match.arrived === false;
-  const calledAgoMs = awaitingArrival ? now - (court.match.calledAt ?? court.match.startedAt) : 0;
-  const possibleNoShow = awaitingArrival && calledAgoMs >= NO_SHOW_MINUTES * 60_000;
 
   // Empty courts get a dashed "placeholder" border + a hover lift; the waiting
   // pulse is carried by the breathing icon/text in the body (§2). Keeping the
@@ -2194,39 +2246,6 @@ function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinis
 
       {isPlaying ? (
         <>
-          {/* No-show nudge (spec §7): staff confirm arrival or drop the group. */}
-          {awaitingArrival && (
-            <div className={`mb-3 rounded-lg border p-2.5 ${
-              possibleNoShow ? 'bg-rose-950 border-rose-700' : 'bg-amber-950/40 border-amber-800'
-            }`}>
-              <div className={`flex items-center gap-1.5 text-xs font-bold mb-2 ${
-                possibleNoShow ? 'text-rose-300' : 'text-amber-300'
-              }`}>
-                <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                {possibleNoShow
-                  ? `Possible no-show — called ${fmtElapsed(calledAgoMs)} ago`
-                  : 'Called — waiting for players'}
-              </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={onArrived}
-                  className="flex-1 bg-lime-400 hover:bg-lime-300 text-zinc-950 text-xs font-bold py-1.5 rounded-md flex items-center justify-center gap-1"
-                >
-                  <Check className="w-3.5 h-3.5" /> They're here
-                </button>
-                <button
-                  onClick={onNoShow}
-                  className={`flex-1 text-xs font-bold py-1.5 rounded-md flex items-center justify-center gap-1 transition ${
-                    possibleNoShow
-                      ? 'bg-rose-500 hover:bg-rose-400 text-zinc-950'
-                      : 'bg-zinc-800 hover:bg-rose-900 text-zinc-300 hover:text-rose-200'
-                  }`}
-                >
-                  <X className="w-3.5 h-3.5" /> No-show
-                </button>
-              </div>
-            </div>
-          )}
           {isRental ? (
             /* Rental — host party display */
             (() => {
@@ -2631,9 +2650,9 @@ function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDu
   const openCourts = courts.filter(c => !c.match);
 
   return (
-    <ModalShell onClose={onClose} title="Assign to court" wide>
+    <ModalShell onClose={onClose} title={modals.assign.title} wide>
       <div className="mb-4">
-        <p className="text-sm text-zinc-400 mb-2">Group:</p>
+        <p className="text-sm text-zinc-400 mb-2">{modals.assign.groupLabel}</p>
         <div className="bg-zinc-950 rounded-lg p-2 space-y-1">
           {group.players.map(id => {
             const p = playerById(id);
@@ -2645,10 +2664,10 @@ function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDu
       </div>
 
       {openCourts.length === 0 ? (
-        <p className="text-amber-400 text-sm py-4 text-center">No open courts. Finish a match first.</p>
+        <p className="text-amber-400 text-sm py-4 text-center">{modals.assign.noOpenCourts}</p>
       ) : (
         <div className="space-y-2">
-          <p className="text-sm text-zinc-400 mb-2">Pick a court and duration:</p>
+          <p className="text-sm text-zinc-400 mb-2">{modals.assign.pickPrompt}</p>
           {openCourts.map(c => {
             const isRental = c.type === 'rental';
             const durations = isRental ? RENTAL_DURATIONS : OPEN_DURATIONS;
@@ -2660,14 +2679,14 @@ function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDu
                   <div className="flex items-center gap-2">
                     <span className="font-display text-lg">{c.name}</span>
                     {isRental ? (
-                      <span className="text-[10px] font-bold tracking-widest bg-amber-500 text-zinc-950 px-1.5 py-0.5 rounded">RENTAL</span>
+                      <span className="text-[10px] font-bold tracking-widest bg-amber-500 text-zinc-950 px-1.5 py-0.5 rounded">{modals.assign.rentalTag}</span>
                     ) : (
-                      <span className="text-[10px] font-bold tracking-widest text-zinc-500">OPEN PLAY</span>
+                      <span className="text-[10px] font-bold tracking-widest text-zinc-500">{modals.assign.openPlayTag}</span>
                     )}
                   </div>
                   {!isRental && !competitiveMode && defaultOpenDuration && (
                     <span className="text-[10px] text-cyan-400 flex items-center gap-1">
-                      <Zap className="w-2.5 h-2.5" /> auto will use {defaultOpenDuration}m
+                      <Zap className="w-2.5 h-2.5" /> {modals.assign.autoWillUse(defaultOpenDuration)}
                     </span>
                   )}
                 </div>
@@ -2686,7 +2705,7 @@ function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDu
                             ? 'bg-cyan-400 text-zinc-950 hover:bg-cyan-300 ring-2 ring-cyan-300'
                             : 'bg-lime-400 text-zinc-950 hover:bg-lime-300'
                         }`}
-                        title={isDefault ? 'This is your default session time' : undefined}
+                        title={isDefault ? modals.assign.defaultDurationTitle : undefined}
                       >
                         {d.label}
                         {isDefault && (
@@ -2711,7 +2730,7 @@ function FinishMatchModal({ court, playerById, onFinish, onClose }) {
   if (!court?.match) return null;
   const [t1a, t1b, t2a, t2b] = court.match.players.map(playerById);
   return (
-    <ModalShell onClose={onClose} title={`Finish ${court.name} — who won?`}>
+    <ModalShell onClose={onClose} title={modals.finishMatch.title(court.name)}>
       {/* Stacked on phones: these are big tap targets and player names wrap badly
           in two narrow columns. */}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -2719,19 +2738,19 @@ function FinishMatchModal({ court, playerById, onFinish, onClose }) {
           onClick={() => onFinish(1)}
           className="bg-zinc-900 border-2 border-zinc-800 hover:border-lime-500 hover:bg-lime-950 rounded-xl p-4 text-left transition"
         >
-          <div className="text-xs text-zinc-500 font-bold mb-2">TEAM 1</div>
+          <div className="text-xs text-zinc-500 font-bold mb-2">{modals.finishMatch.team1}</div>
           <div className="font-display text-xl">{t1a?.name}</div>
           <div className="font-display text-xl">{t1b?.name}</div>
-          <div className="mt-3 text-lime-400 text-xs font-bold">↳ MARK AS WINNER</div>
+          <div className="mt-3 text-lime-400 text-xs font-bold">{modals.finishMatch.markWinner}</div>
         </button>
         <button
           onClick={() => onFinish(2)}
           className="bg-zinc-900 border-2 border-zinc-800 hover:border-lime-500 hover:bg-lime-950 rounded-xl p-4 text-left transition"
         >
-          <div className="text-xs text-zinc-500 font-bold mb-2">TEAM 2</div>
+          <div className="text-xs text-zinc-500 font-bold mb-2">{modals.finishMatch.team2}</div>
           <div className="font-display text-xl">{t2a?.name}</div>
           <div className="font-display text-xl">{t2b?.name}</div>
-          <div className="mt-3 text-lime-400 text-xs font-bold">↳ MARK AS WINNER</div>
+          <div className="mt-3 text-lime-400 text-xs font-bold">{modals.finishMatch.markWinner}</div>
         </button>
       </div>
     </ModalShell>
@@ -2740,9 +2759,9 @@ function FinishMatchModal({ court, playerById, onFinish, onClose }) {
 
 function LeaderboardModal({ leaderboard, history, onClose }) {
   return (
-    <ModalShell onClose={onClose} title="Leaderboard" wide>
+    <ModalShell onClose={onClose} title={leaderboardCopy.title} wide>
       {leaderboard.length === 0 ? (
-        <p className="text-zinc-500 text-center py-8">No matches finished yet.</p>
+        <p className="text-zinc-500 text-center py-8">{leaderboardCopy.empty}</p>
       ) : (
         <div className="space-y-1">
           {leaderboard.map((p, i) => (
@@ -2765,7 +2784,7 @@ function LeaderboardModal({ leaderboard, history, onClose }) {
         </div>
       )}
       <div className="mt-4 pt-4 border-t border-zinc-800 text-xs text-zinc-500">
-        Total matches played: {history.length}
+        {leaderboardCopy.totalMatches(history.length)}
       </div>
     </ModalShell>
   );
@@ -2787,7 +2806,7 @@ function CheckoutModal({ player, onSetPayment, onComplete, onClose }) {
   const checkedIn = new Date(player.checkedInAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
   return (
-    <ModalShell onClose={onClose} title={`Check out — ${player.name}`}>
+    <ModalShell onClose={onClose} title={modals.checkout.title(player.name)}>
       <div className="flex items-center gap-3 mb-4">
         <PlayerAvatar player={player} size="lg" />
         <div className="min-w-0">
@@ -2799,13 +2818,13 @@ function CheckoutModal({ player, onSetPayment, onComplete, onClose }) {
       <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3 mb-4 space-y-1.5 text-sm">
         <div className="flex items-center justify-between">
           <span className="text-zinc-400 flex items-center gap-1.5">
-            <LogIn className="w-4 h-4 text-zinc-500" /> Checked in
+            <LogIn className="w-4 h-4 text-zinc-500" /> {modals.checkout.checkedInLabel}
           </span>
           <span className="text-zinc-200">{checkedIn}</span>
         </div>
         <div className="flex items-center justify-between">
           <span className="text-zinc-400 flex items-center gap-1.5">
-            <Clock className="w-4 h-4 text-zinc-500" /> Session length
+            <Clock className="w-4 h-4 text-zinc-500" /> {modals.checkout.sessionLengthLabel}
           </span>
           <span className="font-semibold text-lime-400">{fmtDuration(sessionMs)}</span>
         </div>
@@ -2813,7 +2832,7 @@ function CheckoutModal({ player, onSetPayment, onComplete, onClose }) {
 
       {paid ? (
         <div className="flex items-center gap-2 text-sm text-zinc-300 mb-5">
-          <span className="text-zinc-400">Payment</span>
+          <span className="text-zinc-400">{modals.checkout.paymentLabel}</span>
           <PaymentBadge payment={player.payment} />
         </div>
       ) : (
@@ -2821,7 +2840,7 @@ function CheckoutModal({ player, onSetPayment, onComplete, onClose }) {
           <div className="flex items-start gap-2.5 mb-2.5">
             <AlertTriangle className="w-5 h-5 text-rose-300 shrink-0 mt-0.5" />
             <p className="text-sm text-rose-200 font-bold">
-              {player.name} has not paid yet. Please collect payment.
+              {modals.checkout.unpaidWarning(player.name)}
             </p>
           </div>
           <div className="flex gap-2">
@@ -2829,13 +2848,13 @@ function CheckoutModal({ player, onSetPayment, onComplete, onClose }) {
               onClick={() => onSetPayment(player.id, 'online')}
               className="flex-1 text-xs font-bold py-2 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 flex items-center justify-center gap-1"
             >
-              <Check className="w-3.5 h-3.5" /> Paid — Online
+              <Check className="w-3.5 h-3.5" /> {modals.checkout.payOnline}
             </button>
             <button
               onClick={() => onSetPayment(player.id, 'cash')}
               className="flex-1 text-xs font-bold py-2 rounded-md bg-amber-400 hover:bg-amber-300 text-zinc-950 flex items-center justify-center gap-1"
             >
-              <DollarSign className="w-3.5 h-3.5" /> Paid — Cash
+              <DollarSign className="w-3.5 h-3.5" /> {modals.checkout.payCash}
             </button>
           </div>
         </div>
@@ -2846,46 +2865,206 @@ function CheckoutModal({ player, onSetPayment, onComplete, onClose }) {
         className="w-full bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition"
       >
         <LogOut className="w-4 h-4" />
-        {paid ? 'Check out' : 'Check out anyway'}
+        {paid ? modals.checkout.confirmPaid : modals.checkout.confirmUnpaid}
       </button>
     </ModalShell>
   );
 }
 
 /* ─────────────────────────────────────────────
+   REPLACE A QUEUED PLAYER (spec §4)
+   Someone is leaving a group; this asks who takes the slot rather than deciding
+   for staff. The closest-value stand-in leads because it keeps the group as
+   even as the matcher made it, but it is one option among four — taking it
+   every time is exactly how one strong group ends up stacked all evening.
+
+   No values anywhere on this screen, including the suggestion: staff pick on
+   names. The roster's Values toggle deliberately does not reach in here.
+   ───────────────────────────────────────────── */
+function ReplaceQueuePlayerModal({ leaving, groupIndex, available, suggested, onReplace, onLeaveOpen, onClose }) {
+  const [search, setSearch] = useState('');
+
+  const listed = available
+    .filter(p => !search || p.name.toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  const c = modals.replacePlayer;
+  const groupLabel = groupIndex >= 0 ? c.groupLabel(groupIndex + 1) : c.fallbackGroupLabel;
+
+  return (
+    <ModalShell onClose={onClose} title={c.title(leaving?.name ?? 'player')}>
+      <p className="text-sm text-zinc-400 mb-3">
+        {c.intro} <span className="text-zinc-200 font-semibold">{groupLabel}</span>.{' '}
+        {c.introAfter}
+      </p>
+
+      <div className="space-y-2 mb-4">
+        {suggested && (
+          <button
+            onClick={() => onReplace(suggested.id)}
+            className="w-full bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold py-2.5 px-3 rounded-lg flex items-center gap-2 text-left"
+          >
+            <Zap className="w-4 h-4 shrink-0" />
+            <span className="flex-1 min-w-0 truncate">{c.closestMatch(suggested.name)}</span>
+            <span className="text-[10px] font-bold tracking-wider opacity-70 shrink-0">{c.closestBadge}</span>
+          </button>
+        )}
+        <button
+          onClick={() => onReplace(randomFrom(available)?.id ?? null)}
+          className="w-full bg-zinc-800 hover:bg-zinc-700 text-zinc-100 font-semibold py-2.5 px-3 rounded-lg flex items-center gap-2 text-left"
+          title={c.randomTitle}
+        >
+          <Shuffle className="w-4 h-4 shrink-0" />
+          <span className="flex-1 min-w-0">{c.randomDraw}</span>
+          <span className="text-[10px] font-bold tracking-wider text-zinc-500 shrink-0">{c.randomBadge}</span>
+        </button>
+      </div>
+
+      <p className="text-sm text-zinc-400 mb-2">{c.pickPrompt}</p>
+      <div className="relative mb-2">
+        <Search className="w-4 h-4 absolute left-3 top-2.5 text-zinc-500" />
+        <input
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+          placeholder={c.searchPlaceholder}
+          className="w-full bg-zinc-950 border border-zinc-800 rounded-md pl-9 pr-3 py-2 text-sm focus:outline-none focus:border-lime-500"
+        />
+      </div>
+      <div className="max-h-44 overflow-y-auto bg-zinc-950 rounded-lg p-1 mb-4">
+        {listed.length === 0 && (
+          <p className="text-sm text-zinc-500 text-center py-4">{c.noneMatch}</p>
+        )}
+        {listed.map(p => (
+          <button
+            key={p.id}
+            onClick={() => onReplace(p.id)}
+            className="w-full flex items-center gap-2 px-3 py-2 rounded-md hover:bg-zinc-800 text-left transition"
+          >
+            <PlayerAvatar player={p} size="sm" />
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-semibold truncate">{p.name}</div>
+              <div className="text-xs text-zinc-500">{p.skill}</div>
+            </div>
+            <PaymentBadge payment={p.payment} dot />
+          </button>
+        ))}
+      </div>
+
+      <button
+        onClick={onLeaveOpen}
+        className="w-full bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-300 font-semibold py-2 rounded-lg text-sm"
+      >
+        {c.leaveOpen}
+      </button>
+    </ModalShell>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   SESSION RANKINGS (spec §6)
+   Today's standings, separate from the all-time /leaderboard page: raw wins
+   rather than win rate, and no minimum-games gate, because on a single evening
+   nobody has ten games. Shows W/L and recent form only — the hidden value the
+   matcher groups on is deliberately absent, and staff who need it use the
+   roster's Values toggle instead.
+   ───────────────────────────────────────────── */
+const RANK_COLORS = ['text-amber-300', 'text-zinc-300', 'text-amber-600'];
+
+function SessionRankModal({ rows, onClose }) {
+  return (
+    <ModalShell onClose={onClose} title={sessionRankCopy.title} wide>
+      {rows.length === 0 ? (
+        <p className="text-zinc-500 text-center py-10">{sessionRankCopy.empty}</p>
+      ) : (
+        <>
+          <div className="flex items-center gap-3 px-3 pb-2 text-[11px] font-bold tracking-wider text-zinc-600 uppercase">
+            <span className="w-8 shrink-0">{sessionRankCopy.colRank}</span>
+            <span className="flex-1">{sessionRankCopy.colPlayer}</span>
+            <span className="w-16 text-center shrink-0">{sessionRankCopy.colRecord}</span>
+            <span className="w-28 text-right shrink-0" title={sessionRankCopy.streakTitle}>
+              {sessionRankCopy.colStreak}
+            </span>
+          </div>
+          <div className="space-y-1 max-h-[60vh] overflow-y-auto">
+            {rows.map((r, i) => (
+              <div key={r.id} className="flex items-center gap-3 bg-zinc-950 rounded-lg px-3 py-2">
+                <span className={`w-8 shrink-0 font-display text-lg ${RANK_COLORS[i] ?? 'text-zinc-600'}`}>
+                  {i + 1}
+                </span>
+                <span className="flex-1 min-w-0 text-sm font-semibold truncate">{r.name}</span>
+                <span className="w-16 text-center shrink-0 text-sm font-mono">
+                  <span className="text-lime-400 font-bold">{r.wins}</span>
+                  <span className="text-zinc-600"> — </span>
+                  <span className="text-rose-400">{r.losses}</span>
+                </span>
+                {/* Newest first, so the leftmost chip is the game they just
+                    played — read it as "how are they going right now". */}
+                <span className="w-28 flex justify-end gap-1 shrink-0" title={sessionRankCopy.streakTitle}>
+                  {r.streak.map((s, j) => (
+                    <span
+                      key={j}
+                      className={`w-5 h-5 rounded text-[10px] font-bold flex items-center justify-center ${
+                        s === 'W' ? 'bg-lime-950 text-lime-400 border border-lime-800'
+                                  : 'bg-rose-950 text-rose-400 border border-rose-900'
+                      }`}
+                    >
+                      {s}
+                    </span>
+                  ))}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+      <p className="text-xs text-zinc-600 mt-4 pt-3 border-t border-zinc-800">
+        {sessionRankCopy.footer}
+      </p>
+    </ModalShell>
+  );
+}
+
+/* ─────────────────────────────────────────────
    ACTIVITY LOG (spec §9)
-   A simple reverse-chronological list of check-ins, checkouts, payment changes
-   and no-shows. Kept lightweight — a review list, not an analytics surface.
+   A simple reverse-chronological list of check-ins, checkouts, match results
+   and payment changes. Kept lightweight — a review list, not an analytics
+   surface.
    ───────────────────────────────────────────── */
 const AUDIT_META = {
-  checkin:  { icon: LogIn,         color: 'text-cyan-400',    label: 'Checked in' },
-  checkout: { icon: LogOut,        color: 'text-zinc-300',    label: 'Checked out' },
-  payment:  { icon: DollarSign,    color: 'text-amber-400',   label: 'Payment updated' },
-  noshow:   { icon: AlertTriangle, color: 'text-rose-400',    label: 'No-show removed' },
+  checkin:  { icon: LogIn,         color: 'text-cyan-400',  label: modals.activityLog.labels.checkin },
+  checkout: { icon: LogOut,        color: 'text-zinc-300',  label: modals.activityLog.labels.checkout },
+  result:   { icon: Trophy,        color: 'text-lime-400',  label: modals.activityLog.labels.result },
+  payment:  { icon: DollarSign,    color: 'text-amber-400', label: modals.activityLog.labels.payment },
+  // Legacy: nothing writes `noshow` any more, but saved sessions can still
+  // carry entries from before the no-show nudge was removed.
+  noshow:   { icon: AlertTriangle, color: 'text-rose-400',  label: modals.activityLog.labels.noshow },
 };
 
 function ActivityLogModal({ auditLog, onClose }) {
   const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
+  const c = modals.activityLog;
   const describe = (e) => {
     switch (e.type) {
       case 'checkin':
-        return `${e.payment ? paymentInfo(e.payment).label : 'Unpaid'}`;
+        return `${e.returning ? c.returning : c.newPlayer} · ${paymentInfo(e.payment).label}`;
       case 'checkout':
-        return `${e.courtName ? e.courtName + ' · ' : ''}here ${fmtDuration(e.sessionMs ?? 0)} · ${paymentInfo(e.payment).label}`;
+        return `${e.courtName ? e.courtName + ' · ' : ''}${c.checkoutHere(fmtDuration(e.sessionMs ?? 0))} · ${paymentInfo(e.payment).label}`;
+      case 'result':
+        return `${c.resultDefeated(e.loserNames)}${e.courtName ? ' · ' + e.courtName : ''} · ${fmtDuration(e.durationMs ?? 0)}`;
       case 'payment':
-        return `→ ${paymentInfo(e.payment).label}`;
+        return c.paymentChange(paymentInfo(e.payment).label);
       case 'noshow':
-        return e.courtName ? `from ${e.courtName}` : '';
+        return e.courtName ? c.noshowFrom(e.courtName) : '';
       default:
         return '';
     }
   };
 
   return (
-    <ModalShell onClose={onClose} title="Activity Log" wide>
+    <ModalShell onClose={onClose} title={c.title} wide>
       {auditLog.length === 0 ? (
-        <p className="text-zinc-500 text-center py-10">No activity yet today.</p>
+        <p className="text-zinc-500 text-center py-10">{c.empty}</p>
       ) : (
         <div className="space-y-1 max-h-[60vh] overflow-y-auto">
           {auditLog.map(e => {
@@ -2907,9 +3086,7 @@ function ActivityLogModal({ auditLog, onClose }) {
           })}
         </div>
       )}
-      <p className="text-xs text-zinc-600 mt-4 pt-3 border-t border-zinc-800">
-        Showing this session's events (most recent first). Cleared on session reset.
-      </p>
+      <p className="text-xs text-zinc-600 mt-4 pt-3 border-t border-zinc-800">{c.footer}</p>
     </ModalShell>
   );
 }
@@ -2925,8 +3102,8 @@ function RentalModal({ court, players, busyPlayerIds, onBook, onClose }) {
     .sort((a, b) => a.name.localeCompare(b.name));
 
   return (
-    <ModalShell onClose={onClose} title={`Book ${court?.name ?? 'Rental'}`}>
-      <p className="text-sm text-zinc-400 mb-3">Pick one person as the host for this rental:</p>
+    <ModalShell onClose={onClose} title={modals.rental.title(court?.name ?? modals.rental.fallbackCourtName)}>
+      <p className="text-sm text-zinc-400 mb-3">{modals.rental.hostPrompt}</p>
 
       {/* Player search */}
       <div className="relative mb-2">
@@ -2934,13 +3111,13 @@ function RentalModal({ court, players, busyPlayerIds, onBook, onClose }) {
         <input
           value={search}
           onChange={e => setSearch(e.target.value)}
-          placeholder="Search players..."
+          placeholder={modals.rental.searchPlaceholder}
           className="w-full bg-zinc-950 border border-zinc-800 rounded-md pl-9 pr-3 py-2 text-sm focus:outline-none focus:border-amber-500"
         />
       </div>
       <div className="max-h-44 overflow-y-auto bg-zinc-950 rounded-lg p-1 mb-4">
         {available.length === 0 && (
-          <p className="text-sm text-zinc-500 text-center py-4">No available players.</p>
+          <p className="text-sm text-zinc-500 text-center py-4">{modals.rental.noneAvailable}</p>
         )}
         {available.map(p => (
           <div
@@ -2961,7 +3138,7 @@ function RentalModal({ court, players, busyPlayerIds, onBook, onClose }) {
       </div>
 
       {/* Duration */}
-      <p className="text-sm text-zinc-400 mb-2">Duration:</p>
+      <p className="text-sm text-zinc-400 mb-2">{modals.rental.durationLabel}</p>
       <div className="grid grid-cols-4 gap-2 mb-5">
         {RENTAL_DURATIONS.map(d => (
           <button
@@ -2981,7 +3158,10 @@ function RentalModal({ court, players, busyPlayerIds, onBook, onClose }) {
       {/* Confirm */}
       {selectedId && (
         <div className="text-center text-sm text-zinc-400 mb-3">
-          Booking for <span className="text-amber-400 font-semibold">{players.find(p => p.id === selectedId)?.name}'s Party</span>
+          {modals.rental.bookingFor}{' '}
+          <span className="text-amber-400 font-semibold">
+            {modals.rental.partySuffix(players.find(p => p.id === selectedId)?.name ?? '')}
+          </span>
         </div>
       )}
       <button
@@ -2989,7 +3169,7 @@ function RentalModal({ court, players, busyPlayerIds, onBook, onClose }) {
         disabled={!selectedId}
         className="w-full bg-amber-500 hover:bg-amber-400 text-zinc-950 font-bold py-3 rounded-lg disabled:opacity-30 disabled:cursor-not-allowed transition"
       >
-        Confirm Booking
+        {modals.rental.confirm}
       </button>
     </ModalShell>
   );
@@ -3037,17 +3217,17 @@ function CameraModal({ playerName, onSave, onClose }) {
   };
 
   return (
-    <ModalShell onClose={onClose} title={`Photo for ${playerName}`}>
+    <ModalShell onClose={onClose} title={modals.camera.title(playerName)}>
       <canvas ref={canvasRef} className="hidden" />
       {captured ? (
         <div className="text-center">
-          <img src={captured} alt="Preview" className="w-48 h-48 rounded-full object-cover mx-auto mb-5 border-4 border-lime-500" />
+          <img src={captured} alt={modals.camera.previewAlt} className="w-48 h-48 rounded-full object-cover mx-auto mb-5 border-4 border-lime-500" />
           <div className="flex gap-3 justify-center">
             <button onClick={retake} className="px-5 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-semibold rounded-lg flex items-center gap-2">
-              <RotateCcw className="w-4 h-4" /> Retake
+              <RotateCcw className="w-4 h-4" /> {modals.camera.retake}
             </button>
             <button onClick={() => onSave(captured)} className="px-5 py-2.5 bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold rounded-lg flex items-center gap-2">
-              <Check className="w-4 h-4" /> Save Photo
+              <Check className="w-4 h-4" /> {modals.camera.save}
             </button>
           </div>
         </div>
@@ -3068,10 +3248,10 @@ function CameraModal({ playerName, onSave, onClose }) {
           </div>
           <div className="flex gap-3 justify-center">
             <button onClick={onClose} className="px-5 py-2.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-400 font-semibold rounded-lg">
-              Skip
+              {buttons.skip}
             </button>
             <button onClick={capture} className="px-5 py-2.5 bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold rounded-lg flex items-center gap-2">
-              <Camera className="w-4 h-4" /> Take Photo
+              <Camera className="w-4 h-4" /> {modals.camera.take}
             </button>
           </div>
         </div>
