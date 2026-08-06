@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom';
 import { DisplayView } from '../App';
 import { fetchDisplayState, subscribeToDisplay } from '../lib/session';
 import { hydrateCourts } from '../lib/logic';
+import { brand, screens, tvDisplay, connection } from '../copy';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -83,9 +84,9 @@ export default function DisplayPage() {
     [courts]
   );
 
-  if (error === 'NOT_FOUND') return <Message title="Display not found" body="This link is no longer valid. Ask the front desk for a new one." />;
-  if (error === 'LOAD_FAILED') return <Message title="Can’t reach CourtFlow" body="Check this device’s internet connection. Retrying automatically." />;
-  if (!data) return <Message title="Loading…" body="" />;
+  if (error === 'NOT_FOUND') return <Message title={tvDisplay.notFoundTitle} body={tvDisplay.notFoundBody} />;
+  if (error === 'LOAD_FAILED') return <Message title={tvDisplay.unreachableTitle} body={tvDisplay.unreachableBody} />;
+  if (!data) return <Message title={screens.loading} body="" />;
 
   return (
     <div className="font-body min-h-screen bg-zinc-950 text-zinc-100">
@@ -101,7 +102,7 @@ export default function DisplayPage() {
       />
       {!live && (
         <div className="fixed bottom-3 right-3 text-[11px] text-zinc-600 bg-zinc-900/90 border border-zinc-800 rounded-full px-3 py-1">
-          reconnecting…
+          {connection.reconnecting}
         </div>
       )}
     </div>
@@ -112,7 +113,7 @@ function Message({ title, body }) {
   return (
     <div className="font-body min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-6 text-center">
       <div>
-        <div className="font-display text-4xl text-lime-400 mb-3">COURTFLOW</div>
+        <div className="font-display text-4xl text-lime-400 mb-3">{brand.name}</div>
         <p className="text-xl text-zinc-300 mb-2">{title}</p>
         {body && <p className="text-zinc-500 max-w-sm">{body}</p>}
       </div>

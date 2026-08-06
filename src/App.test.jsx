@@ -18,10 +18,18 @@ import {
   ladderGroup,
   recentPartners,
   partnerWeight,
-  balancedFreshGroup,
+  valueGroup,
+  playerValue,
+  closestByValue,
+  randomFrom,
   buildAutoGroup,
   allTimeLeaderboard,
   RANKED_MIN_GAMES,
+  gamesToRank,
+  sessionStreak,
+  sessionLeaderboard,
+  recentlyPlayed,
+  restCost,
   slugify,
   isValidSlug,
 } from './lib/logic.js';
@@ -590,76 +598,189 @@ describe('recentPartners', () => {
   });
 });
 
-/* ── balancedFreshGroup ─────────────────────── */
-describe('balancedFreshGroup', () => {
+/* ── playerValue ────────────────────────────── */
+describe('playerValue', () => {
+  it('starts everyone at zero', () => {
+    expect(playerValue({ id: 1 })).toBe(0);
+    expect(playerValue({ id: 1, wins: 0, losses: 0 })).toBe(0);
+  });
+
+  it('scores a win +1 and a loss -0.5', () => {
+    expect(playerValue({ wins: 1, losses: 0 })).toBe(1);
+    expect(playerValue({ wins: 0, losses: 1 })).toBe(-0.5);
+    expect(playerValue({ wins: 3, losses: 2 })).toBe(2);
+  });
+
+  it('tolerates a player row with no counters at all', () => {
+    expect(playerValue(undefined)).toBe(0);
+    expect(playerValue(null)).toBe(0);
+  });
+});
+
+/* ── valueGroup ─────────────────────────────── */
+// value = wins - losses/2, so these read directly as the number in the comment.
+const val = (id, wins = 0, losses = 0) => ({ id, name: `P${id}`, skill: 'Intermediate', wins, losses });
+
+describe('valueGroup', () => {
   it('returns null when fewer than four are available', () => {
-    expect(balancedFreshGroup(evenFour.slice(0, 3), [])).toBeNull();
-    expect(balancedFreshGroup(undefined, [])).toBeNull();
+    expect(valueGroup(evenFour.slice(0, 3), [])).toBeNull();
+    expect(valueGroup([], [])).toBeNull();
+    expect(valueGroup(undefined, [])).toBeNull();
   });
 
-  it('returns the top four in snake order when there is no history', () => {
-    const five = [...tieredFour, { id: 5, skill: 'Beginner' }];
-    expect(balancedFreshGroup(five, [])).toEqual(balancedGroup(tieredFour));
-    expect(ids(balancedFreshGroup(five, []))).toEqual([1, 4, 2, 3]);
-  });
-
-  it('re-splits the same four rather than repeating last round’s partnerships', () => {
-    const group = ids(balancedFreshGroup(evenFour, [{ players: [1, 2, 3, 4] }]));
-    const partnered = (a, b) => {
-      const i = group.indexOf(a);
-      const j = group.indexOf(b);
-      return Math.floor(i / 2) === Math.floor(j / 2);
-    };
-    expect(partnered(1, 2)).toBe(false);
-    expect(partnered(3, 4)).toBe(false);
-  });
-
-  it('drafts a free fifth player when every split of the top four repeats', () => {
-    // Three rounds that between them used all three ways of splitting 1-4, so no
-    // arrangement of those four is fresh — only reaching past them is.
-    const history = [
-      { players: [1, 4, 2, 3] }, // most recent
-      { players: [1, 3, 2, 4] },
-      { players: [1, 2, 3, 4] },
+  it('takes four players inside ±1 over a wider spread', () => {
+    // 1-4 are all on 2.0; 5-8 are on 0. Both are perfectly tight, and the
+    // higher rung is reached first.
+    const eight = [
+      val(1, 2), val(2, 2), val(3, 2), val(4, 2),
+      val(5), val(6), val(7), val(8),
     ];
-    const group = ids(balancedFreshGroup(evenFive, history));
+    expect(ids(valueGroup(eight, [])).sort()).toEqual([1, 2, 3, 4]);
+  });
+
+  it('expands to ±2 when no four sit within ±1', () => {
+    // Values 5, 2, 1.5, 0.5, 0. The only window inside ±2 is the bottom four.
+    const five = [val(1, 5), val(2, 2), val(3, 2, 1), val(4, 1, 1), val(5)];
+    expect(ids(valueGroup(five, [])).sort()).toEqual([2, 3, 4, 5]);
+  });
+
+  it('falls back to the closest four when nothing sits within ±2', () => {
+    // Values 9, 6, 3, 0 — every window is far wider than ±2, but a group must
+    // still come out rather than the matcher giving up.
+    const four = [val(1, 9), val(2, 6), val(3, 3), val(4)];
+    const group = valueGroup(four, []);
+    expect(group).toHaveLength(4);
+    expect(new Set(ids(group)).size).toBe(4);
+  });
+
+  it('splits the four as highest+lowest vs 2nd+3rd', () => {
+    // Values 2, 1, 0.5, -1 → on-court order [top, bottom, 2nd, 3rd].
+    const four = [val(1, 2), val(2, 1), val(3, 1, 1), val(4, 0, 2)];
+    expect(ids(valueGroup(four, []))).toEqual([1, 4, 2, 3]);
+  });
+
+  it('avoids re-making a partnership when two groups are equally tight', () => {
+    // Everyone on 0, so every window is spread 0 and only partner history can
+    // decide. 1&4 and 2&3 partnered last game, so the fresh fifth is drafted.
+    const five = [val(1), val(2), val(3), val(4), val(5)];
+    const group = ids(valueGroup(five, [{ players: [1, 4, 2, 3] }]));
     expect(group).toContain(5);
     const partnered = (a, b) => {
       const i = group.indexOf(a);
       const j = group.indexOf(b);
       return i >= 0 && j >= 0 && Math.floor(i / 2) === Math.floor(j / 2);
     };
-    // Last round's partnerships are the most expensive; neither survives.
     expect(partnered(1, 4)).toBe(false);
     expect(partnered(2, 3)).toBe(false);
   });
 
-  it('still terminates and returns a valid four when every pairing repeats', () => {
-    // Six players, and a history long enough to have paired all 15 combinations,
-    // so no choice is free of repeats. The search must pick a least-bad one, not
-    // loop looking for a perfect answer.
-    const six = [1, 2, 3, 4, 5, 6].map((id) => ({ id, skill: 'Intermediate' }));
+  it('prefers a close-value group with a repeat over a far-value group of strangers', () => {
+    // Values 2, 1.5, 1.5, 1, 0. Only the top four sit inside ±1, and their snake
+    // pairs (2 with 1) and (1.5 with 1.5) both played together last game. The
+    // tier gate still wins: value proximity outranks partner freshness.
+    const five = [val(1, 2), val(2, 2, 1), val(3, 2, 1), val(4, 1), val(5)];
+    const history = [{ players: [1, 4, 2, 3] }];
+    expect(ids(valueGroup(five, history)).sort()).toEqual([1, 2, 3, 4]);
+  });
+
+  it('rotates among equal values instead of always handing the same four the court', () => {
+    // Eight players all on 0 — nothing but who has been waiting separates them,
+    // so the four who just came off must not go straight back on.
+    const eight = [1, 2, 3, 4, 5, 6, 7, 8].map((id) => val(String(id)));
+    const group = valueGroup(eight, [{ players: ['1', '2', '3', '4'] }]);
+    expect(ids(group).sort()).toEqual(['5', '6', '7', '8']);
+  });
+
+  it('is deterministic across repeated calls with the same input', () => {
+    const history = [{ players: [1, 2, 3, 4] }, { players: [2, 5, 1, 3] }];
+    const five = [val(1, 2), val(2, 1), val(3, 1), val(4), val(5)];
+    expect(ids(valueGroup(five, history))).toEqual(ids(valueGroup(five, history)));
+  });
+
+  it('never picks the same player twice', () => {
+    const history = [{ players: [1, 2, 3, 4] }, { players: [3, 5, 1, 2] }];
+    expect(new Set(ids(valueGroup(evenFive, history))).size).toBe(4);
+  });
+
+  it('terminates and returns a valid four when every pairing has repeated', () => {
+    // Six equals, and a history that has already paired all 15 combinations, so
+    // no choice is free of repeats. The tier gate must still yield a group.
+    const six = [1, 2, 3, 4, 5, 6].map((id) => val(id));
     const pairs = [];
     for (let i = 0; i < 6; i++) for (let j = i + 1; j < 6; j++) pairs.push([i + 1, j + 1]);
     const history = pairs.map(([a, b]) => ({
       players: [a, b, ...[1, 2, 3, 4, 5, 6].filter((x) => x !== a && x !== b).slice(0, 2)],
     }));
-    const group = balancedFreshGroup(six, history, { partnerWindow: pairs.length });
+    const group = valueGroup(six, history, { partnerWindow: pairs.length });
     expect(group).toHaveLength(4);
     expect(new Set(ids(group)).size).toBe(4);
   });
 
-  it('is deterministic across repeated calls with the same input', () => {
-    const history = [{ players: [1, 2, 3, 4] }, { players: [2, 5, 1, 3] }];
-    const a = ids(balancedFreshGroup(evenFive, history));
-    const b = ids(balancedFreshGroup(evenFive, history));
-    expect(a).toEqual(b);
+  it('ignores skill tier entirely — only values decide', () => {
+    // A Pro on 0 and a Beginner on 0 are interchangeable now. The old matcher
+    // would have taken the four highest tiers; this one takes the four whose
+    // values match, which here is everyone, so rest order decides.
+    const mixed = [
+      { ...val(1), skill: 'Pro' },
+      { ...val(2), skill: 'Beginner' },
+      { ...val(3), skill: 'Pro' },
+      { ...val(4), skill: 'Beginner' },
+      { ...val(5, 4), skill: 'Beginner' }, // value 4 — the odd one out
+    ];
+    expect(ids(valueGroup(mixed, [])).sort()).toEqual([1, 2, 3, 4]);
+  });
+});
+
+/* ── closestByValue ─────────────────────────── */
+describe('closestByValue', () => {
+  it('returns the free player nearest the departing value', () => {
+    const free = [val(1, 5), val(2, 2), val(3)];
+    expect(closestByValue(free, 2, []).id).toBe(2);
   });
 
-  it('never picks the same player twice', () => {
-    const history = [{ players: [1, 2, 3, 4] }, { players: [3, 5, 1, 2] }];
-    const group = balancedFreshGroup(evenFive, history);
-    expect(new Set(ids(group)).size).toBe(4);
+  it('reaches either side of the target', () => {
+    const free = [val(1, 4), val(2)]; // values 4 and 0
+    expect(closestByValue(free, 3, []).id).toBe(1);
+    expect(closestByValue(free, 1, []).id).toBe(2);
+  });
+
+  it('breaks a value tie toward whoever has waited longest', () => {
+    // Both on 0; 1 just came off court, 2 has been waiting.
+    const free = [val('1'), val('2')];
+    expect(closestByValue(free, 0, [{ players: ['1', 'x', 'y', 'z'] }]).id).toBe('2');
+  });
+
+  it('returns null when nobody is free', () => {
+    expect(closestByValue([], 0, [])).toBeNull();
+    expect(closestByValue(undefined, 0, [])).toBeNull();
+  });
+});
+
+/* ── randomFrom ─────────────────────────────── */
+describe('randomFrom', () => {
+  const three = [val(1), val(2), val(3)];
+
+  it('indexes by the injected rng', () => {
+    expect(randomFrom(three, () => 0).id).toBe(1);
+    expect(randomFrom(three, () => 0.5).id).toBe(2);
+    expect(randomFrom(three, () => 0.99).id).toBe(3);
+  });
+
+  it('never runs off the end when the rng returns exactly 1', () => {
+    // Math.random() is documented as < 1, but a stub or a future engine quirk
+    // must not produce undefined here.
+    expect(randomFrom(three, () => 1)).toBe(three[2]);
+  });
+
+  it('can reach every candidate', () => {
+    const seen = new Set();
+    for (let i = 0; i < 300; i++) seen.add(randomFrom(three).id);
+    expect(seen.size).toBe(3);
+  });
+
+  it('returns null when there is nobody to draw', () => {
+    expect(randomFrom([])).toBeNull();
+    expect(randomFrom(undefined)).toBeNull();
   });
 });
 
@@ -675,9 +796,9 @@ describe('buildAutoGroup', () => {
     );
   });
 
-  it('routes balanced to the repeat-avoiding draft', () => {
+  it('routes balanced to the value matcher', () => {
     expect(buildAutoGroup(evenFive, history, 'balanced')).toEqual(
-      balancedFreshGroup(evenFive, history)
+      valueGroup(evenFive, history)
     );
   });
 
@@ -688,7 +809,7 @@ describe('buildAutoGroup', () => {
   });
 
   it('falls back to balanced for an unknown or missing style', () => {
-    const expected = balancedFreshGroup(evenFive, history);
+    const expected = valueGroup(evenFive, history);
     expect(buildAutoGroup(evenFive, history, 'legacy-value')).toEqual(expected);
     expect(buildAutoGroup(evenFive, history, undefined)).toEqual(expected);
     expect(buildAutoGroup(evenFive, history)).toEqual(expected);
@@ -793,6 +914,199 @@ describe('allTimeLeaderboard', () => {
   it('honours a custom minimum', () => {
     const rows = [player(1, 'Short', 2, 1)];
     expect(allTimeLeaderboard(rows, 3).ranked.map((r) => r.id)).toEqual([1]);
+  });
+});
+
+/* ── session rankings (spec §6) ─────────────── */
+describe('sessionStreak', () => {
+  it('reads newest first', () => {
+    const history = [decided([1, 2], [3, 4]), decided([3, 4], [1, 2])];
+    expect(sessionStreak(history, 1)).toEqual(['W', 'L']);
+    expect(sessionStreak(history, 3)).toEqual(['L', 'W']);
+  });
+
+  it('skips games the player was not in', () => {
+    const history = [decided([5, 6], [7, 8]), decided([1, 2], [3, 4])];
+    expect(sessionStreak(history, 1)).toEqual(['W']);
+  });
+
+  it('skips entries with no recorded result', () => {
+    const history = [{ players: [1, 2, 3, 4] }, decided([1, 2], [3, 4])];
+    expect(sessionStreak(history, 1)).toEqual(['W']);
+  });
+
+  it('caps at the requested length', () => {
+    const history = Array.from({ length: 9 }, () => decided([1, 2], [3, 4]));
+    expect(sessionStreak(history, 1, 5)).toHaveLength(5);
+    expect(sessionStreak(history, 1, 2)).toEqual(['W', 'W']);
+  });
+
+  it('matches ids across string/number boundaries', () => {
+    expect(sessionStreak([decided(['1', '2'], ['3', '4'])], 1)).toEqual(['W']);
+  });
+
+  it('is empty for a player with no games', () => {
+    expect(sessionStreak([], 1)).toEqual([]);
+    expect(sessionStreak(undefined, 1)).toEqual([]);
+  });
+});
+
+describe('sessionLeaderboard', () => {
+  const players = [
+    { id: 1, name: 'Ann', wins: 3, losses: 1 },
+    { id: 2, name: 'Ben', wins: 3, losses: 0 },
+    { id: 3, name: 'Cal', wins: 0, losses: 2 },
+    { id: 4, name: 'Dee', wins: 0, losses: 0 }, // never played
+  ];
+
+  it('ranks on session wins, fewest losses breaking a tie', () => {
+    const rows = sessionLeaderboard(players, []);
+    expect(rows.map((r) => r.name)).toEqual(['Ben', 'Ann', 'Cal']);
+  });
+
+  it('leaves out anyone who has not played', () => {
+    expect(sessionLeaderboard(players, []).map((r) => r.id)).not.toContain(4);
+  });
+
+  it('has no minimum-games threshold, unlike the all-time board', () => {
+    const one = [{ id: 1, name: 'Ann', wins: 1, losses: 0 }];
+    expect(sessionLeaderboard(one, [])).toHaveLength(1);
+    // The same single game is far short of ranking all-time.
+    expect(allTimeLeaderboard([{ ...one[0], totalGames: 1, totalWins: 1 }]).ranked).toHaveLength(0);
+  });
+
+  it('attaches each player’s own streak', () => {
+    const history = [decided([1], [3]), decided([3], [1])];
+    const rows = sessionLeaderboard(players, history);
+    expect(rows.find((r) => r.id === 1).streak).toEqual(['W', 'L']);
+    expect(rows.find((r) => r.id === 3).streak).toEqual(['L', 'W']);
+  });
+
+  it('never exposes the hidden value', () => {
+    // Asserting the exact key set, not just the absence of a `value` field: the
+    // point is that nothing this screen renders can be reverse-engineered into
+    // the number the matcher groups on.
+    const rows = sessionLeaderboard([{ id: 1, name: 'Ann', wins: 2, losses: 2 }], []);
+    expect(Object.keys(rows[0]).sort()).toEqual(
+      ['games', 'id', 'losses', 'name', 'photo', 'skill', 'streak', 'wins']
+    );
+  });
+
+  it('is empty before anyone has finished a game', () => {
+    expect(sessionLeaderboard([], [])).toEqual([]);
+    expect(sessionLeaderboard(undefined, [])).toEqual([]);
+  });
+});
+
+describe('gamesToRank', () => {
+  it('counts down the games still needed', () => {
+    expect(gamesToRank(3)).toBe('Needs 7 more games to rank');
+    expect(gamesToRank(0)).toBe('Needs 10 more games to rank');
+  });
+  it('uses the singular for the last game', () => {
+    expect(gamesToRank(9)).toBe('Needs 1 more game to rank');
+  });
+  it('never counts below zero', () => {
+    expect(gamesToRank(10)).toBe('Ready to rank');
+    expect(gamesToRank(40)).toBe('Ready to rank');
+  });
+  it('is null-safe and honours a custom minimum', () => {
+    expect(gamesToRank(undefined)).toBe('Needs 10 more games to rank');
+    expect(gamesToRank(1, 3)).toBe('Needs 2 more games to rank');
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+   REST FAIRNESS — stops the same strong four monopolising a court
+   ═══════════════════════════════════════════════════════════════════════ */
+describe('recentlyPlayed', () => {
+  it('scores the players from the game that just finished highest', () => {
+    const rest = recentlyPlayed([{ players: [1, 2, 3, 4] }, { players: [5, 6, 7, 8] }]);
+    expect(restCost(rest, 1)).toBeGreaterThan(restCost(rest, 5));
+  });
+
+  it('scores someone who has not played at all as 0', () => {
+    const rest = recentlyPlayed([{ players: [1, 2, 3, 4] }]);
+    expect(restCost(rest, 99)).toBe(0);
+  });
+
+  it('keeps only a player’s most recent appearance', () => {
+    // Playing twice running is no more tiring, for scheduling, than once just now.
+    const twice = recentlyPlayed([{ players: [1, 2, 3, 4] }, { players: [1, 2, 5, 6] }]);
+    const once = recentlyPlayed([{ players: [1, 2, 3, 4] }]);
+    expect(restCost(twice, 1)).toBe(restCost(once, 1));
+  });
+
+  it('never exceeds 1 and decays with age', () => {
+    const rest = recentlyPlayed([
+      { players: [1, 2, 3, 4] },
+      { players: [5, 6, 7, 8] },
+      { players: [9, 10, 11, 12] },
+    ]);
+    expect(restCost(rest, 1)).toBe(1);
+    expect(restCost(rest, 5)).toBeLessThan(1);
+    expect(restCost(rest, 9)).toBeLessThan(restCost(rest, 5));
+  });
+
+  it('respects the window and an empty history', () => {
+    const rest = recentlyPlayed([{ players: [1, 2, 3, 4] }, { players: [5, 6, 7, 8] }], 1);
+    expect(restCost(rest, 1)).toBe(1);
+    expect(restCost(rest, 5)).toBe(0);
+    expect(recentlyPlayed([]).size).toBe(0);
+    expect(recentlyPlayed(undefined).size).toBe(0);
+  });
+});
+
+describe('valueGroup starvation guard', () => {
+  it('does not starve a roster far larger than one court', () => {
+    // 12 players, all still on 0 because nobody has finished a game yet, and
+    // the first eight have just come off court. Value alone cannot separate
+    // them, so the four who have never played must get the court.
+    const twelve = Array.from({ length: 12 }, (_, i) => val(`p${i}`));
+    const history = [
+      { players: ['p0', 'p1', 'p2', 'p3'] },
+      { players: ['p4', 'p5', 'p6', 'p7'] },
+    ];
+    const group = ids(valueGroup(twelve, history));
+    expect(group.sort()).toEqual(['p10', 'p11', 'p8', 'p9']);
+  });
+
+  it('lets a repeated partnership be broken up even with only four players', () => {
+    // Four players, all on 0, who just played as (1,2) vs (3,4). No other four
+    // exist, so the only lever left is which of them partner each other — and
+    // the value sort must not simply hand back the same split.
+    const four = [1, 2, 3, 4].map((id) => val(String(id)));
+    const group = ids(valueGroup(four, [{ players: ['1', '2', '3', '4'] }]));
+    expect(new Set(group).size).toBe(4);
+  });
+});
+
+describe('ladderGroup rung selection', () => {
+  it('picks the tightest rung rather than the top four', () => {
+    // p1/p2 won; p3-p6 all lost. The top four would be a mixed court
+    // (2 winners + 2 losers); the four losers are the coherent rung.
+    const six = [1, 2, 3, 4, 5, 6].map((id) => ({ id, skill: 'Intermediate' }));
+    const history = [decided([1, 2], [3, 4]), decided([1, 2], [5, 6])];
+    const group = ids(ladderGroup(six, history)).sort();
+    expect(group).toEqual([3, 4, 5, 6]);
+  });
+
+  it('still forms a winners court when four winners are free', () => {
+    const eight = [1, 2, 3, 4, 5, 6, 7, 8].map((id) => ({ id, skill: 'Intermediate' }));
+    const history = [decided([1, 2], [5, 6]), decided([3, 4], [7, 8])];
+    const group = ids(ladderGroup(eight, history)).sort();
+    expect(group).toEqual([1, 2, 3, 4]);
+  });
+
+  it('avoids re-making a partnership inside the rung it picked', () => {
+    // No result recorded, so form is flat and the rung is [1,2,3,4] — but they
+    // last played as [1,4] vs [2,3], which is exactly the snake split.
+    const history = [{ players: [1, 4, 2, 3] }];
+    const group = ids(ladderGroup(evenFour, history));
+    const partnered = (a, b) =>
+      Math.floor(group.indexOf(a) / 2) === Math.floor(group.indexOf(b) / 2);
+    expect(partnered(1, 4)).toBe(false);
+    expect(partnered(2, 3)).toBe(false);
   });
 });
 

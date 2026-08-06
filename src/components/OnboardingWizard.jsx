@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Users, Shuffle, Check, ChevronRight, Plus } from 'lucide-react';
 import ModalShell from './ModalShell';
 import { SKILL_TIERS, MATCHING_STYLE_ORDER, matchingStyleInfo } from '../lib/logic';
+import { buttons, wizard as t } from '../copy';
 
 /* ─────────────────────────────────────────────
    ONBOARDING WIZARD (spec §F5)
@@ -38,7 +39,7 @@ export default function OnboardingWizard({
   };
 
   return (
-    <ModalShell onClose={onClose} title="Set up open play" wide>
+    <ModalShell onClose={onClose} title={t.title} wide>
       {/* ── Progress ── */}
       <div className="flex items-center gap-2 mb-1">
         {[1, 2, 3].map(i => (
@@ -50,15 +51,13 @@ export default function OnboardingWizard({
           />
         ))}
       </div>
-      <p className="text-xs text-zinc-500 font-semibold mb-5">Step {step} of {TOTAL}</p>
+      <p className="text-xs text-zinc-500 font-semibold mb-5">{t.stepCounter(step, TOTAL)}</p>
 
       {/* ── Step 1 — courts & matching style ── */}
       {step === 1 && (
         <div className="cf-fade-up">
-          <h4 className="font-display text-xl text-zinc-200 tracking-wide mb-1">Your courts</h4>
-          <p className="text-zinc-500 text-sm mb-3">
-            How many courts are you running today? You can add or rename them later.
-          </p>
+          <h4 className="font-display text-xl text-zinc-200 tracking-wide mb-1">{t.courtsHeading}</h4>
+          <p className="text-zinc-500 text-sm mb-3">{t.courtsBody}</p>
 
           <div className="flex items-center gap-3 mb-6">
             <button
@@ -76,12 +75,14 @@ export default function OnboardingWizard({
             >
               +
             </button>
-            <span className="text-zinc-500 text-sm">courts</span>
+            <span className="text-zinc-500 text-sm">{t.courtsUnit}</span>
           </div>
 
-          <h4 className="font-display text-xl text-zinc-200 tracking-wide mb-1">Matching style</h4>
+          <h4 className="font-display text-xl text-zinc-200 tracking-wide mb-1">{t.matchingHeading}</h4>
           <p className="text-zinc-500 text-sm mb-3">
-            How the <span className="text-zinc-300 font-semibold">Auto</span> button builds a group.
+            {t.matchingBodyBefore}{' '}
+            <span className="text-zinc-300 font-semibold">{t.matchingBodyButton}</span>{' '}
+            {t.matchingBodyAfter}
           </p>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -114,17 +115,15 @@ export default function OnboardingWizard({
       {/* ── Step 2 — roster ── */}
       {step === 2 && (
         <div className="cf-fade-up">
-          <h4 className="font-display text-xl text-zinc-200 tracking-wide mb-1">Add players</h4>
-          <p className="text-zinc-500 text-sm mb-3">
-            Get a few names in now — you'll check the rest in at the desk as they arrive.
-          </p>
+          <h4 className="font-display text-xl text-zinc-200 tracking-wide mb-1">{t.playersHeading}</h4>
+          <p className="text-zinc-500 text-sm mb-3">{t.playersBody}</p>
 
           <form onSubmit={submitPlayer} className="flex flex-col sm:flex-row gap-2 mb-4">
             <input
               autoFocus
               value={newPlayerName}
               onChange={e => setNewPlayerName(e.target.value)}
-              placeholder="Player name…"
+              placeholder={t.playerPlaceholder}
               className="flex-1 bg-zinc-950 border border-zinc-800 rounded-md px-3 py-2 text-sm focus:outline-none focus:border-lime-500"
             />
             <select
@@ -139,15 +138,13 @@ export default function OnboardingWizard({
               disabled={!newPlayerName.trim()}
               className="bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold px-4 py-2 rounded-lg flex items-center justify-center gap-2 disabled:opacity-30 disabled:cursor-not-allowed transition"
             >
-              <Plus className="w-4 h-4" /> Add
+              <Plus className="w-4 h-4" /> {t.addPlayer}
             </button>
           </form>
 
           <div className="bg-zinc-950 border border-zinc-800 rounded-lg p-3 max-h-56 overflow-y-auto">
             {players.length === 0 ? (
-              <p className="text-zinc-600 text-sm italic text-center py-4">
-                Nobody checked in yet.
-              </p>
+              <p className="text-zinc-600 text-sm italic text-center py-4">{t.noPlayersYet}</p>
             ) : (
               <div className="space-y-1">
                 {players.map(p => (
@@ -164,11 +161,9 @@ export default function OnboardingWizard({
           <p className="text-xs mt-2 flex items-center gap-1.5">
             <Users className="w-3.5 h-3.5 text-zinc-600" />
             <span className={players.length >= 4 ? 'text-lime-400' : 'text-zinc-500'}>
-              {players.length} checked in
+              {t.checkedInCount(players.length)}
             </span>
-            {players.length < 4 && (
-              <span className="text-zinc-500">— you need at least 4 to start a game.</span>
-            )}
+            {players.length < 4 && <span className="text-zinc-500">{t.needFour}</span>}
           </p>
         </div>
       )}
@@ -176,23 +171,20 @@ export default function OnboardingWizard({
       {/* ── Step 3 — summary ── */}
       {step === 3 && (
         <div className="cf-fade-up">
-          <h4 className="font-display text-xl text-zinc-200 tracking-wide mb-1">You're all set</h4>
-          <p className="text-zinc-500 text-sm mb-4">
-            Check-in players at the desk, build a group, and CourtFlow fills the courts
-            as they free up.
-          </p>
+          <h4 className="font-display text-xl text-zinc-200 tracking-wide mb-1">{t.doneHeading}</h4>
+          <p className="text-zinc-500 text-sm mb-4">{t.doneBody}</p>
 
           <div className="grid grid-cols-3 gap-2 mb-5">
-            <Stat label="Courts" value={courtCount} />
-            <Stat label="Players" value={players.length} />
-            <Stat label="Matching" value={matchingStyleInfo(matchingStyle).short} small />
+            <Stat label={t.statCourts} value={courtCount} />
+            <Stat label={t.statPlayers} value={players.length} />
+            <Stat label={t.statMatching} value={matchingStyleInfo(matchingStyle).short} small />
           </div>
 
           <button
             onClick={onFinish}
             className="w-full bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold py-3 rounded-lg flex items-center justify-center gap-2 transition"
           >
-            Start Open Play <ChevronRight className="w-4 h-4" strokeWidth={3} />
+            {t.start} <ChevronRight className="w-4 h-4" strokeWidth={3} />
           </button>
         </div>
       )}
@@ -205,14 +197,14 @@ export default function OnboardingWizard({
               onClick={back}
               className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-semibold px-4 py-2 rounded-lg transition"
             >
-              Back
+              {buttons.back}
             </button>
           )}
           <button
             onClick={next}
             className="ml-auto bg-lime-400 hover:bg-lime-300 text-zinc-950 font-bold px-6 py-2 rounded-lg flex items-center gap-2 transition"
           >
-            Next <ChevronRight className="w-4 h-4" strokeWidth={3} />
+            {buttons.next} <ChevronRight className="w-4 h-4" strokeWidth={3} />
           </button>
         </div>
       )}
@@ -222,7 +214,7 @@ export default function OnboardingWizard({
             onClick={back}
             className="bg-zinc-800 hover:bg-zinc-700 text-zinc-200 font-semibold px-4 py-2 rounded-lg transition"
           >
-            Back
+            {buttons.back}
           </button>
         </div>
       )}

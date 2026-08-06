@@ -7,6 +7,12 @@ dist/
 .env.local
 .env.*.local
 
+# Playwright output — traces and screenshots are per-run debris, not artefacts
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
 # Editor / OS noise
 .DS_Store
 Thumbs.db
