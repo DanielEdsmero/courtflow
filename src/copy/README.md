@@ -9,7 +9,7 @@ never need to go hunting through the components.
 | File | What's in it |
 |---|---|
 | `common.js` | The brand name, buttons that appear all over (Back, Try again, Cancel), and the full-screen loading / "couldn't load" states |
-| `toolbar.js` | The staff header: Staff/Preview, Auto ON/OFF, timer, matching style, Competitive/Casual, and every toolbar button + its hover tooltip |
+| `toolbar.js` | The staff header: Staff/Preview, timer, matching style, Competitive/Casual, and every toolbar button + its hover tooltip |
 | `roster.js` | The ROSTER panel — check-in box, returning-player dropdown, the Values toggle, the checked-out drawer |
 | `modals.js` | Every pop-up: assign to court, finish match, check out, replace a queued player, book a rental, take a photo, display link, activity log |
 | `prompts.js` | The browser confirm/alert boxes ("Start a new session?") and the red warning banners |

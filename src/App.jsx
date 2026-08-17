@@ -40,16 +40,36 @@ import { setSoundEnabled } from './lib/sound';
 // Pure logic lives in ./lib/logic.js so tests can import it without booting the
 // Supabase client. Re-exported here because existing callers import from App.
 import {
-  SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, fmtDuration, estimateWait, balancedGroup,
+  SKILL_TIERS, skillRank, fmtElapsed, fmtDuration, fmtWaiting, balancedGroup,
   defaultCourts, hydrateCourts, matchRoster, findExactPlayer,
   PAYMENT_STATUSES, PAYMENT_ORDER, paymentInfo, isPaid,
-  buildAutoGroup, DEFAULT_MATCHING_STYLE, MATCHING_STYLE_ORDER, matchingStyleInfo,
+  DEFAULT_MATCHING_STYLE, MATCHING_STYLE_ORDER, matchingStyleInfo,
   playerValue, closestByValue, randomFrom, sessionLeaderboard,
 } from './lib/logic';
-export { SKILL_TIERS, skillRank, fmtElapsed, fmtMinutes, estimateWait, balancedGroup };
+// Group formation, court filling and the repeat ladder (spec §1–§7). Pure and
+// clock-free: every call below hands it `now`.
+import { runAutoPass, draftTeams, checkInOrder } from './lib/queue-engine';
+export { SKILL_TIERS, skillRank, fmtElapsed, fmtWaiting, balancedGroup };
 
 // Bounds the in-memory activity log carried in the session blob.
 const MAX_AUDIT = 100;
+
+/* Ids for courts and queue groups (spec §10). Date.now() on its own collides
+   whenever two are created inside the same millisecond, and two rows sharing a
+   React key is exactly how "Court 1" and "Court 2" ended up rendering on top of
+   each other as "Court12". A monotonic counter cannot collide. */
+let uidSeq = 0;
+const nextUid = (prefix) => `${prefix}-${Date.now().toString(36)}-${uidSeq++}`;
+
+/* Every queue group carries its own formation timestamp (spec §9). Topping a
+   partial group up later must NOT refresh it — the group has been waiting since
+   the moment staff started it. */
+const newQueueGroup = (playerIds, type = 'manual') => ({
+  id: nextUid('q'),
+  players: playerIds,
+  type,
+  createdAt: Date.now(),
+});
 
 // True if this device has a webcam. Lets the check-in flow skip the photo step
 // silently when there's no camera, instead of popping an error modal (spec §5).
@@ -186,7 +206,6 @@ export default function App() {
   const [auditLog, setAuditLog]       = useState([]);
   const [announcement, setAnnouncement] = useState('');
   const [competitiveMode, setCompetitiveMode] = useState(false);
-  const [autoAssign, setAutoAssign]   = useState(true);
   // null = no timer; number = minutes. Applies to auto-assign for open-play courts.
   const [defaultOpenDuration, setDefaultOpenDuration] = useState(null);
   // How the Auto button forms a group (spec §F1, §F2). In the session blob so
@@ -284,6 +303,10 @@ export default function App() {
   const [draggingPlayerId, setDraggingPlayerId]         = useState(null);
 
   const [tick, setTick] = useState(0);
+  // The clock the UI hands to anything that renders elapsed time (spec §9). Read
+  // once per render rather than inside the queue card, so every group on screen
+  // is measured against the same instant.
+  const nowTick = useMemo(() => Date.now(), [tick]);
   useEffect(() => {
     const id = setInterval(() => setTick(t => t + 1), 1000);
     return () => clearInterval(id);
@@ -307,7 +330,6 @@ export default function App() {
           setAuditLog(saved.auditLog ?? []);
           setAnnouncement(saved.announcement ?? '');
           setCompetitiveMode(saved.competitiveMode ?? false);
-          setAutoAssign(saved.autoAssign ?? true);
           setDefaultOpenDuration(saved.defaultOpenDuration ?? null);
           setMatchingStyle(saved.matchingStyle ?? DEFAULT_MATCHING_STYLE);
           // A venue with a saved session predates the wizard by definition — it's
@@ -348,10 +370,10 @@ export default function App() {
   useEffect(() => {
     if (booting) return;
     syncRef.current?.push({
-      courts, queue, history, auditLog, competitiveMode, autoAssign, announcement, defaultOpenDuration,
+      courts, queue, history, auditLog, competitiveMode, announcement, defaultOpenDuration,
       matchingStyle, onboarded,
     });
-  }, [booting, courts, queue, history, auditLog, competitiveMode, autoAssign, announcement,
+  }, [booting, courts, queue, history, auditLog, competitiveMode, announcement,
       defaultOpenDuration, matchingStyle, onboarded]);
 
   // Auto-expire courts when their duration runs out.
@@ -376,46 +398,14 @@ export default function App() {
       };
       setHistory(h => [entry, ...h]);
       recordMatchHistory(venueId, { ...entry, courtName: c.name });
-      // The timer running out just frees the court — the players go back to the
-      // roster, still checked in. Checking out (leaving for the day) is a separate
-      // roster action, so nothing is logged or finalised here.
-      // With Auto-Filling on, an expired open-play group rotates back into the queue.
-      if (c.type !== 'rental') requeueGroup(c.match.players);
+      // The timer running out just frees the court — the players dissolve back to
+      // the roster, still checked in (spec §8). Nothing is re-queued and no court
+      // is refilled: group formation only ever happens when staff click Auto.
     });
     setCourts(prev => prev.map(c =>
       expired.find(e => e.id === c.id) ? { ...c, match: null } : c
     ));
   }, [tick, competitiveMode]);
-
-  // Auto-assign: feed the first complete queued group onto a free open-play court.
-  // The ref guard matters now that setCourts/setQueue can be interleaved with
-  // network work — without it the same group can be assigned twice.
-  const lastAutoAssigned = useRef(null);
-  useEffect(() => {
-    if (!autoAssign) return;
-    const freeCourt = courts.find(c => !c.match && c.type === 'open');
-    if (!freeCourt) return;
-    const nextGroup = queue[0];
-    if (!nextGroup || nextGroup.players.length < 4) return;
-    if (lastAutoAssigned.current === nextGroup.id) return;
-    lastAutoAssigned.current = nextGroup.id;
-
-    const now = Date.now();
-    const dur = competitiveMode ? null : defaultOpenDuration;
-    const match = {
-      players: nextGroup.players,
-      startedAt: now,
-      endsAt: dur ? now + dur * 60 * 1000 : null,
-      durationMin: dur,
-      autoAssigned: true,
-    };
-    setCourts(prev => prev.map(c => c.id === freeCourt.id ? { ...c, match } : c));
-    setQueue(prev => prev.filter(g => g.id !== nextGroup.id));
-    startReveal(nextGroup.players, freeCourt);
-    // startReveal reads prefs/playerById but re-running this effect when those
-    // change would re-assign a court, so it is deliberately not a dependency.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [courts, queue, autoAssign, competitiveMode, defaultOpenDuration]);
 
   const busyPlayerIds = useMemo(() => {
     const ids = new Set();
@@ -423,17 +413,6 @@ export default function App() {
     queue.forEach(g => g.players.forEach(p => ids.add(p)));
     return ids;
   }, [courts, queue]);
-
-  const avgGameDurationMs = useMemo(() => {
-    const completed = history.filter(h => h.duration > 0);
-    if (completed.length === 0) return 15 * 60 * 1000;
-    return completed.reduce((sum, h) => sum + h.duration, 0) / completed.length;
-  }, [history]);
-
-  const openPlayCourtCount = useMemo(
-    () => courts.filter(c => c.type === 'open').length,
-    [courts]
-  );
 
   const playerById = (id) => players.find(p => p.id === id);
 
@@ -537,7 +516,7 @@ export default function App() {
       const target = prev.find(g => g.players.length < 4);
       return target
         ? prev.map(g => g.id === target.id ? { ...g, players: [...g.players, playerId] } : g)
-        : [...prev, { id: Date.now(), players: [playerId], type: 'manual' }];
+        : [...prev, newQueueGroup([playerId])];
     });
   };
 
@@ -549,30 +528,67 @@ export default function App() {
       ...prev
         .map(g => g.players.includes(playerId) ? { ...g, players: g.players.filter(x => x !== playerId) } : g)
         .filter(g => g.players.length > 0),
-      { id: Date.now(), players: [playerId], type: 'manual' },
+      newQueueGroup([playerId]),
     ]);
   };
 
-  // Ranking, repeat-partner avoidance and the snake draft all live in logic.js so
-  // they stay testable without React — this owns only the roster filter and the
-  // failure message. Which of the two algorithms runs is the club's matchingStyle.
+  /* ── Auto (spec §2) ───────────────────────────────────────────────────────
+     One click, one pass. Every rule — the four-player guard, FIFO consumption,
+     the repeat ladder, Winners/Losers routing, the one-waiting-group cap — lives
+     in the pure engine; this function is only the plumbing that hands it the
+     world, applies what came back, and tells staff when nothing could be done. */
   const autoGroup = () => {
-    const available = players.filter(p => !p.checkedOut && !busyPlayerIds.has(p.id));
-    const group = buildAutoGroup(available, history, matchingStyle);
-    if (!group) {
+    const now = Date.now();
+    const result = runAutoPass({ players, courts, queue, history, matchingStyle, now });
+
+    if (result.reason === 'needMorePlayers') {
       alert(alerts.notEnoughToAutoGroup);
       return;
     }
-    setQueue(prev => [...prev, { id: Date.now(), players: group.map(p => p.id), type: 'auto' }]);
+
+    if (result.assignments.length > 0) {
+      const dur = competitiveMode ? null : defaultOpenDuration;
+      setCourts(prev => prev.map(c => {
+        const a = result.assignments.find(x => x.courtId === c.id);
+        if (!a) return c;
+        return {
+          ...c,
+          match: {
+            players: a.playerIds,
+            startedAt: now,
+            endsAt: dur ? now + dur * 60 * 1000 : null,
+            durationMin: dur,
+            autoAssigned: true,
+          },
+        };
+      }));
+      // One reveal per pass: the overlay flies players to a single court, so a
+      // pass that fills three at once announces the first and the rest simply
+      // appear. Chaining three overlays would hold the floor for half a minute.
+      const first = result.assignments[0];
+      startReveal(first.playerIds, courts.find(c => c.id === first.courtId));
+    }
+
+    setQueue(result.queue);
+
+    // The engine already accounts for a partial group being topped up, which is
+    // real work even though it fills no court and creates no group.
+    if (result.reason === 'nothingToDo') alert(alerts.autoPassDidNothing);
   };
 
+  // Explicit staff assignment (spec §3). Bypasses FIFO — it is a deliberate
+  // override — but still runs the snake draft, so the teams on court are the
+  // balanced ones rather than whatever order the group happens to be stored in.
   const assignToCourt = (groupId, courtId, durationMin) => {
     const group = queue.find(g => g.id === groupId);
     const court = courts.find(c => c.id === courtId);
     if (!group || !court || court.match) return;
+    const four = group.players.map(playerById).filter(Boolean);
+    if (four.length < 4) return; // never put two or three players on a court
+    const drafted = draftTeams(four, checkInOrder(players)).map(p => p.id);
     const now = Date.now();
     const match = {
-      players: group.players,
+      players: drafted,
       startedAt: now,
       endsAt: durationMin ? now + durationMin * 60 * 1000 : null,
       durationMin: durationMin || null,
@@ -580,7 +596,7 @@ export default function App() {
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match } : c));
     setQueue(prev => prev.filter(g => g.id !== groupId));
     setShowAssign(null);
-    startReveal(group.players, court);
+    startReveal(drafted, court);
   };
 
   const assignRental = (courtId, hostId, durationMin) => {
@@ -621,43 +637,12 @@ export default function App() {
     });
   };
 
-  // Auto-requeue: with Auto-Filling on, an open-play group that finishes drops
-  // straight back onto the end of the queue, so play rotates without staff having
-  // to rebuild the group. Checked-out players are left out; rentals never requeue.
-  // Once queued they can be freely dragged to swap opponents or fill a short group.
-  // `nextHistory` must be the history INCLUDING the game that just finished —
-  // React state hasn't flushed yet at the call site, and re-matching against a
-  // stale history is precisely what would let the finished pairings repeat.
-  const requeueGroup = (playerIds, nextHistory) => {
-    if (!autoAssign) return;
-
-    // The four coming off court are free again; anyone else on a court or
-    // already sitting in the queue is not.
-    const leaving = new Set(playerIds);
-    const stillBusy = new Set([...busyPlayerIds].filter(id => !leaving.has(id)));
-    const available = players.filter(p => !p.checkedOut && !stillBusy.has(p.id));
-
-    // Re-match instead of re-queueing the same four. Handing the group straight
-    // back its own line-up was the bug: it bypassed the matcher entirely, so
-    // repeat-partner avoidance and the Winners/Losers style never got a say in
-    // the rotation that produces almost every group on a busy floor.
-    const group = buildAutoGroup(available, nextHistory, matchingStyle);
-    if (group) {
-      setQueue(prev => [...prev, {
-        id: Date.now() + Math.random(), players: group.map(p => p.id), type: 'requeue',
-      }]);
-      return;
-    }
-
-    // Fewer than four free to draft from — keep the finishers together rather
-    // than dropping them off the queue altogether.
-    const eligible = playerIds.filter(id => {
-      const p = players.find(pl => pl.id === id);
-      return p && !p.checkedOut;
-    });
-    if (eligible.length === 0) return;
-    setQueue(prev => [...prev, { id: Date.now() + Math.random(), players: eligible, type: 'requeue' }]);
-  };
+  /* After a match, players dissolve to the BACK of Available (spec §8). They are
+     not re-queued and they get no priority for the next group: the whole point
+     is that the same four cannot cycle onto a court all evening. Nothing else
+     happens until staff click Auto again — there is no RE-QUEUED state any more.
+     Where they land in Available is derived from the history entry we just wrote,
+     so this function has no work left to do beyond documenting that. */
 
   // Pull a single player out of the queue and back to the roster — staff need to
   // peel one person off a group (e.g. to check them out) without deleting the
@@ -711,8 +696,6 @@ export default function App() {
     // Players return to the roster — no checkout here.
     setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match: null } : c));
     recordMatchHistory(venueId, { ...entry, courtName: court.name });
-    // Open-play groups rotate back into the queue when Auto-Filling is on.
-    if (court.type !== 'rental') requeueGroup(court.match.players, [entry, ...history]);
   };
 
   const finishMatch = (courtId, winningPair) => {
@@ -769,12 +752,24 @@ export default function App() {
       setStatsWriteFailed(true);
     });
     recordMatchHistory(venueId, { ...entry, courtName: court.name });
-    // Both teams rotate back into the queue when Auto-Filling is on.
-    requeueGroup(court.match.players, [entry, ...history]);
+  };
+
+  // Names come off the highest number already in use, not off the array length:
+  // remove Court 2 from a floor of three and the next court added is Court 4, not
+  // a second Court 3. Ids come from the collision-free counter (spec §10).
+  const nextCourtName = (existing) => {
+    const highest = existing.reduce((n, c) => {
+      const m = /(\d+)\s*$/.exec(c.name ?? '');
+      return m ? Math.max(n, Number(m[1])) : n;
+    }, 0);
+    return `Court ${Math.max(highest, existing.length) + 1}`;
   };
 
   const addCourt = () => {
-    setCourts(prev => [...prev, { id: Date.now(), name: `Court ${prev.length + 1}`, type: 'open', match: null }]);
+    setCourts(prev => [
+      ...prev,
+      { id: nextUid('court'), name: nextCourtName(prev), type: 'open', match: null },
+    ]);
   };
 
   // Used by the setup wizard (spec §F5) to dial the floor in with one control.
@@ -786,13 +781,16 @@ export default function App() {
     setCourts(prev => {
       if (prev.length === target) return prev;
       if (prev.length < target) {
-        const extra = Array.from({ length: target - prev.length }, (_, i) => ({
-          id: Date.now() + i,
-          name: `Court ${prev.length + i + 1}`,
-          type: 'open',
-          match: null,
-        }));
-        return [...prev, ...extra];
+        const grown = [...prev];
+        while (grown.length < target) {
+          grown.push({
+            id: nextUid('court'),
+            name: nextCourtName(grown),
+            type: 'open',
+            match: null,
+          });
+        }
+        return grown;
       }
       return [...prev.slice(0, target), ...prev.slice(target).filter(c => c.match)];
     });
@@ -874,6 +872,12 @@ export default function App() {
     });
   };
 
+  /* Reset (spec §11) puts the club back to the start of a session: every queue
+     group gone (partials included), every court cleared, every W/L and therefore
+     every hidden Value back to zero, and the whole history dropped — which is
+     what returns all four repeat trackers (same-4, same-opponent, same-partner,
+     previous result) to neutral, since they are derived from it rather than
+     stored. Court names and the roster itself survive; this is not a wipe. */
   const resetSession = async () => {
     if (!confirm(confirms.resetSession)) return;
     const clearedCourts = courts.map(c => ({ ...c, match: null }));
@@ -886,7 +890,12 @@ export default function App() {
     setCheckoutPlayerId(null);
     setPlayers(prev => prev.map(p => ({ ...p, wins: 0, losses: 0 })));
     setFinishingCourt(null);
-    lastAutoAssigned.current = null;
+    setShowAssign(null);
+    setReplacing(null);
+    // A reveal caught mid-flight leaves the layout in its "flying" mode, where
+    // the panels stop clipping so the cards can travel — that is the stray
+    // scrollbar on the roster after a reset. Landing it puts the frame back.
+    endReveal();
 
     // One statement for the whole roster rather than a round-trip per player.
     resetAllStats(venueId).catch(err => console.error('Failed to reset stats:', err));
@@ -895,7 +904,7 @@ export default function App() {
     // if staff closed the tab straight after resetting, resurrecting the session.
     syncRef.current?.push({
       courts: clearedCourts, queue: [], history: [], auditLog: [],
-      competitiveMode, autoAssign, announcement: '', defaultOpenDuration,
+      competitiveMode, announcement: '', defaultOpenDuration,
       // Both are settings, not session data: a reset must not re-run the wizard
       // or silently flip the club back to the default matching style.
       matchingStyle, onboarded,
@@ -1028,20 +1037,10 @@ export default function App() {
                     <Divider />
 
                     {/* CENTRE — session controls: Auto, timer, mode */}
+                    {/* No Auto ON/OFF switch any more (spec §2): nothing fills a
+                        court by itself, so there is no continuous mode to turn
+                        off. The one Auto button lives in the Queue panel. */}
                     <div className="flex items-center gap-1.5 flex-wrap">
-                      <button
-                        onClick={() => setAutoAssign(v => !v)}
-                        className={`px-2.5 py-1.5 rounded-lg border text-sm font-semibold flex items-center gap-2 transition ${
-                          autoAssign
-                            ? 'bg-cyan-500 text-zinc-950 border-cyan-400 hover:bg-cyan-400'
-                            : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
-                        }`}
-                        title={autoAssign ? toolbar.autoTitleOn : toolbar.autoTitleOff}
-                      >
-                        <Zap className="w-4 h-4" />
-                        {autoAssign ? toolbar.autoOn : toolbar.autoOff}
-                      </button>
-
                       {/* Default open-play session time */}
                       <div className="flex items-center gap-1.5 bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1">
                         <Clock className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
@@ -1065,7 +1064,8 @@ export default function App() {
                         className="flex items-center gap-1.5 bg-zinc-900 border border-zinc-800 rounded-lg px-2 py-1"
                         title={matchingStyleInfo(matchingStyle).blurb}
                       >
-                        <Shuffle className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
+                        {/* No shuffle icon beside the dropdown (spec §2) — the
+                            only shuffle in the app is the Auto button itself. */}
                         <select
                           value={matchingStyle}
                           onChange={e => setMatchingStyle(e.target.value)}
@@ -1248,7 +1248,6 @@ export default function App() {
       {view === 'staff' ? (
         <StaffView
           competitiveMode={competitiveMode}
-          autoAssign={autoAssign}
           players={players}
           filteredPlayers={filteredPlayers}
           courts={courts}
@@ -1258,8 +1257,7 @@ export default function App() {
           newPlayerName={newPlayerName}
           newPlayerSkill={newPlayerSkill}
           newPlayerPayment={newPlayerPayment}
-          avgGameDurationMs={avgGameDurationMs}
-          openPlayCourtCount={openPlayCourtCount}
+          now={nowTick}
           setSearch={setSearch}
           setNewPlayerName={setNewPlayerName}
           setNewPlayerSkill={setNewPlayerSkill}
@@ -1298,8 +1296,6 @@ export default function App() {
           queue={queue}
           history={history}
           announcement={announcement}
-          avgGameDurationMs={avgGameDurationMs}
-          openPlayCourtCount={openPlayCourtCount}
           playerById={playerById}
         />
       )}
@@ -1742,10 +1738,10 @@ function CheckedOutBox({ players, onCheckIn }) {
    ───────────────────────────────────────────── */
 function StaffView(props) {
   const {
-    competitiveMode, autoAssign,
+    competitiveMode,
     players, filteredPlayers, courts, queue, busyPlayerIds,
     search, newPlayerName, newPlayerSkill, newPlayerPayment,
-    avgGameDurationMs, openPlayCourtCount,
+    now,
     setSearch, setNewPlayerName, setNewPlayerSkill, setNewPlayerPayment,
     addPlayer, checkInExisting, onCheckoutPlayer, removePlayer, setPlayerPayment, addPlayerToQueue, startQueueGroup, autoGroup,
     setShowAssign, setShowRental, removeFromQueue, removePlayerFromQueue, movePlayerToQueueGroup, dropOnQueuePlayer,
@@ -1786,11 +1782,6 @@ function StaffView(props) {
         <div className="flex items-center justify-between mb-1.5 shrink-0">
           <div className="flex items-center gap-3">
             <h2 className="font-display text-xl text-zinc-200 tracking-wide">COURTS</h2>
-            {autoAssign && (
-              <span className="text-xs font-bold text-cyan-400 bg-cyan-950 border border-cyan-800 px-2 py-0.5 rounded-full flex items-center gap-1">
-                <Zap className="w-3 h-3" /> AUTO-FILLING
-              </span>
-            )}
           </div>
           <button
             onClick={addCourt}
@@ -2016,7 +2007,6 @@ function StaffView(props) {
               const avgSkill = groupPlayers.length
                 ? Math.round(groupPlayers.reduce((s, p) => s + skillRank(p.skill), 0) / groupPlayers.length)
                 : 0;
-              const estWaitMs = estimateWait(idx, openPlayCourtCount, avgGameDurationMs);
               const hasFreeCourt = courts.some(c => c.type === 'open' && !c.match);
               const isImmediateNext = idx === 0 && hasFreeCourt && groupPlayers.length >= 4;
               const unpaidCount = groupPlayers.filter(p => !isPaid(p.payment)).length;
@@ -2047,7 +2037,7 @@ function StaffView(props) {
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-display text-xl text-lime-400">#{idx + 1}</span>
                       <span className="text-xs uppercase tracking-wider text-zinc-500">
-                        {g.type === 'auto' ? 'Auto-grouped' : g.type === 'requeue' ? 'Re-queued' : 'Manual'}
+                        {g.type === 'auto' ? 'Auto-grouped' : 'Manual'}
                       </span>
                       <span className={`text-xs px-1.5 py-0.5 rounded ${skillStyleSolid(SKILL_TIERS[avgSkill])} bg-opacity-20 text-zinc-300`}>
                         avg {SKILL_TIERS[avgSkill]}
@@ -2057,15 +2047,16 @@ function StaffView(props) {
                           <AlertTriangle className="w-3 h-3" /> {unpaidCount} unpaid
                         </span>
                       )}
-                      {isImmediateNext ? (
+                      {isImmediateNext && (
                         <span className="text-xs font-bold text-lime-400 bg-lime-950 border border-lime-800 px-2 py-0.5 rounded-full">
                           Now
                         </span>
-                      ) : estWaitMs ? (
-                        <span className="text-xs text-zinc-400 bg-zinc-800 px-2 py-0.5 rounded-full flex items-center gap-1">
-                          <Clock className="w-3 h-3" /> {fmtMinutes(estWaitMs)}
-                        </span>
-                      ) : null}
+                      )}
+                      {/* How long this group has actually been waiting (spec §9),
+                          measured from its own createdAt — not an estimate. */}
+                      <span className="text-xs text-zinc-400 bg-zinc-800 px-2 py-0.5 rounded-full flex items-center gap-1">
+                        <Clock className="w-3 h-3" /> {fmtWaiting(now, g.createdAt)}
+                      </span>
                     </div>
                     <button onClick={() => removeFromQueue(g.id)} className="text-zinc-600 hover:text-rose-400 transition-colors duration-150">
                       <X className="w-4 h-4" />
@@ -2382,8 +2373,9 @@ function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinis
    DISPLAY VIEW (customer-facing)
    ───────────────────────────────────────────── */
 // Exported so the public /d/:token route can render it with data from the RPC.
-export function DisplayView({ competitiveMode, courts, queue, history, announcement, avgGameDurationMs, openPlayCourtCount, playerById }) {
+export function DisplayView({ competitiveMode, courts, queue, history, announcement, playerById }) {
   const now = new Date();
+  const nowMs = now.getTime();
   const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
   const activeCourts  = courts.filter(c => c.match).length;
@@ -2621,7 +2613,6 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {queue.map((g, idx) => {
                 const groupPlayers = g.players.map(playerById).filter(Boolean);
-                const estWaitMs = estimateWait(idx, openPlayCourtCount, avgGameDurationMs);
                 const hasFreeCourt = courts.some(c => c.type === 'open' && !c.match);
                 const isImmediateNext = idx === 0 && hasFreeCourt && groupPlayers.length >= 4;
                 const isAutoBalanced = g.type === 'auto' && groupPlayers.length === 4;
@@ -2641,19 +2632,20 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                       <div>
                         <span className="font-display text-6xl text-lime-400 leading-none">#{idx + 1}</span>
                         <div className="text-xs uppercase tracking-widest text-zinc-500 mt-0.5">
-                          {g.type === 'auto' ? 'Auto-balanced' : g.type === 'requeue' ? 'Back in play' : 'Group'}
+                          {g.type === 'auto' ? 'Auto-balanced' : 'Group'}
                         </div>
                       </div>
                       {isImmediateNext ? (
                         <span className="text-xs font-bold text-lime-300 bg-lime-900 border border-lime-700 px-3 py-1.5 rounded-full animate-pulse mt-1">
                           STEPPING ON
                         </span>
-                      ) : estWaitMs ? (
+                      ) : (
+                        /* Time waited, not time predicted (spec §9). */
                         <span className="text-sm text-zinc-300 bg-zinc-800 px-3 py-1.5 rounded-full flex items-center gap-1.5 mt-1">
                           <Clock className="w-3.5 h-3.5 text-zinc-500" />
-                          {fmtMinutes(estWaitMs)}
+                          {fmtWaiting(nowMs, g.createdAt)}
                         </span>
-                      ) : null}
+                      )}
                     </div>
 
                     {/* Players — split into teams if auto-balanced */}

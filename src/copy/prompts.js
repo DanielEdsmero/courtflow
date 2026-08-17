@@ -12,7 +12,10 @@ export const confirms = {
 // Native alert() boxes — a single OK.
 export const alerts = {
   addPlayerFailed: (name) => `Couldn't add ${name}. Check your connection and try again.`,
-  notEnoughToAutoGroup: 'Need at least 4 available players to auto-group.',
+  notEnoughToAutoGroup: 'Need at least 4 players between the queue and the roster before Auto can make a group.',
+  // Auto ran, but every court was busy, the queue already had a waiting group,
+  // and nothing else could legally be formed. Says so rather than looking broken.
+  autoPassDidNothing: 'Nothing to do — courts are busy and a group is already waiting.',
   regenerateFailed: 'Could not regenerate the link. Check your connection and try again.',
 };
 

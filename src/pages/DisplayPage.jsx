@@ -73,17 +73,6 @@ export default function DisplayPage() {
   const courts = useMemo(() => hydrateCourts(state.courts ?? []), [state.courts]);
   const history = state.history ?? [];
 
-  const avgGameDurationMs = useMemo(() => {
-    const completed = history.filter((h) => h.duration > 0);
-    if (completed.length === 0) return 15 * 60 * 1000;
-    return completed.reduce((sum, h) => sum + h.duration, 0) / completed.length;
-  }, [history]);
-
-  const openPlayCourtCount = useMemo(
-    () => courts.filter((c) => c.type === 'open').length,
-    [courts]
-  );
-
   if (error === 'NOT_FOUND') return <Message title={tvDisplay.notFoundTitle} body={tvDisplay.notFoundBody} />;
   if (error === 'LOAD_FAILED') return <Message title={tvDisplay.unreachableTitle} body={tvDisplay.unreachableBody} />;
   if (!data) return <Message title={screens.loading} body="" />;
@@ -96,8 +85,6 @@ export default function DisplayPage() {
         queue={state.queue ?? []}
         history={history}
         announcement={state.announcement ?? ''}
-        avgGameDurationMs={avgGameDurationMs}
-        openPlayCourtCount={openPlayCourtCount}
         playerById={playerById}
       />
       {!live && (

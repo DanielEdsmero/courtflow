@@ -17,9 +17,14 @@ export const fmtElapsed = (ms) => {
   return `${m}:${String(s % 60).padStart(2, '0')}`;
 };
 
-export const fmtMinutes = (ms) => {
-  const m = Math.round(ms / 60000);
-  return m <= 0 ? 'Now!' : `~${m} min`;
+// How long a queue group has been waiting (spec §9). Elapsed, never estimated:
+// the old "~N min" chip multiplied a queue position by the average game length,
+// which one long-running court turned into "~1347 min". `now` is passed in so
+// this stays pure and the caller owns the clock.
+export const fmtWaiting = (now, createdAt) => {
+  if (createdAt == null || !Number.isFinite(Number(createdAt))) return 'Just now';
+  const m = Math.floor((now - Number(createdAt)) / 60000);
+  return m < 1 ? 'Just now' : `${m} min`;
 };
 
 // Total elapsed time in a human "1h 15m" / "15m" shape — used for session length
@@ -72,14 +77,6 @@ export const PAYMENT_ORDER = ['online', 'cash', 'unpaid'];
 export const paymentInfo = (status) => PAYMENT_STATUSES[status] || PAYMENT_STATUSES.unpaid;
 
 export const isPaid = (status) => status === 'online' || status === 'cash';
-
-// Returns estimated wait in ms for queue group at `queueIndex`.
-// Uses ceiling-division so group at index 0 still shows one round's wait
-// (the caller decides if they should show "stepping on" instead).
-export const estimateWait = (queueIndex, openPlayCourtsTotal, avgGameDurationMs) => {
-  if (openPlayCourtsTotal === 0) return null;
-  return Math.ceil((queueIndex + 1) / openPlayCourtsTotal) * avgGameDurationMs;
-};
 
 /* ─────────────────────────────────────────────
    ROSTER AUTOCOMPLETE (spec §1, §4, §6, §7)
@@ -145,162 +142,18 @@ export const matchingStyleInfo = (style) =>
   MATCHING_STYLES[style] || MATCHING_STYLES[DEFAULT_MATCHING_STYLE];
 
 /* ─────────────────────────────────────────────
-   RECENT FORM (spec §F1)
-   Derived from the session `history` array, never from a database column: the
-   session wins/losses are zeroed on reset, and the all-time totals are far too
-   coarse to say who is hot right now. Every entry finishMatch() produces carries
-   `winners` and `losers`; casual and rental entries carry neither and are skipped.
-   ───────────────────────────────────────────── */
+   REST FAIRNESS
+   Who has been sitting the longest. Used to break ties between players the
+   matcher rates identically, so a group that just came off court doesn't get
+   handed the next one while newcomers watch.
 
-// How many of a player's OWN most recent decided games count as "form". Per
-// player rather than a flat slice of history, because with four courts running
-// the last five entries only cover a fraction of the roster.
-export const FORM_WINDOW = 5;
-
-// history is newest-first (App pushes with [entry, ...prev]), so the first entry
-// a player appears in is their most recent game.
-// → { [playerId]: { games, wins, losses, last: 'W'|'L'|null } }
-export const playerForm = (history, window = FORM_WINDOW) => {
-  const form = {};
-  for (const h of history ?? []) {
-    const winners = Array.isArray(h?.winners) ? h.winners : [];
-    const losers = Array.isArray(h?.losers) ? h.losers : [];
-    if (winners.length === 0 && losers.length === 0) continue; // no result recorded
-    for (const id of [...winners, ...losers]) {
-      const f = form[id] || (form[id] = { games: 0, wins: 0, losses: 0, last: null });
-      if (f.games >= window) continue;
-      const won = winners.includes(id);
-      if (f.games === 0) f.last = won ? 'W' : 'L';
-      f.games += 1;
-      if (won) f.wins += 1;
-      else f.losses += 1;
-    }
-  }
-  return form;
-};
-
-// One number, so form can be sorted. Deliberately banded:
-//   won their last game  → +1 .. +3
-//   no history at all    →  0        (so a newcomer never ranks as a loser)
-//   lost their last game → -3 .. -1
-// The last result dominates; the W-L record inside the window only breaks ties
-// among players who all won — or all lost — their most recent game.
-export const formScore = (f) => {
-  if (!f || f.games === 0) return 0;
-  const last = f.last === 'W' ? 1 : -1;
-  const record = (f.wins - f.losses) / f.games; // -1 .. 1
-  return last * 2 + record;
-};
-
-// Best form first. The skill tie-break is what makes the no-history fallback
-// exact: with an empty history every formScore is 0, so this collapses to the
-// original "sort by skillRank descending" and the snake draft below produces
-// precisely the best+worst pairing it always did. The id tie-break keeps it
-// deterministic (Array#sort is stable within an engine, but the input order into
-// it is not something we want to depend on).
-export const rankByForm = (players, form) =>
-  [...players].sort(
-    (a, b) =>
-      formScore(form[b.id]) - formScore(form[a.id]) ||
-      skillRank(b.skill) - skillRank(a.skill) ||
-      String(a.id).localeCompare(String(b.id))
-  );
-
-// The winnersLosers group: take the four best-form available players, then snake
-// draft them. Because those four are busy by the time Auto is pressed again,
-// repeated calls walk DOWN the ladder — the first is the winners court, the next
-// the rung below, and so on.
-// Snake-drafting a form-ranked four means each team is one recent winner plus one
-// recent loser, and the two in-form players end up as OPPONENTS, not partners.
-// Taking the top four outright looked right on paper but produced a mixed court
-// in practice: with four courts running there are rarely four recent winners
-// free at the same moment, so the "winners court" quietly filled up with
-// newcomers and then losers, and the result was barely distinguishable from the
-// balanced draft. Instead, slide a window of four down the form-ranked list and
-// take the TIGHTEST rung — the four whose form is closest together. Ties go to
-// the highest window, so the winners' court is still picked first and repeated
-// calls still walk down the ladder.
-export const ladderGroup = (players, history, { formWindow = FORM_WINDOW } = {}) => {
-  if (!players || players.length < 4) return null;
-  const form = playerForm(history, formWindow);
-  const ranked = rankByForm(players, form);
-
-  let best = ranked.slice(0, 4);
-  let bestSpread = Infinity;
-  for (let i = 0; i + 4 <= ranked.length; i++) {
-    const rung = ranked.slice(i, i + 4);
-    // Already form-descending, so the spread is just the ends.
-    const spread = formScore(form[rung[0].id]) - formScore(form[rung[3].id]);
-    if (spread < bestSpread) {
-      bestSpread = spread;
-      best = rung;
-    }
-  }
-
-  // Which rung is settled; now pick HOW to split it. Tightening the rungs made
-  // the same four cluster together repeatedly, so without this the ladder
-  // re-made partnerships about one time in six. The snake split is tried first
-  // and wins every tie, so the two strongest performers still end up opponents.
-  const partners = recentPartners(history);
-  let split = balancedGroup(best);
-  let bestRepeats = Infinity;
-  for (const [a, b, c, d] of SPLITS) {
-    const repeats =
-      partnerWeight(partners, best[a].id, best[b].id) +
-      partnerWeight(partners, best[c].id, best[d].id);
-    if (repeats < bestRepeats) {
-      bestRepeats = repeats;
-      split = [best[a], best[b], best[c], best[d]];
-    }
-  }
-  return split;
-};
-
-/* ─────────────────────────────────────────────
-   REPEAT-PARTNER AVOIDANCE (spec §F2)
-   The upgrade to the default balanced group: same snake draft, but pick WHICH
-   four (and which of the three ways to split them) so nobody partners the same
-   person two rounds running. Read out of the session history array — no new
-   column. An entry's `players` is the on-court order and the finish modal treats
-   slots [0,1] as team 1 and [2,3] as team 2, so partnerships are already implicit.
+   The queue engine (./queue-engine.js) owns group FORMATION now — this half
+   survives because the replacement picker still needs it.
    ───────────────────────────────────────────── */
 
 // How many past games count as "recent". Four is roughly one full rotation on a
-// four-court floor — long enough to notice a repeat, short enough that a six
-// player roster isn't punished forever for pairings it has no way to avoid.
+// four-court floor.
 export const PARTNER_WINDOW = 4;
-
-// Order-independent key. Stringified because ids are uuids in production but
-// plain numbers in the tests and in older session blobs.
-const pairKey = (a, b) => [String(a), String(b)].sort().join('|');
-
-// → Map<pairKey, weight>, where weight is recency: the immediately previous game
-// scores `window`, the oldest one still in the window scores 1. So "partnered
-// last round" costs four times as much as "partnered four rounds ago", and old
-// repeats age out on their own without needing a second tuning knob.
-export const recentPartners = (history, window = PARTNER_WINDOW) => {
-  const counts = new Map();
-  const bump = (k, w) => counts.set(k, (counts.get(k) ?? 0) + w);
-  (history ?? []).slice(0, window).forEach((h, i) => {
-    const ids = Array.isArray(h?.players) ? h.players : [];
-    if (ids.length < 4) return; // rentals (one host) and short groups have no teams
-    const w = window - i;
-    bump(pairKey(ids[0], ids[1]), w);
-    bump(pairKey(ids[2], ids[3]), w);
-  });
-  return counts;
-};
-
-export const partnerWeight = (counts, a, b) => counts.get(pairKey(a, b)) ?? 0;
-
-/* ─────────────────────────────────────────────
-   REST FAIRNESS
-   Repeat-partner avoidance alone still lets the same strong four monopolise a
-   court: they are the top of the skill-sorted pool every time, so the draft
-   keeps picking them and only reshuffles who partners whom. This adds the other
-   half — someone who has just come off court sorts below someone who has been
-   waiting, so the pool actually rotates.
-   ───────────────────────────────────────────── */
 
 // → Map<playerId, 0..1> where 1 means "played the game that just finished" and
 // values decay to 0 at the edge of the window. Only a player's MOST RECENT
@@ -321,19 +174,10 @@ export const recentlyPlayed = (history, window = PARTNER_WINDOW) => {
 
 export const restCost = (rest, id) => rest.get(String(id)) ?? 0;
 
-// The three ways to split a value-sorted [w,x,y,z] into two teams, as indexes
-// into that array. The first is the snake draft — provably the most even of the
-// three for any sorted four — and is listed first so it wins every tie.
-const SPLITS = [
-  [0, 3, 1, 2], // w+z vs x+y  (snake)
-  [0, 2, 1, 3], // w+y vs x+z
-  [0, 1, 2, 3], // w+x vs y+z
-];
-
 /* ─────────────────────────────────────────────
    PLAYER VALUE (hidden)
-   A per-session number that says how today has gone: +1 a win, -0.5 a loss.
-   Everyone starts a session on 0.
+   A per-session number that says how today has gone: +1 a win, -0.5 a loss, per
+   player and uncapped in both directions. Everyone starts a session on 0.
 
    It is DERIVED from the session win/loss counters rather than stored in a
    column of its own, and that is the whole trick:
@@ -353,93 +197,14 @@ export const VALUE_LOSS = -0.5;
 
 export const playerValue = (p) => (p?.wins ?? 0) * VALUE_WIN + (p?.losses ?? 0) * VALUE_LOSS;
 
-// How close two players' values must be to count as a match, tried in order.
-// Anything past the last tier is "closest four available, whatever the spread".
-export const VALUE_TIERS = [1, 2];
-
-// "Who did you play WITH in the last 2 games" (spec §3) — deliberately shorter
-// than PARTNER_WINDOW, which the ladder still uses.
+// "Who did you play WITH in the last 2 games" — the window the replacement
+// picker rates rest over.
 export const VALUE_PARTNER_WINDOW = 2;
 
-// Inside a tier every group is already close enough on value, so partner
-// freshness decides between them: one partnership repeated from the game that
-// just finished (weight 2) costs 8, more than the widest spread a tier permits.
-// Across tiers it can never win — the tier gate is applied first.
-const VALUE_REPEAT_WEIGHT = 4;
-
 /* ─────────────────────────────────────────────
-   VALUE-BASED GROUPING (spec §2)
-   Replaces the old skill-tier snake draft outright. Two questions, in order:
-   WHICH four (closest values, then freshest partnerships) and HOW to split them
-   (always the snake, so the group's best and worst are partners).
-   ───────────────────────────────────────────── */
-export const valueGroup = (
-  players,
-  history,
-  { partnerWindow = VALUE_PARTNER_WINDOW, tiers = VALUE_TIERS } = {}
-) => {
-  if (!players || players.length < 4) return null;
-
-  const partners = recentPartners(history, partnerWindow);
-  const rest = recentlyPlayed(history, partnerWindow);
-
-  // Value descending. The rest tie-break only ever separates players who are on
-  // exactly the SAME value, so value proximity is untouched by it — it decides
-  // which of several identical players gets the court. Without it a roster that
-  // is mostly still on 0 would hand the first four the game every time, which
-  // is the starvation bug the ladder had.
-  const ranked = [...players].sort(
-    (a, b) =>
-      playerValue(b) - playerValue(a) ||
-      restCost(rest, a.id) - restCost(rest, b.id) ||
-      String(a.id).localeCompare(String(b.id))
-  );
-
-  // In a sorted list the four closest values are always contiguous, so sliding
-  // a window of four is already an exhaustive search of the tightest groups —
-  // no need to enumerate all C(n,4) subsets the way the old matcher did.
-  const windows = [];
-  for (let i = 0; i + 4 <= ranked.length; i++) {
-    const four = ranked.slice(i, i + 4);
-    windows.push({
-      four,
-      spread: playerValue(four[0]) - playerValue(four[3]),
-      // The split is always the snake, so these two are the only partnerships
-      // this group can produce — no point costing the alternatives.
-      repeats:
-        partnerWeight(partners, four[0].id, four[3].id) +
-        partnerWeight(partners, four[1].id, four[2].id),
-    });
-  }
-
-  // ±1, then ±2, then everyone. Value proximity is a hard gate: the repeat
-  // penalty only ever chooses between groups that already cleared the same
-  // tier, so a close-value group with a repeated pair still beats a far-value
-  // group of strangers — exactly the priority the spec asks for.
-  for (const limit of [...tiers, Infinity]) {
-    const eligible = windows.filter((w) => w.spread <= limit);
-    if (eligible.length === 0) continue;
-    let best = eligible[0];
-    let bestCost = Infinity;
-    for (const w of eligible) {
-      const cost = VALUE_REPEAT_WEIGHT * w.repeats + w.spread;
-      // Strict < keeps the first minimum, and `windows` is built in a fixed
-      // order, so identical inputs always produce identical output.
-      if (cost < bestCost) {
-        bestCost = cost;
-        best = w;
-      }
-    }
-    // [a,d,b,c] — highest+lowest against 2nd+3rd.
-    return balancedGroup(best.four);
-  }
-  return null;
-};
-
-/* ─────────────────────────────────────────────
-   REPLACEMENT (spec §4)
+   REPLACEMENT
    Someone is pulled out of a queued group mid-session; the stand-in is whoever
-   is free with the nearest value, so the group stays as tight as the matcher
+   is free with the nearest value, so the group stays as tight as the engine
    made it. Staff picking a replacement by hand go through the normal drag/click
    path instead, which is unfiltered and shows no values.
    ───────────────────────────────────────────── */
@@ -463,24 +228,6 @@ export const closestByValue = (candidates, targetValue, history, opts = {}) => {
       restCost(rest, a.id) - restCost(rest, b.id) ||
       String(a.id).localeCompare(String(b.id))
   )[0];
-};
-
-/* ─────────────────────────────────────────────
-   AUTO-GROUP ENTRY POINT
-   The one function App.jsx calls. Returns four players in on-court order
-   ([0,1] = team 1, [2,3] = team 2), or null when there aren't four to group —
-   the caller decides how to complain about that.
-   ───────────────────────────────────────────── */
-export const buildAutoGroup = (
-  available,
-  history,
-  matchingStyle = DEFAULT_MATCHING_STYLE,
-  opts = {}
-) => {
-  if (!available || available.length < 4) return null;
-  return matchingStyle === 'winnersLosers'
-    ? ladderGroup(available, history, opts)
-    : valueGroup(available, history, opts);
 };
 
 /* ─────────────────────────────────────────────
