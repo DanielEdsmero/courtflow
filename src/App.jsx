@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { LayoutGroup } from 'motion/react';
 import {
   Plus, Trophy, RotateCcw, X, Check, Search, Zap, Monitor,
@@ -24,6 +24,7 @@ import {
   roster as rosterCopy, checkIn, checkedOut as checkedOutCopy,
   confirms, alerts, statsWriteBanner,
   sessionRank as sessionRankCopy, leaderboardModal as leaderboardCopy,
+  queue as queueCopy,
   modals,
 } from './copy';
 import ModalShell from './components/ModalShell';
@@ -48,7 +49,9 @@ import {
 } from './lib/logic';
 // Group formation, court filling and the repeat ladder (spec §1–§7). Pure and
 // clock-free: every call below hands it `now`.
-import { runAutoPass, draftTeams, checkInOrder } from './lib/queue-engine';
+import {
+  generateAutoQueueGroups, assignQueuedGroupToCourt, suggestCourtFor, courtRoles,
+} from './lib/queue-engine';
 export { SKILL_TIERS, skillRank, fmtElapsed, fmtWaiting, balancedGroup };
 
 // Bounds the in-memory activity log carried in the session blob.
@@ -297,6 +300,11 @@ export default function App() {
   // a person leaving for the day — not something a court ending triggers.
   const [checkoutPlayerId, setCheckoutPlayerId] = useState(null);
   const [showAssign, setShowAssign]           = useState(null);
+  // What the last Auto press did, shown inline under the Queue header rather
+  // than as a dialog: Auto is pressed over and over through a session, and a
+  // modal on every press would be unusable. Cleared on its own after a few
+  // seconds by the Queue panel.
+  const [autoStatus, setAutoStatus]           = useState(null);
   const [showRental, setShowRental]           = useState(null);
   const [showAnnouncementBar, setShowAnnouncementBar] = useState(false);
   const [pendingPhotoPlayerId, setPendingPhotoPlayerId] = useState(null);
@@ -532,71 +540,39 @@ export default function App() {
     ]);
   };
 
-  /* ── Auto (spec §2) ───────────────────────────────────────────────────────
-     One click, one pass. Every rule — the four-player guard, FIFO consumption,
-     the repeat ladder, Winners/Losers routing, the one-waiting-group cap — lives
-     in the pure engine; this function is only the plumbing that hands it the
-     world, applies what came back, and tells staff when nothing could be done. */
+  /* ── Auto ─ build every group the bench can make ─────────────────────
+     One explicit staff click, and it only ever touches the QUEUE. It completes
+     the partial groups staff started, then keeps building fours until fewer than
+     four players are left on the bench. No court is filled, nobody starts
+     playing, and no reveal animation runs ─ that all belongs to Assign to court.
+
+     Every matching decision lives in the pure engine; this is the plumbing that
+     hands it the world, applies the queue it hands back, and reports what
+     happened without blocking anyone with a dialog. */
   const autoGroup = () => {
     const now = Date.now();
-    const result = runAutoPass({ players, courts, queue, history, matchingStyle, now });
-
-    if (result.reason === 'needMorePlayers') {
-      alert(alerts.notEnoughToAutoGroup);
-      return;
-    }
-
-    if (result.assignments.length > 0) {
-      const dur = competitiveMode ? null : defaultOpenDuration;
-      setCourts(prev => prev.map(c => {
-        const a = result.assignments.find(x => x.courtId === c.id);
-        if (!a) return c;
-        return {
-          ...c,
-          match: {
-            players: a.playerIds,
-            startedAt: now,
-            endsAt: dur ? now + dur * 60 * 1000 : null,
-            durationMin: dur,
-            autoAssigned: true,
-          },
-        };
-      }));
-      // One reveal per pass: the overlay flies players to a single court, so a
-      // pass that fills three at once announces the first and the rest simply
-      // appear. Chaining three overlays would hold the floor for half a minute.
-      const first = result.assignments[0];
-      startReveal(first.playerIds, courts.find(c => c.id === first.courtId));
-    }
-
+    const result = generateAutoQueueGroups({ players, courts, queue, history, matchingStyle, now });
     setQueue(result.queue);
-
-    // The engine already accounts for a partial group being topped up, which is
-    // real work even though it fills no court and creates no group.
-    if (result.reason === 'nothingToDo') alert(alerts.autoPassDidNothing);
+    setAutoStatus({
+      at: now,
+      text: result.reason === 'noFullGroupPossible'
+        ? queueCopy.autoNothingCreated(result.remaining)
+        : queueCopy.autoCreated(result.created.length, result.toppedUp.length, result.remaining),
+    });
   };
 
-  // Explicit staff assignment (spec §3). Bypasses FIFO — it is a deliberate
-  // override — but still runs the snake draft, so the teams on court are the
-  // balanced ones rather than whatever order the group happens to be stored in.
+  /* Assign to court ─ the ONLY path from Queued to Playing.
+     The group goes on exactly as staff are looking at it: same four players, same
+     teams. Re-running the matcher here would hand them a different match from the
+     one they clicked. */
   const assignToCourt = (groupId, courtId, durationMin) => {
-    const group = queue.find(g => g.id === groupId);
-    const court = courts.find(c => c.id === courtId);
-    if (!group || !court || court.match) return;
-    const four = group.players.map(playerById).filter(Boolean);
-    if (four.length < 4) return; // never put two or three players on a court
-    const drafted = draftTeams(four, checkInOrder(players)).map(p => p.id);
     const now = Date.now();
-    const match = {
-      players: drafted,
-      startedAt: now,
-      endsAt: durationMin ? now + durationMin * 60 * 1000 : null,
-      durationMin: durationMin || null,
-    };
-    setCourts(prev => prev.map(c => c.id === courtId ? { ...c, match } : c));
-    setQueue(prev => prev.filter(g => g.id !== groupId));
+    const next = assignQueuedGroupToCourt({ groupId, courtId, courts, queue, now, durationMin });
     setShowAssign(null);
-    startReveal(drafted, court);
+    if (!next) return;
+    setCourts(next.courts);
+    setQueue(next.queue);
+    startReveal(next.assigned.playerIds, courts.find(c => c.id === courtId));
   };
 
   const assignRental = (courtId, hostId, durationMin) => {
@@ -957,6 +933,10 @@ export default function App() {
     [players, history]
   );
 
+  // Stable identity so the Queue panel's dismiss timer isn't torn down and
+  // rebuilt on every render of the app.
+  const clearAutoStatus = useCallback(() => setAutoStatus(null), []);
+
   if (loadFailed) {
     return (
       <div className="font-body min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-6 text-center">
@@ -1272,6 +1252,8 @@ export default function App() {
           autoGroup={autoGroup}
           showValues={showValues}
           setShowValues={setShowValues}
+          autoStatus={autoStatus}
+          clearAutoStatus={clearAutoStatus}
           reveal={reveal}
           setShowAssign={setShowAssign}
           setShowRental={setShowRental}
@@ -1749,6 +1731,7 @@ function StaffView(props) {
     setFinishingCourt, clearCourtCasual,
     addCourt, removeCourt, toggleCourtType, renameCourt, playerById,
     showValues, setShowValues, reveal,
+    autoStatus, clearAutoStatus,
   } = props;
 
   // Framer positions a travelling element inside its DESTINATION, so without
@@ -1759,13 +1742,22 @@ function StaffView(props) {
   const [dragOverZone, setDragOverZone] = useState(null);
   // The specific queued player a drag is hovering — the one who'll be swapped out.
   const [dragOverPlayerId, setDragOverPlayerId] = useState(null);
-  // Brief "thinking" state so Auto-group feels deliberate rather than instant (§4).
+  // Brief "thinking" state so Auto-group feels deliberate rather than instant.
   const [autoBusy, setAutoBusy] = useState(false);
   const runAutoGroup = () => {
     if (autoBusy) return;
     setAutoBusy(true);
     setTimeout(() => { autoGroup(); setAutoBusy(false); }, 550);
   };
+
+  // The result line reads once and gets out of the way. Keyed on the press time
+  // so a second press restarts the countdown rather than inheriting the first.
+  const statusAt = autoStatus?.at;
+  useEffect(() => {
+    if (!statusAt) return;
+    const t = setTimeout(clearAutoStatus, 7000);
+    return () => clearTimeout(t);
+  }, [statusAt, clearAutoStatus]);
 
   // Checked-out players stay in `players` for re-check-in but are not part of the
   // active roster: they're counted separately and shown in their own box below.
@@ -1986,21 +1978,36 @@ function StaffView(props) {
             to fill the first open slot, drag between groups to rearrange, or
             drop on the strip at the bottom to start a fresh group. */}
         <section className="lg:col-span-7 flex flex-col min-h-0">
-          <div className="flex items-center justify-between gap-3 mb-1.5 shrink-0">
-            <h2 className="font-display text-xl text-zinc-200 tracking-wide">
-              QUEUE <span className="text-zinc-600 text-sm">({queue.length})</span>
-            </h2>
+          <div className="flex items-start justify-between gap-3 mb-1.5 shrink-0">
+            <div className="min-w-0">
+              <h2 className="font-display text-xl text-zinc-200 tracking-wide">
+                {queueCopy.heading} <span className="text-zinc-600 text-sm">({queue.length})</span>
+              </h2>
+              {/* Says what the button does, because "Auto" on its own has read as
+                  "start the matches" to every member of staff who has used it. */}
+              <p className="text-[11px] text-zinc-500 leading-snug">{queueCopy.autoHelp}</p>
+            </div>
             <button
               onClick={runAutoGroup}
               disabled={autoBusy}
-              className={`relative overflow-hidden bg-zinc-800 text-zinc-200 text-sm font-semibold py-1.5 px-3 rounded-lg hover:bg-zinc-700 flex items-center gap-2 transition-colors disabled:cursor-wait ${autoBusy ? 'cf-shimmer' : ''}`}
-              title="Groups players with similar values for fair matches, then balances teams within each group."
+              className={`relative overflow-hidden shrink-0 bg-zinc-800 text-zinc-200 text-sm font-semibold py-1.5 px-3 rounded-lg hover:bg-zinc-700 flex items-center gap-2 transition-colors disabled:cursor-wait ${autoBusy ? 'cf-shimmer' : ''}`}
+              title={queueCopy.autoTitle}
             >
               {autoBusy
-                ? <><RefreshCw className="w-4 h-4 animate-spin" /> Balancing…</>
-                : <><Shuffle className="w-4 h-4" /> Auto</>}
+                ? <><RefreshCw className="w-4 h-4 animate-spin" /> {queueCopy.autoButtonBusy}</>
+                : <><Shuffle className="w-4 h-4" /> {queueCopy.autoButton}</>}
             </button>
           </div>
+          {/* What the last press actually did. Inline and self-clearing rather
+              than a dialog: Auto is pressed over and over through a session. */}
+          {autoStatus && (
+            <div
+              role="status"
+              className="cf-fade-up shrink-0 mb-1.5 text-xs text-zinc-300 bg-zinc-900 border border-zinc-800 rounded-lg px-2.5 py-1.5"
+            >
+              {autoStatus.text}
+            </div>
+          )}
           <div className={`flex-1 min-h-0 ${scrollClass} space-y-2 pr-0.5`}>
             {queue.map((g, idx) => {
               const groupPlayers = g.players.map(playerById).filter(Boolean);
@@ -2010,6 +2017,10 @@ function StaffView(props) {
               const hasFreeCourt = courts.some(c => c.type === 'open' && !c.match);
               const isImmediateNext = idx === 0 && hasFreeCourt && groupPlayers.length >= 4;
               const unpaidCount = groupPlayers.filter(p => !isPaid(p.payment)).length;
+              const courtHint = queueCopy.hint[g.preferredCourt] ?? null;
+              // Teams only exist once a group is complete; the snake draft put
+              // slots [0,1] on one side and [2,3] on the other.
+              const showTeams = groupPlayers.length === 4;
 
               const canDrop = !!_dragId && groupPlayers.length < 4 && !g.players.includes(_dragId);
               return (
@@ -2037,14 +2048,31 @@ function StaffView(props) {
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-display text-xl text-lime-400">#{idx + 1}</span>
                       <span className="text-xs uppercase tracking-wider text-zinc-500">
-                        {g.type === 'auto' ? 'Auto-grouped' : 'Manual'}
+                        {g.type === 'auto' ? queueCopy.typeAuto : queueCopy.typeManual}
                       </span>
                       <span className={`text-xs px-1.5 py-0.5 rounded ${skillStyleSolid(SKILL_TIERS[avgSkill])} bg-opacity-20 text-zinc-300`}>
                         avg {SKILL_TIERS[avgSkill]}
                       </span>
-                      {unpaidCount > 0 && (
+                      {/* Payment summary for the whole group — staff need to know
+                          before a group goes on, not once it is already playing. */}
+                      {unpaidCount > 0 ? (
                         <span className="text-xs font-bold text-rose-300 bg-rose-950 border border-rose-800 px-2 py-0.5 rounded-full flex items-center gap-1">
-                          <AlertTriangle className="w-3 h-3" /> {unpaidCount} unpaid
+                          <AlertTriangle className="w-3 h-3" /> {queueCopy.unpaid(unpaidCount)}
+                        </span>
+                      ) : groupPlayers.length > 0 && (
+                        <span className="text-xs text-emerald-400 bg-emerald-950 border border-emerald-900 px-2 py-0.5 rounded-full">
+                          {queueCopy.allPaid}
+                        </span>
+                      )}
+                      {/* The Winners/Losers routing hint. Staff view only, and
+                          purely a suggestion — Assign to court offers it first
+                          but any court can be chosen. */}
+                      {courtHint && (
+                        <span
+                          className="text-xs text-cyan-300 bg-cyan-950 border border-cyan-900 px-2 py-0.5 rounded-full"
+                          title={queueCopy.hintTitle}
+                        >
+                          {courtHint}
                         </span>
                       )}
                       {isImmediateNext && (
@@ -2063,11 +2091,16 @@ function StaffView(props) {
                     </button>
                   </div>
                   <div className="space-y-0.5 mb-2">
-                    {groupPlayers.map(p => {
+                    {groupPlayers.map((p, slot) => {
                       const canSwapHere = !!_dragId && _dragId !== p.id;
                       return (
+                      <React.Fragment key={p.id}>
+                      {showTeams && slot % 2 === 0 && (
+                        <div className="text-[10px] font-bold tracking-widest text-zinc-600 pt-0.5">
+                          {queueCopy.team(slot / 2 + 1)}
+                        </div>
+                      )}
                       <div
-                        key={p.id}
                         draggable
                         onDragStart={e => {
                           _dragId = p.id; // synchronous — readable by dragover handlers immediately
@@ -2117,13 +2150,14 @@ function StaffView(props) {
                           <X className="w-3.5 h-3.5" />
                         </button>
                       </div>
+                      </React.Fragment>
                       );
                     })}
                     {groupPlayers.length < 4 && (
                       <div className={`text-xs italic ${canDrop ? 'text-lime-400' : 'text-amber-500'}`}>
                         {canDrop
-                          ? `Drop to add here · ${4 - groupPlayers.length} spot${4 - groupPlayers.length > 1 ? 's' : ''} left`
-                          : `Incomplete — ${4 - groupPlayers.length} more needed`}
+                          ? queueCopy.dropHere(4 - groupPlayers.length)
+                          : queueCopy.incomplete(4 - groupPlayers.length)}
                       </div>
                     )}
                   </div>
@@ -2132,7 +2166,7 @@ function StaffView(props) {
                     disabled={groupPlayers.length < 4}
                     className="w-full bg-zinc-800 hover:bg-lime-400 hover:text-zinc-950 text-sm font-semibold py-1.5 rounded-lg flex items-center justify-center gap-2 transition disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-zinc-800 disabled:hover:text-current"
                   >
-                    Assign to court <ChevronRight className="w-4 h-4" />
+                    {queueCopy.assign} <ChevronRight className="w-4 h-4" />
                   </button>
                 </div>
               );
@@ -2615,7 +2649,9 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                 const groupPlayers = g.players.map(playerById).filter(Boolean);
                 const hasFreeCourt = courts.some(c => c.type === 'open' && !c.match);
                 const isImmediateNext = idx === 0 && hasFreeCourt && groupPlayers.length >= 4;
-                const isAutoBalanced = g.type === 'auto' && groupPlayers.length === 4;
+                // Every complete group is snake-drafted into two teams, however
+                // it was built, so the board can always show the sides.
+                const isAutoBalanced = groupPlayers.length === 4;
 
                 return (
                   <div
@@ -2709,18 +2745,41 @@ const RENTAL_DURATIONS = [
 function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDuration, onAssign, onClose }) {
   if (!group) return null;
   const openCourts = courts.filter(c => !c.match);
+  // Winners/Losers suggests an end of the ladder; it is only ever a suggestion,
+  // so the suggested court is highlighted and every other court still works.
+  const suggestedId = suggestCourtFor(group, courts);
+  const hint = queueCopy.hint[group.preferredCourt] ?? null;
 
   return (
     <ModalShell onClose={onClose} title={modals.assign.title} wide>
       <div className="mb-4">
-        <p className="text-sm text-zinc-400 mb-2">{modals.assign.groupLabel}</p>
-        <div className="bg-zinc-950 rounded-lg p-2 space-y-1">
-          {group.players.map(id => {
-            const p = playerById(id);
-            return p ? (
-              <div key={id} className="text-sm">{p.name} <span className="text-zinc-500">· {p.skill}</span></div>
-            ) : null;
-          })}
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <p className="text-sm text-zinc-400">{modals.assign.groupLabel}</p>
+          {hint && (
+            <span
+              className="text-xs text-cyan-300 bg-cyan-950 border border-cyan-900 px-2 py-0.5 rounded-full"
+              title={queueCopy.hintTitle}
+            >
+              {hint}
+            </span>
+          )}
+        </div>
+        {/* The four in their team order — the same split the queue card shows,
+            so what staff confirm here is what walks onto the court. */}
+        <div className="bg-zinc-950 rounded-lg p-2 grid grid-cols-2 gap-2">
+          {[0, 1].map(team => (
+            <div key={team}>
+              <div className="text-[10px] font-bold tracking-widest text-zinc-600 mb-1">
+                {queueCopy.team(team + 1)}
+              </div>
+              {group.players.slice(team * 2, team * 2 + 2).map(id => {
+                const p = playerById(id);
+                return p ? (
+                  <div key={id} className="text-sm">{p.name} <span className="text-zinc-500">· {p.skill}</span></div>
+                ) : null;
+              })}
+            </div>
+          ))}
         </div>
       </div>
 
@@ -2732,9 +2791,12 @@ function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDu
           {openCourts.map(c => {
             const isRental = c.type === 'rental';
             const durations = isRental ? RENTAL_DURATIONS : OPEN_DURATIONS;
+            const suggested = !isRental && c.id === suggestedId && !!hint;
             return (
               <div key={c.id} className={`rounded-lg p-3 border-2 ${
-                isRental ? 'bg-amber-950 bg-opacity-30 border-amber-800 border-dashed' : 'bg-zinc-950 border-zinc-800'
+                isRental ? 'bg-amber-950 bg-opacity-30 border-amber-800 border-dashed'
+                : suggested ? 'bg-zinc-950 border-cyan-700'
+                : 'bg-zinc-950 border-zinc-800'
               }`}>
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
@@ -2743,6 +2805,9 @@ function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDu
                       <span className="text-[10px] font-bold tracking-widest bg-amber-500 text-zinc-950 px-1.5 py-0.5 rounded">{modals.assign.rentalTag}</span>
                     ) : (
                       <span className="text-[10px] font-bold tracking-widest text-zinc-500">{modals.assign.openPlayTag}</span>
+                    )}
+                    {suggested && (
+                      <span className="text-[10px] font-bold tracking-widest text-cyan-300">{modals.assign.suggestedTag}</span>
                     )}
                   </div>
                   {!isRental && !competitiveMode && defaultOpenDuration && (

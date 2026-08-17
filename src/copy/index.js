@@ -15,6 +15,7 @@ export { auth, activate } from './auth';
 export { tvDisplay, clubBoard, connection, qrPoster } from './board';
 export { settings, matchReveal } from './settings';
 export { matchingStyles, payments } from './matching';
+export { queue } from './queue';
 
 // Namespaced rather than spread: `modals.checkout.title` reads better than a
 // flat `checkoutTitle`, and every dialog has a `title`.

@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import {
-  runAutoPass,
+  generateAutoQueueGroups,
+  assignQueuedGroupToCourt,
+  suggestCourtFor,
+  preferredCourtFor,
   buildHistoryIndex,
   courtRoles,
   draftTeams,
@@ -14,7 +17,7 @@ import { playerValue } from './logic.js';
    HARNESS
    Everything here is deterministic on purpose: fixed ids, fixed check-in order,
    an injected clock, and a simulated match that always awards the win to team 1.
-   Two runs of the same scenario must produce byte-identical output.
+   Two runs of the same scenario must produce identical output.
    ───────────────────────────────────────────── */
 
 const mkPlayers = (n, from = 1) =>
@@ -37,7 +40,10 @@ const mkCourts = (n) =>
     match: null,
   }));
 
-const withMatch = (court, ids) => ({ ...court, match: { players: ids, startedAt: 0 } });
+const withMatch = (court, ids, startedAt = 0) => ({
+  ...court,
+  match: { players: ids, startedAt, endsAt: null, durationMin: null },
+});
 
 const result = (id, ids) => ({
   id,
@@ -49,88 +55,23 @@ const result = (id, ids) => ({
   finishedAt: 0,
 });
 
-// Apply a pass the way App does, then finish every match on court.
-function playRound(state, { matchingStyle = 'balanced', now = 0 } = {}) {
-  const res = runAutoPass({ ...state, matchingStyle, now });
+const group = (id, players, extra = {}) => ({
+  id,
+  players,
+  type: 'manual',
+  createdAt: 100,
+  ...extra,
+});
 
-  let courts = state.courts.map((c) => {
-    const a = res.assignments.find((x) => x.courtId === c.id);
-    return a ? { ...c, match: { players: a.playerIds, startedAt: now } } : c;
-  });
-
-  const finished = [];
-  courts = courts.map((c) => {
-    if (!c.match) return c;
-    finished.push(result(`h-${now}-${c.id}`, c.match.players));
-    return { ...c, match: null };
-  });
-
-  const won = new Set(finished.flatMap((f) => f.winners));
-  const lost = new Set(finished.flatMap((f) => f.losers));
-
-  return {
-    res,
-    state: {
-      players: state.players.map((p) =>
-        won.has(p.id)
-          ? { ...p, wins: p.wins + 1 }
-          : lost.has(p.id)
-          ? { ...p, losses: p.losses + 1 }
-          : p
-      ),
-      courts,
-      queue: res.queue,
-      // Newest first, and the courts within one round are ordered c1 → cN, so
-      // reversing them keeps "later court finished later".
-      history: [...finished.reverse(), ...state.history],
-    },
-  };
-}
-
-function simulate({ players, courts, rounds, matchingStyle = 'balanced' }) {
-  let state = { players, courts, queue: [], history: [] };
-  const passes = [];
-  for (let r = 0; r < rounds; r++) {
-    const step = playRound(state, { matchingStyle, now: r * 60_000 });
-    passes.push(step.res);
-    state = step.state;
-  }
-  return { state, passes };
-}
-
-// Who is left on the bench after a pass.
-const availableAfter = (players, courts, queue, assignments) => {
+// Who is left on the bench once a pass has run.
+const availableAfter = (players, courts, queue) => {
   const busy = new Set();
   courts.forEach((c) => (c.match?.players ?? []).forEach((id) => busy.add(id)));
   queue.forEach((g) => g.players.forEach((id) => busy.add(id)));
-  assignments.forEach((a) => a.playerIds.forEach((id) => busy.add(id)));
   return players.filter((p) => !p.checkedOut && !busy.has(p.id));
 };
 
-// Every same-4 repeat in a finished history, with how many matches each member
-// played in between. A cooldown violation is one where somebody played fewer
-// than COOLDOWN_MATCHES.
-function sameFourViolations(history) {
-  const out = [];
-  const seen = new Map();
-  // Oldest first, so "later" means a higher position.
-  const chron = [...history].reverse();
-  const played = new Map();
-  chron.forEach((h, i) => {
-    const key = [...h.players].sort().join('|');
-    if (seen.has(key)) {
-      const at = seen.get(key);
-      const gaps = h.players.map((id) => (played.get(id) ?? []).filter((j) => j > at).length);
-      if (gaps.some((g) => g < COOLDOWN_MATCHES)) out.push({ key, at, i, gaps });
-    }
-    seen.set(key, i);
-    h.players.forEach((id) => {
-      if (!played.has(id)) played.set(id, []);
-      played.get(id).push(i);
-    });
-  });
-  return out;
-}
+const allQueued = (queue) => queue.flatMap((g) => g.players);
 
 /* ── combinations ────────────────────────────── */
 describe('combinations', () => {
@@ -146,17 +87,17 @@ describe('combinations', () => {
   });
 });
 
-/* ── snake draft (spec §5) ───────────────────── */
+/* ── snake draft ─────────────────────────────── */
 describe('draftTeams', () => {
   const order = checkInOrder(mkPlayers(4));
 
   it('pairs the highest value with the lowest, and the middle two together', () => {
     const [a, b, c, d] = mkPlayers(4);
     const four = [
-      { ...a, wins: 4 },  // value 4   — highest
-      { ...b, wins: 2 },  // value 2
-      { ...c, wins: 1 },  // value 1
-      { ...d, losses: 2 } // value -1  — lowest
+      { ...a, wins: 4 },   // value  4 — highest
+      { ...b, wins: 2 },   // value  2
+      { ...c, wins: 1 },   // value  1
+      { ...d, losses: 2 }, // value -1 — lowest
     ];
     const drafted = draftTeams(four, order);
     expect([drafted[0].id, drafted[1].id]).toEqual(['p1', 'p4']);
@@ -180,7 +121,7 @@ describe('draftTeams', () => {
   });
 });
 
-/* ── history index (spec §6) ─────────────────── */
+/* ── history index ───────────────────────────── */
 describe('buildHistoryIndex', () => {
   it('reads the immediately previous result per player', () => {
     const H = buildHistoryIndex([result('h1', ['p1', 'p2', 'p3', 'p4'])]);
@@ -205,7 +146,7 @@ describe('buildHistoryIndex', () => {
     expect(buildHistoryIndex([first]).opponentBlocked('p1', 'p3')).toBe(true);
 
     // p1 and p3 each play two more — as PARTNERS, so they never face each other
-    // again in the meantime and only the cooldown can unblock them.
+    // in the meantime and only the cooldown can unblock them.
     const withTwo = [
       result('h3', ['p1', 'p3', 'p7', 'p8']),
       result('h2', ['p1', 'p3', 'p5', 'p6']),
@@ -220,7 +161,6 @@ describe('buildHistoryIndex', () => {
       result('h2', ['p5', 'p6', 'p7', 'p8']),
       result('h1', ['p1', 'p2', 'p3', 'p4']),
     ];
-    // Two matches have happened since, but p1 and p3 played in neither.
     expect(buildHistoryIndex(history).opponentBlocked('p1', 'p3')).toBe(true);
   });
 
@@ -233,349 +173,528 @@ describe('buildHistoryIndex', () => {
   });
 });
 
-/* ── court roles (spec §4A) ──────────────────── */
-describe('courtRoles', () => {
-  it('makes court 1 high and the last court low', () => {
+/* ─────────────────────────────────────────────
+   THE SCREENSHOT REGRESSION
+   Two courts playing, one complete group already queued, eight on the bench.
+   The old build refused with "courts are busy and a group is already waiting".
+   ───────────────────────────────────────────── */
+describe('regression: 8 Playing + Queue[4] + 8 Available', () => {
+  // p1..p8 on court, p9..p12 queued, p13..p20 free.
+  const build = () => ({
+    players: mkPlayers(20),
+    courts: [
+      withMatch(mkCourts(2)[0], ['p1', 'p2', 'p3', 'p4'], 500),
+      withMatch(mkCourts(2)[1], ['p5', 'p6', 'p7', 'p8'], 600),
+    ],
+    queue: [group('existing', ['p9', 'p10', 'p11', 'p12'], { type: 'auto' })],
+  });
+
+  const run = () => {
+    const world = build();
+    return { ...world, res: generateAutoQueueGroups({ ...world, history: [], now: 9_000 }) };
+  };
+
+  it('creates exactly two more complete groups', () => {
+    const { res } = run();
+    expect(res.created).toHaveLength(2);
+    expect(res.queue).toHaveLength(3);
+    expect(res.queue.every((g) => g.players.length === 4)).toBe(true);
+  });
+
+  it('leaves nobody on the bench', () => {
+    const { players, courts, res } = run();
+    expect(res.remaining).toBe(0);
+    expect(availableAfter(players, courts, res.queue)).toHaveLength(0);
+  });
+
+  it('leaves the courts and the eight players on them completely alone', () => {
+    const { courts, res } = run();
+    // The engine returns no court state at all — there is nothing it could change.
+    expect(res).not.toHaveProperty('assignments');
+    expect(res).not.toHaveProperty('courts');
+    expect(courts[0].match.players).toEqual(['p1', 'p2', 'p3', 'p4']);
+    expect(courts[0].match.startedAt).toBe(500);
+    expect(courts[1].match.startedAt).toBe(600);
+  });
+
+  it('keeps the existing group first and unchanged, and reports no refusal', () => {
+    const { res } = run();
+    expect(res.queue[0].id).toBe('existing');
+    expect(res.queue[0].players).toEqual(['p9', 'p10', 'p11', 'p12']);
+    expect(res.queue[0].createdAt).toBe(100);
+    expect(res.reason).toBeNull();
+  });
+});
+
+/* ─────────────────────────────────────────────
+   AUTO BUILDS EVERY GROUP IT CAN
+   ───────────────────────────────────────────── */
+describe('generateAutoQueueGroups', () => {
+  it('20 Available and two empty courts → five groups, both courts still empty', () => {
+    const players = mkPlayers(20);
+    const courts = mkCourts(2);
+    const res = generateAutoQueueGroups({ players, courts, queue: [], history: [], now: 0 });
+    expect(res.created).toHaveLength(5);
+    expect(res.queue).toHaveLength(5);
+    expect(allQueued(res.queue)).toHaveLength(20);
+    expect(courts.every((c) => !c.match)).toBe(true);
+    expect(res.remaining).toBe(0);
+  });
+
+  it('nine Available → two groups and one player left over', () => {
+    const players = mkPlayers(9);
+    const courts = mkCourts(2);
+    const res = generateAutoQueueGroups({ players, courts, queue: [], history: [], now: 0 });
+    expect(res.created).toHaveLength(2);
+    expect(res.remaining).toBe(1);
+    expect(availableAfter(players, courts, res.queue)).toHaveLength(1);
+  });
+
+  it('never leaves a group of one, two or three behind', () => {
+    for (const n of [4, 5, 6, 7, 8, 11, 13, 17]) {
+      const res = generateAutoQueueGroups({
+        players: mkPlayers(n), courts: mkCourts(2), queue: [], history: [], now: 0,
+      });
+      expect(res.created).toHaveLength(Math.floor(n / 4));
+      expect(res.queue.every((g) => g.players.length === 4)).toBe(true);
+      expect(res.remaining).toBe(n % 4);
+    }
+  });
+
+  it('says so truthfully when it cannot build anything', () => {
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(3), courts: mkCourts(2), queue: [], history: [], now: 0,
+    });
+    expect(res.created).toEqual([]);
+    expect(res.reason).toBe('noFullGroupPossible');
+    expect(res.remaining).toBe(3);
+    expect(res.queue).toEqual([]);
+  });
+
+  it('tops a manual partial up first, keeping its members, then builds the rest', () => {
+    // Two manual members plus ten Available: the partial fills, then two more
+    // complete groups come out of the remaining eight.
+    const players = mkPlayers(12);
+    const queue = [group('manual', ['p1', 'p2'])];
+    const res = generateAutoQueueGroups({
+      players, courts: mkCourts(2), queue, history: [], now: 7_000,
+    });
+
+    const topped = res.queue.find((g) => g.id === 'manual');
+    expect(topped.players).toHaveLength(4);
+    expect(topped.players).toEqual(expect.arrayContaining(['p1', 'p2']));
+    expect(topped.type).toBe('manual');
+    expect(topped.createdAt).toBe(100); // topping up does not restart the wait
+    expect(res.toppedUp).toEqual(['manual']);
+    expect(res.created).toHaveLength(2);
+    expect(res.remaining).toBe(0);
+  });
+
+  it('leaves a partial alone when the bench cannot complete it', () => {
+    const players = mkPlayers(3);
+    const queue = [group('manual', ['p1', 'p2', 'p3'])];
+    const res = generateAutoQueueGroups({
+      players, courts: mkCourts(1), queue, history: [], now: 0,
+    });
+    expect(res.queue).toEqual(queue);
+    expect(res.reason).toBe('noFullGroupPossible');
+  });
+
+  it('puts the longest-waiting player in the group that plays next', () => {
+    // p1..p4 just came off court, p5..p8 have never played. p5 is the longest
+    // waiter, so whichever group they end up in has to be Queue #1.
+    const players = mkPlayers(8);
+    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
+    const res = generateAutoQueueGroups({
+      players, courts: mkCourts(2), queue: [], history, now: 0,
+    });
+    expect(res.queue[0].players).toContain('p5');
+  });
+
+  it('mixes a batch rather than leaving the last group to be the previous four', () => {
+    // The only way to use all eight without rebuilding p1..p4 is to split them
+    // across both groups — which greedy grouping alone would never find.
+    const players = mkPlayers(8);
+    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
+    const res = generateAutoQueueGroups({
+      players, courts: mkCourts(2), queue: [], history, now: 0,
+    });
+    const H = buildHistoryIndex(history);
+    expect(res.queue).toHaveLength(2);
+    for (const g of res.queue) expect(H.quadBlocked(g.players)).toBe(false);
+  });
+
+  it('avoids a recent rematch when a valid alternative exists', () => {
+    const players = mkPlayers(8);
+    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
+    const res = generateAutoQueueGroups({
+      players, courts: mkCourts(2), queue: [], history, now: 0,
+    });
+    const H = buildHistoryIndex(history);
+    for (const g of res.queue) {
+      const [a, b, c, d] = g.players;
+      for (const x of [a, b]) {
+        for (const y of [c, d]) expect(H.opponentBlocked(x, y)).toBe(false);
+      }
+    }
+    expect(res.log.filter((l) => l.step === 'create').every((l) => l.rung === 'strict')).toBe(true);
+  });
+
+  it('falls back rather than failing to make a playable group', () => {
+    // Only the four who just played are free, so every option repeats.
+    const players = mkPlayers(4);
+    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
+    const res = generateAutoQueueGroups({
+      players, courts: mkCourts(1), queue: [], history, now: 0,
+    });
+    expect(res.created).toHaveLength(1);
+    expect(res.queue[0].players).toHaveLength(4);
+    expect(res.log.find((l) => l.step === 'create').rung).toBe('giveUp');
+  });
+
+  it('records nothing in history merely by queueing a group', () => {
+    const history = [];
+    generateAutoQueueGroups({
+      players: mkPlayers(8), courts: mkCourts(2), queue: [], history, now: 0,
+    });
+    expect(history).toEqual([]);
+  });
+
+  it('ignores checked-out players and anyone already on a court or in the queue', () => {
+    const players = mkPlayers(12).map((p) => (p.id === 'p12' ? { ...p, checkedOut: true } : p));
+    const courts = [withMatch(mkCourts(1)[0], ['p1', 'p2', 'p3', 'p4'])];
+    const queue = [group('q', ['p5', 'p6', 'p7', 'p8'], { type: 'auto' })];
+    const res = generateAutoQueueGroups({ players, courts, queue, history: [], now: 0 });
+    // p9, p10, p11 are free; p12 has gone home. Not a full four.
+    expect(res.created).toEqual([]);
+    expect(res.remaining).toBe(3);
+  });
+});
+
+/* ── idempotence and purity ──────────────────── */
+describe('pressing Auto twice', () => {
+  it('changes nothing on the second press when nobody new is Available', () => {
+    const players = mkPlayers(8);
+    const courts = mkCourts(2);
+    const first = generateAutoQueueGroups({
+      players, courts, queue: [], history: [], now: 1_000,
+    });
+    const second = generateAutoQueueGroups({
+      players, courts, queue: first.queue, history: [], now: 2_000,
+    });
+    expect(second.queue).toEqual(first.queue);
+    expect(second.created).toEqual([]);
+    expect(second.toppedUp).toEqual([]);
+    expect(second.reason).toBe('noFullGroupPossible');
+    expect(second.queue.map((g) => g.id)).toEqual(first.queue.map((g) => g.id));
+  });
+
+  it('picks up where it left off once four more players check in', () => {
+    const eight = mkPlayers(8);
+    const courts = mkCourts(2);
+    const first = generateAutoQueueGroups({
+      players: eight, courts, queue: [], history: [], now: 1_000,
+    });
+    const twelve = [...eight, ...mkPlayers(4, 9)];
+    const second = generateAutoQueueGroups({
+      players: twelve, courts, queue: first.queue, history: [], now: 2_000,
+    });
+    expect(second.created).toHaveLength(1);
+    expect(second.queue.slice(0, 2)).toEqual(first.queue);
+  });
+
+  it('does not mutate the inputs it is given', () => {
+    const players = mkPlayers(12);
+    const courts = [withMatch(mkCourts(2)[0], ['p1', 'p2', 'p3', 'p4'])];
+    const queue = [group('manual', ['p5', 'p6'])];
+    const snapshot = JSON.stringify({ players, courts, queue });
+    generateAutoQueueGroups({ players, courts, queue, history: [], now: 0 });
+    expect(JSON.stringify({ players, courts, queue })).toBe(snapshot);
+  });
+
+  it('is deterministic for identical state and now', () => {
+    const args = {
+      players: mkPlayers(17), courts: mkCourts(3), queue: [], history: [], now: 4_242,
+    };
+    const a = generateAutoQueueGroups(args);
+    const b = generateAutoQueueGroups(args);
+    expect(b.queue).toEqual(a.queue);
+    expect(b.log).toEqual(a.log);
+  });
+
+  it('does not depend on the order players arrive in the array', () => {
+    const players = mkPlayers(12);
+    const shared = { courts: mkCourts(2), queue: [], history: [], now: 0 };
+    const a = generateAutoQueueGroups({ ...shared, players });
+    const b = generateAutoQueueGroups({ ...shared, players: [...players].reverse() });
+    expect(b.queue.map((g) => [...g.players].sort())).toEqual(
+      a.queue.map((g) => [...g.players].sort())
+    );
+  });
+});
+
+/* ── FIFO ────────────────────────────────────── */
+describe('FIFO', () => {
+  const seeded = () => {
+    const players = mkPlayers(12);
+    const queue = [group('old', ['p1', 'p2', 'p3', 'p4'], { type: 'auto', createdAt: 10 })];
+    const res = generateAutoQueueGroups({
+      players, courts: mkCourts(2), queue, history: [], now: 5_000,
+    });
+    return res;
+  };
+
+  it('keeps an older complete group at the head of the queue', () => {
+    const res = seeded();
+    expect(res.queue[0].id).toBe('old');
+    expect(res.queue.slice(1).every((g) => g.createdAt === 5_000)).toBe(true);
+  });
+
+  it('offers that same head group first for manual court assignment', () => {
+    const res = seeded();
+    const next = assignQueuedGroupToCourt({
+      groupId: res.queue[0].id, courtId: 'c1', courts: mkCourts(2), queue: res.queue, now: 6_000,
+    });
+    expect(next.assigned.playerIds).toEqual(['p1', 'p2', 'p3', 'p4']);
+  });
+});
+
+/* ── Winners / Losers hints ──────────────────── */
+describe('Winners / Losers', () => {
+  const history = [
+    result('h2', ['p5', 'p6', 'p7', 'p8']), // p5,p6 won  p7,p8 lost
+    result('h1', ['p1', 'p2', 'p3', 'p4']), // p1,p2 won  p3,p4 lost
+  ];
+
+  it('reads court roles off the floor, with no ladder on a single court', () => {
     const roles = courtRoles(mkCourts(3));
     expect(roles.get('c1')).toBe('high');
     expect(roles.get('c2')).toBe('neutral');
     expect(roles.get('c3')).toBe('low');
-  });
-
-  it('has no high or low court when there is only one', () => {
     expect(courtRoles(mkCourts(1)).get('c1')).toBe('neutral');
   });
-});
 
-/* ── the four-player guard (spec §1, §12.1) ──── */
-describe('four-player guard', () => {
-  it('does nothing at all with three players, however many courts are free', () => {
-    const players = mkPlayers(3);
-    const res = runAutoPass({ players, courts: mkCourts(4), queue: [], history: [], now: 0 });
-    expect(res.reason).toBe('needMorePlayers');
-    expect(res.assignments).toEqual([]);
-    expect(res.queue).toEqual([]);
+  it('hints high for a winners group and low for a losers group', () => {
+    const H = buildHistoryIndex(history);
+    const winners = mkPlayers(8).filter((p) => ['p1', 'p2', 'p5', 'p6'].includes(p.id));
+    const losers = mkPlayers(8).filter((p) => ['p3', 'p4', 'p7', 'p8'].includes(p.id));
+    expect(preferredCourtFor(winners, H, { wl: true })).toBe('high');
+    expect(preferredCourtFor(losers, H, { wl: true })).toBe('low');
+    expect(preferredCourtFor(winners, H, { wl: false })).toBe('any');
   });
 
-  it('counts players already sitting in a queue group towards the four', () => {
-    const players = mkPlayers(4);
-    const queue = [{ id: 'g1', players: ['p1', 'p2', 'p3'], type: 'manual', createdAt: 0 }];
-    const res = runAutoPass({ players, courts: mkCourts(1), queue, history: [], now: 0 });
-    expect(res.reason).not.toBe('needMorePlayers');
-    expect(res.assignments).toHaveLength(1);
-    expect(res.assignments[0].playerIds).toHaveLength(4);
-  });
-
-  it('never puts fewer than four players on a court', () => {
-    const players = mkPlayers(7);
-    const res = runAutoPass({ players, courts: mkCourts(2), queue: [], history: [], now: 0 });
-    expect(res.assignments).toHaveLength(1);
-    expect(res.assignments[0].playerIds).toHaveLength(4);
-  });
-});
-
-/* ── the worked examples from the spec (§2) ──── */
-describe('Auto pass — consumption limits (spec §2, §7)', () => {
-  it('two empty courts + 12 available → two courts and one waiting group, nobody left', () => {
-    const players = mkPlayers(12);
-    const courts = mkCourts(2);
-    const res = runAutoPass({ players, courts, queue: [], history: [], now: 5_000 });
-    expect(res.assignments).toHaveLength(2);
-    expect(res.created).toHaveLength(1);
-    expect(res.queue).toHaveLength(1);
-    expect(res.queue[0].players).toHaveLength(4);
-    expect(availableAfter(players, courts, res.queue, res.assignments)).toHaveLength(0);
-  });
-
-  it('two empty courts + 5 available → one court filled, one player still waiting', () => {
-    const players = mkPlayers(5);
-    const courts = mkCourts(2);
-    const res = runAutoPass({ players, courts, queue: [], history: [], now: 0 });
-    expect(res.assignments).toHaveLength(1);
-    expect(res.created).toHaveLength(0);
-    expect(availableAfter(players, courts, res.queue, res.assignments)).toHaveLength(1);
-    expect(res.log).toContainEqual(
-      expect.objectContaining({ step: 'fill', filled: false, reason: 'noEligibleFour' })
-    );
-  });
-
-  it('two empty courts + 20 available → three groups and eight left over', () => {
-    const players = mkPlayers(20);
-    const courts = mkCourts(2);
-    const res = runAutoPass({ players, courts, queue: [], history: [], now: 0 });
-    expect(res.assignments).toHaveLength(2);
-    expect(res.created).toHaveLength(1);
-    expect(availableAfter(players, courts, res.queue, res.assignments)).toHaveLength(8);
-  });
-
-  it('no empty courts + 8 available → exactly one waiting group', () => {
+  it('hints only — it never puts a group on a court', () => {
     const players = mkPlayers(8);
-    const courts = [withMatch(mkCourts(1)[0], ['x1', 'x2', 'x3', 'x4'])];
-    const res = runAutoPass({ players, courts, queue: [], history: [], now: 0 });
-    expect(res.assignments).toHaveLength(0);
-    expect(res.created).toHaveLength(1);
-    expect(availableAfter(players, courts, res.queue, res.assignments)).toHaveLength(4);
-  });
-
-  it('will not build a second waiting group while one already waits', () => {
-    const players = mkPlayers(8);
-    const courts = [withMatch(mkCourts(1)[0], ['x1', 'x2', 'x3', 'x4'])];
-    const queue = [{ id: 'g1', players: ['p1', 'p2', 'p3', 'p4'], type: 'auto', createdAt: 0 }];
-    const res = runAutoPass({ players, courts, queue, history: [], now: 0 });
-    expect(res.created).toHaveLength(0);
-    expect(res.queue).toHaveLength(1);
-    expect(res.log).toContainEqual(
-      expect.objectContaining({ step: 'waiting', reason: 'waitingGroupExists' })
-    );
-  });
-});
-
-/* ── timestamps (spec §9) ────────────────────── */
-describe('group timestamps', () => {
-  it('stamps a new group with the injected now, never the wall clock', () => {
-    const res = runAutoPass({
-      players: mkPlayers(12),
-      courts: mkCourts(2),
-      queue: [],
-      history: [],
-      now: 1_700_000_000_000,
-    });
-    expect(res.queue[0].createdAt).toBe(1_700_000_000_000);
-  });
-
-  it('does not refresh createdAt when a partial group is topped up', () => {
-    const players = mkPlayers(6);
-    const courts = [withMatch(mkCourts(1)[0], ['x1', 'x2', 'x3', 'x4'])];
-    const queue = [{ id: 'g1', players: ['p1', 'p2'], type: 'manual', createdAt: 111 }];
-    const res = runAutoPass({ players, courts, queue, history: [], now: 999_999 });
-    const g = res.queue.find((x) => x.id === 'g1');
-    expect(g.players).toHaveLength(4);
-    expect(g.createdAt).toBe(111);
-  });
-});
-
-/* ── FIFO and immutable complete groups (spec §3.1) ── */
-describe('queue consumption order', () => {
-  it('takes the oldest complete group first, whatever order the array is in', () => {
-    const players = mkPlayers(8);
-    const queue = [
-      { id: 'young', players: ['p5', 'p6', 'p7', 'p8'], type: 'auto', createdAt: 900 },
-      { id: 'old', players: ['p1', 'p2', 'p3', 'p4'], type: 'manual', createdAt: 100 },
-    ];
-    const res = runAutoPass({ players, courts: mkCourts(1), queue, history: [], now: 0 });
-    expect(res.assignments[0].groupId).toBe('old');
-  });
-
-  it('never rewrites a complete group at assignment time', () => {
-    const players = mkPlayers(10);
-    const queue = [{ id: 'g1', players: ['p7', 'p8', 'p9', 'p10'], type: 'auto', createdAt: 1 }];
-    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
-    const res = runAutoPass({ players, courts: mkCourts(1), queue, history, now: 0 });
-    expect([...res.assignments[0].playerIds].sort()).toEqual(['p10', 'p7', 'p8', 'p9']);
-  });
-
-  it('skips a complete group that would repeat the same four, then takes the next', () => {
-    const players = mkPlayers(8);
-    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
-    const queue = [
-      { id: 'repeat', players: ['p1', 'p2', 'p3', 'p4'], type: 'auto', createdAt: 100 },
-      { id: 'fresh', players: ['p5', 'p6', 'p7', 'p8'], type: 'auto', createdAt: 200 },
-    ];
-    const res = runAutoPass({ players, courts: mkCourts(1), queue, history, now: 0 });
-    expect(res.assignments[0].groupId).toBe('fresh');
-    expect(res.queue.map((g) => g.id)).toContain('repeat');
-  });
-
-  it('assigns the oldest anyway rather than deadlocking when every group repeats', () => {
-    const players = mkPlayers(4);
-    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
-    const queue = [{ id: 'only', players: ['p1', 'p2', 'p3', 'p4'], type: 'auto', createdAt: 1 }];
-    const res = runAutoPass({ players, courts: mkCourts(1), queue, history, now: 0 });
-    expect(res.assignments[0].groupId).toBe('only');
-    expect(res.log).toContainEqual(
-      expect.objectContaining({ step: 'fill', escape: 'allRepeatTakeOldest' })
-    );
-  });
-});
-
-/* ── partial groups (spec §3.2, §7) ──────────── */
-describe('manual partial groups', () => {
-  it('tops up a partial before building anything new from Available', () => {
-    const players = mkPlayers(8);
-    const queue = [{ id: 'g1', players: ['p1', 'p2'], type: 'manual', createdAt: 1 }];
-    const res = runAutoPass({ players, courts: mkCourts(1), queue, history: [], now: 0 });
-    expect(res.assignments[0].groupId).toBe('g1');
-    expect(res.assignments[0].playerIds).toEqual(expect.arrayContaining(['p1', 'p2']));
-  });
-
-  it('leaves a partial intact when Available cannot complete it', () => {
-    const players = mkPlayers(4);
-    const courts = [withMatch(mkCourts(1)[0], ['p3', 'p4'])];
-    const queue = [{ id: 'g1', players: ['p1'], type: 'manual', createdAt: 1 }];
-    const res = runAutoPass({ players, courts, queue, history: [], now: 0 });
-    expect(res.queue).toEqual(queue);
-  });
-
-  it('still tops the oldest partial up when courts are full and a group already waits', () => {
-    const players = mkPlayers(8);
-    const courts = [withMatch(mkCourts(1)[0], ['x1', 'x2', 'x3', 'x4'])];
-    const queue = [
-      { id: 'partial', players: ['p1', 'p2'], type: 'manual', createdAt: 10 },
-      { id: 'waiting', players: ['p3', 'p4', 'p5', 'p6'], type: 'auto', createdAt: 20 },
-    ];
-    const res = runAutoPass({ players, courts, queue, history: [], now: 0 });
-    expect(res.queue.find((g) => g.id === 'partial').players).toHaveLength(4);
-    expect(res.created).toHaveLength(0);
-  });
-
-  it('picks top-up players closest to the partial group’s own mean value', () => {
-    const players = mkPlayers(8).map((p, i) =>
-      // p1,p2 sit on 3; p3..p6 on 0; p7,p8 on 3 as well.
-      i < 2 || i > 5 ? { ...p, wins: 3 } : p
-    );
-    const queue = [{ id: 'g1', players: ['p1', 'p2'], type: 'manual', createdAt: 1 }];
-    const res = runAutoPass({ players, courts: mkCourts(1), queue, history: [], now: 0 });
-    expect([...res.assignments[0].playerIds].sort()).toEqual(['p1', 'p2', 'p7', 'p8']);
-  });
-});
-
-/* ── Winners / Losers (spec §4) ──────────────── */
-describe('Winners / Losers mode', () => {
-  // p1..p4 played: p1,p2 won and p3,p4 lost. p5..p8 have never played.
-  const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
-
-  it('is inactive with a single court — both mechanisms need a high and a low', () => {
-    const players = mkPlayers(8);
-    const shared = { players, courts: mkCourts(1), queue: [], history, now: 0 };
-    const ladder = runAutoPass({ ...shared, matchingStyle: 'winnersLosers' });
-    const balanced = runAutoPass({ ...shared, matchingStyle: 'balanced' });
-    expect(ladder.assignments).toEqual(balanced.assignments);
-    expect(ladder.log.find((l) => l.step === 'fill').role).toBe('neutral');
-  });
-
-  it('forces a previous-match loser into a group formed for an empty low court', () => {
-    // p3 and p4 WON the last match; p1 and p2 lost it but are the two strongest
-    // players on the floor, so value proximity on its own would leave them out
-    // of the low court's group entirely. Only rule 4B can pull one in.
-    const beaten = [result('h1', ['p3', 'p4', 'p1', 'p2'])];
-    const players = mkPlayers(8).map((p) =>
-      ['p1', 'p2'].includes(p.id) ? { ...p, wins: 2, losses: 1 }
-      : ['p3', 'p4'].includes(p.id) ? { ...p, wins: 1 }
-      : p
-    );
-    const courts = [withMatch(mkCourts(2)[0], ['x1', 'x2', 'x3', 'x4']), mkCourts(2)[1]];
-    const res = runAutoPass({
-      players, courts, queue: [], history: beaten, now: 0, matchingStyle: 'winnersLosers',
-    });
-    const fill = res.log.find((l) => l.step === 'fill' && l.filled);
-    expect(fill.role).toBe('low');
-    expect(fill.forcedLoser).toBe(true);
-    expect(res.assignments[0].playerIds.some((id) => ['p1', 'p2'].includes(id))).toBe(true);
-  });
-
-  it('drops to relax2 when forcing that loser in repeats an opponent', () => {
-    // p3 and p9 beat p4 and p10. p10 is still on court, so p4 is the only
-    // selectable loser — and the cheapest group for the low court is built
-    // around BOTH of the players who just beat them. Swapping p4 in for the
-    // lower-valued of those two leaves the other one facing p4 again.
-    const beaten = [result('h1', ['p3', 'p9', 'p4', 'p10'])];
-    const players = mkPlayers(10).map((p) => {
-      if (p.id === 'p3') return { ...p, wins: 1, losses: 1 }; // 0.5 — winner
-      if (p.id === 'p9') return { ...p, wins: 1 };            // 1.0 — winner
-      if (p.id === 'p4') return { ...p, wins: 2, losses: 1 }; // 1.5 — the loser
-      if (p.id === 'p1' || p.id === 'p2') return p;           // 0.0 — neutral
-      return { ...p, wins: 2 };                               // 2.0 — neutral
-    });
-    const courts = [
-      withMatch(mkCourts(2)[0], ['p10', 'x1', 'x2', 'x3']),
-      mkCourts(2)[1],
-    ];
-    const res = runAutoPass({
-      players, courts, queue: [], history: beaten, now: 0, matchingStyle: 'winnersLosers',
-    });
-    const fill = res.log.find((l) => l.step === 'fill' && l.filled);
-    expect(fill.forcedLoser).toBe(true);
-    expect(fill.rung).toBe('relax2');
-    expect(res.assignments[0].playerIds).toContain('p4');
-  });
-
-  it('fills the low court anyway when no previous-match loser is selectable', () => {
-    // Everyone free is a winner or a newcomer; the two losers are on court.
-    const players = mkPlayers(8);
-    const courts = [
-      withMatch(mkCourts(2)[0], ['p3', 'p4', 'p7', 'p8']),
-      mkCourts(2)[1],
-    ];
-    const res = runAutoPass({
+    const courts = mkCourts(2); // both empty, and both must stay empty
+    const res = generateAutoQueueGroups({
       players, courts, queue: [], history, now: 0, matchingStyle: 'winnersLosers',
     });
-    expect(res.assignments).toHaveLength(1);
-    expect(res.assignments[0].playerIds).toHaveLength(4);
+    expect(res.created).toHaveLength(2);
+    expect(courts.every((c) => !c.match)).toBe(true);
+    expect(res.queue.every((g) => ['high', 'low', 'any'].includes(g.preferredCourt))).toBe(true);
   });
 
-  it('does not rewrite an all-winner complete group sent to the low court', () => {
-    const players = mkPlayers(8);
-    const courts = [withMatch(mkCourts(2)[0], ['x1', 'x2', 'x3', 'x4']), mkCourts(2)[1]];
-    // p1 and p2 won; give the group two more winners from a second match.
-    const fullHistory = [result('h2', ['p1', 'p2', 'p5', 'p6']), ...history];
-    const queue = [{ id: 'g1', players: ['p1', 'p2', 'p7', 'p8'], type: 'auto', createdAt: 1 }];
-    const res = runAutoPass({
-      players, courts, queue, history: fullHistory, now: 0, matchingStyle: 'winnersLosers',
+  it('clusters recent winners together and recent losers together', () => {
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(8), courts: mkCourts(2), queue: [], history, now: 0,
+      matchingStyle: 'winnersLosers',
     });
-    expect([...res.assignments[0].playerIds].sort()).toEqual(['p1', 'p2', 'p7', 'p8']);
+    expect(res.queue.map((g) => g.preferredCourt).sort()).toEqual(['high', 'low']);
   });
 
-  it('leaves composition to value proximity in balanced mode', () => {
-    const players = mkPlayers(8);
-    const courts = [withMatch(mkCourts(2)[0], ['x1', 'x2', 'x3', 'x4']), mkCourts(2)[1]];
-    const res = runAutoPass({ players, courts, queue: [], history, now: 0, matchingStyle: 'balanced' });
-    expect(res.log.find((l) => l.step === 'fill' && l.filled).role).toBe('neutral');
+  it('uses "any" on a one-court floor, where there is no ladder', () => {
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(8), courts: mkCourts(1), queue: [], history, now: 0,
+      matchingStyle: 'winnersLosers',
+    });
+    expect(res.queue.every((g) => g.preferredCourt === 'any')).toBe(true);
+  });
+
+  it('leaves a pre-existing complete group untouched, hint or not', () => {
+    const players = mkPlayers(12);
+    const queue = [group('existing', ['p1', 'p2', 'p3', 'p4'], { type: 'auto', createdAt: 5 })];
+    const res = generateAutoQueueGroups({
+      players, courts: mkCourts(2), queue, history, now: 0, matchingStyle: 'winnersLosers',
+    });
+    expect(res.queue[0]).toEqual(queue[0]);
+  });
+
+  it('suggests the hinted end of the floor but never forces it', () => {
+    const courts = mkCourts(3);
+    expect(suggestCourtFor({ preferredCourt: 'high' }, courts)).toBe('c1');
+    expect(suggestCourtFor({ preferredCourt: 'low' }, courts)).toBe('c3');
+    expect(suggestCourtFor({ preferredCourt: 'any' }, courts)).toBe('c1');
+    // The hinted court is busy — fall back to whatever is actually open.
+    const busyLow = [courts[0], courts[1], withMatch(courts[2], ['x1', 'x2', 'x3', 'x4'])];
+    expect(suggestCourtFor({ preferredCourt: 'low' }, busyLow)).toBe('c1');
+    expect(suggestCourtFor({ preferredCourt: 'high' }, [])).toBeNull();
   });
 });
 
 /* ─────────────────────────────────────────────
-   REQUIRED SIMULATION 1 — 24 players, 3 courts, 20 rounds (spec §13)
+   MANUAL COURT ASSIGNMENT
    ───────────────────────────────────────────── */
-describe('simulation: 24 players / 3 courts / 20 rounds', () => {
+describe('assignQueuedGroupToCourt', () => {
+  const setup = () => ({
+    courts: mkCourts(2),
+    queue: [
+      group('g1', ['p1', 'p2', 'p3', 'p4'], { type: 'auto' }),
+      group('g2', ['p5', 'p6', 'p7', 'p8'], { type: 'auto' }),
+    ],
+  });
+
+  it('moves exactly those four onto the court and leaves later groups alone', () => {
+    const { courts, queue } = setup();
+    const next = assignQueuedGroupToCourt({
+      groupId: 'g1', courtId: 'c1', courts, queue, now: 5_000, durationMin: 15,
+    });
+    expect(next.courts[0].match.players).toEqual(['p1', 'p2', 'p3', 'p4']);
+    expect(next.courts[1].match).toBeNull();
+    expect(next.queue).toEqual([queue[1]]);
+  });
+
+  it('uses the group verbatim rather than re-running the matcher', () => {
+    const { courts } = setup();
+    // A deliberately unbalanced hand-built order must survive intact.
+    const queue = [group('hand', ['p4', 'p1', 'p3', 'p2'])];
+    const next = assignQueuedGroupToCourt({
+      groupId: 'hand', courtId: 'c1', courts, queue, now: 0,
+    });
+    expect(next.courts[0].match.players).toEqual(['p4', 'p1', 'p3', 'p2']);
+  });
+
+  it('starts the configured timer, and leaves it open when there is none', () => {
+    const { courts, queue } = setup();
+    const timed = assignQueuedGroupToCourt({
+      groupId: 'g1', courtId: 'c1', courts, queue, now: 1_000, durationMin: 20,
+    });
+    expect(timed.courts[0].match.startedAt).toBe(1_000);
+    expect(timed.courts[0].match.endsAt).toBe(1_000 + 20 * 60_000);
+    expect(timed.courts[0].match.durationMin).toBe(20);
+
+    const open = assignQueuedGroupToCourt({
+      groupId: 'g1', courtId: 'c1', courts, queue, now: 1_000, durationMin: null,
+    });
+    expect(open.courts[0].match.endsAt).toBeNull();
+  });
+
+  it('refuses an incomplete group, a busy court and an unknown id', () => {
+    const { courts, queue } = setup();
+    const partial = [group('short', ['p1', 'p2'])];
+    expect(assignQueuedGroupToCourt({
+      groupId: 'short', courtId: 'c1', courts, queue: partial, now: 0,
+    })).toBeNull();
+
+    const busy = [withMatch(courts[0], ['x1', 'x2', 'x3', 'x4']), courts[1]];
+    expect(assignQueuedGroupToCourt({
+      groupId: 'g1', courtId: 'c1', courts: busy, queue, now: 0,
+    })).toBeNull();
+
+    expect(assignQueuedGroupToCourt({
+      groupId: 'nope', courtId: 'c1', courts, queue, now: 0,
+    })).toBeNull();
+  });
+
+  it('does not mutate the courts or queue it was handed', () => {
+    const { courts, queue } = setup();
+    const snapshot = JSON.stringify({ courts, queue });
+    assignQueuedGroupToCourt({ groupId: 'g1', courtId: 'c1', courts, queue, now: 9 });
+    expect(JSON.stringify({ courts, queue })).toBe(snapshot);
+  });
+});
+
+/* ─────────────────────────────────────────────
+   A WHOLE SESSION
+   Auto builds the queue, staff assign courts by hand, matches finish, repeat.
+   ───────────────────────────────────────────── */
+function simulate({ players, courts, rounds, matchingStyle = 'balanced' }) {
+  let state = { players, courts, queue: [], history: [] };
+  const passes = [];
+
+  for (let r = 0; r < rounds; r++) {
+    const now = r * 60_000;
+    const res = generateAutoQueueGroups({ ...state, matchingStyle, now });
+    passes.push(res);
+    state = { ...state, queue: res.queue };
+
+    // Staff assign the head of the queue to each open court, by hand.
+    for (const court of state.courts.filter((c) => c.type === 'open' && !c.match)) {
+      const head = state.queue.find((g) => g.players.length === 4);
+      if (!head) break;
+      const next = assignQueuedGroupToCourt({
+        groupId: head.id, courtId: court.id, courts: state.courts, queue: state.queue, now,
+      });
+      if (!next) break;
+      state = { ...state, courts: next.courts, queue: next.queue };
+    }
+
+    // Every match finishes; team 1 always wins.
+    const finished = [];
+    const courtsAfter = state.courts.map((c) => {
+      if (!c.match) return c;
+      finished.push(result(`h-${now}-${c.id}`, c.match.players));
+      return { ...c, match: null };
+    });
+    const won = new Set(finished.flatMap((f) => f.winners));
+    const lost = new Set(finished.flatMap((f) => f.losers));
+    state = {
+      players: state.players.map((p) =>
+        won.has(p.id) ? { ...p, wins: p.wins + 1 }
+        : lost.has(p.id) ? { ...p, losses: p.losses + 1 }
+        : p
+      ),
+      courts: courtsAfter,
+      queue: state.queue,
+      history: [...finished.reverse(), ...state.history],
+    };
+  }
+  return { state, passes };
+}
+
+// Same-four repeats that broke the cooldown.
+function sameFourViolations(history) {
+  const out = [];
+  const seen = new Map();
+  const played = new Map();
+  [...history].reverse().forEach((h, i) => {
+    const key = [...h.players].sort().join('|');
+    if (seen.has(key)) {
+      const at = seen.get(key);
+      const gaps = h.players.map((id) => (played.get(id) ?? []).filter((j) => j > at).length);
+      if (gaps.some((g) => g < COOLDOWN_MATCHES)) out.push({ key, gaps });
+    }
+    seen.set(key, i);
+    h.players.forEach((id) => {
+      if (!played.has(id)) played.set(id, []);
+      played.get(id).push(i);
+    });
+  });
+  return out;
+}
+
+describe('session: 24 players / 3 courts / 20 rounds', () => {
   const run = () => simulate({ players: mkPlayers(24), courts: mkCourts(3), rounds: 20 });
 
   it('separates values over the session', () => {
-    const { state } = run();
-    const vals = state.players.map(playerValue);
+    const vals = run().state.players.map(playerValue);
     expect(Math.max(...vals) - Math.min(...vals)).toBeGreaterThan(2);
   });
 
   it('never repeats the same four inside the cooldown', () => {
-    const { state } = run();
-    expect(sameFourViolations(state.history)).toEqual([]);
+    expect(sameFourViolations(run().state.history)).toEqual([]);
   });
 
-  it('puts exactly four players on every court, every round', () => {
-    const { passes } = run();
-    const assigned = passes.flatMap((p) => p.assignments);
-    expect(assigned.length).toBeGreaterThan(50);
-    expect(assigned.every((a) => a.playerIds.length === 4)).toBe(true);
-  });
-
-  it('spreads play across the whole roster rather than cycling the same faces', () => {
-    const { state } = run();
-    const games = state.players.map((p) => p.wins + p.losses);
+  it('gets everyone on court rather than cycling the same faces', () => {
+    const games = run().state.players.map((p) => p.wins + p.losses);
     expect(Math.min(...games)).toBeGreaterThan(0);
   });
 
   it('is deterministic for a fixed input order and clock', () => {
-    const a = run();
-    const b = run();
-    expect(b.state.history).toEqual(a.state.history);
-    expect(b.passes.map((p) => p.assignments)).toEqual(a.passes.map((p) => p.assignments));
+    expect(run().state.history).toEqual(run().state.history);
   });
 });
 
-/* ─────────────────────────────────────────────
-   REQUIRED SIMULATION 2 — 5 players, 2 courts, 10 rounds (spec §13)
-   The pathological case: the same four must recur, so the ladder has to give.
-   ───────────────────────────────────────────── */
-describe('simulation: 5 players / 2 courts / 10 rounds', () => {
+describe('session: 5 players / 2 courts / 10 rounds', () => {
   const run = () => simulate({ players: mkPlayers(5), courts: mkCourts(2), rounds: 10 });
 
   it('runs to completion without deadlocking or throwing', () => {
@@ -583,58 +702,21 @@ describe('simulation: 5 players / 2 courts / 10 rounds', () => {
     expect(run().passes).toHaveLength(10);
   });
 
-  it('fills only one court — the other stays empty rather than taking a short group', () => {
-    const { passes } = run();
-    for (const p of passes) {
-      expect(p.assignments).toHaveLength(1);
-      expect(p.assignments[0].playerIds).toHaveLength(4);
+  it('builds exactly one group a round and never a short one', () => {
+    for (const p of run().passes) {
+      expect(p.created).toHaveLength(1);
+      expect(p.remaining).toBe(1);
     }
   });
 
-  it('reports the court it could not fill instead of silently skipping it', () => {
-    const { passes } = run();
-    expect(passes[0].log).toContainEqual(
-      expect.objectContaining({ step: 'fill', filled: false, reason: 'noEligibleFour' })
-    );
-  });
-
-  it('never creates a waiting group it has no players for', () => {
-    const { passes } = run();
-    expect(passes.every((p) => p.created.length === 0)).toBe(true);
-  });
-
-  it('walks past the strict rung, reaching relax2 or beyond at least once', () => {
-    const { passes } = run();
-    const rungs = passes.flatMap((p) => p.log.map((l) => l.rung)).filter(Boolean);
+  it('walks past the strict rung when history leaves no clean option', () => {
+    const rungs = run().passes.flatMap((p) => p.log.map((l) => l.rung)).filter(Boolean);
     expect(rungs.some((r) => r !== 'strict')).toBe(true);
     expect(rungs.some((r) => ['relax2', 'relax3', 'giveUp'].includes(r))).toBe(true);
   });
 
-  it('rotates the player who sits out rather than benching one person all night', () => {
-    const { state } = run();
-    const games = state.players.map((p) => p.wins + p.losses);
+  it('rotates who sits out rather than benching one person all night', () => {
+    const games = run().state.players.map((p) => p.wins + p.losses);
     expect(Math.min(...games)).toBeGreaterThan(4);
-  });
-});
-
-/* ── determinism, generally ──────────────────── */
-describe('determinism', () => {
-  it('gives the same answer for the same inputs regardless of array order', () => {
-    const players = mkPlayers(9);
-    const shared = { courts: mkCourts(2), queue: [], history: [], now: 0 };
-    const a = runAutoPass({ ...shared, players });
-    const b = runAutoPass({ ...shared, players: [...players].reverse() });
-    expect(b.assignments.map((x) => [...x.playerIds].sort())).toEqual(
-      a.assignments.map((x) => [...x.playerIds].sort())
-    );
-  });
-
-  it('does not mutate the inputs it is given', () => {
-    const players = mkPlayers(12);
-    const courts = mkCourts(2);
-    const queue = [{ id: 'g1', players: ['p1', 'p2'], type: 'manual', createdAt: 1 }];
-    const snapshot = JSON.stringify({ players, courts, queue });
-    runAutoPass({ players, courts, queue, history: [], now: 0 });
-    expect(JSON.stringify({ players, courts, queue })).toBe(snapshot);
   });
 });
