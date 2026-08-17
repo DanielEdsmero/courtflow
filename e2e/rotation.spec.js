@@ -3,11 +3,15 @@ import { stubRest, stubRealtime, signIn, VENUE } from './stub-supabase.js';
 
 /* ─────────────────────────────────────────────
    MATCH ROTATION
-   Group formation is manual only (spec §2, §8, §12.11). Finishing a match
-   dissolves its four players to the back of Available and stops there — no
-   re-queue, no auto-assign, no RE-QUEUED state. Nothing moves until staff press
-   the single Auto button in the Queue panel, and when they do it fills every
-   court it legally can and parks at most one waiting group behind them.
+   Two staff actions, and the split between them is the point.
+
+   Auto-group Available builds matchups. It turns every Available player it can
+   into a complete four in the QUEUE, and it never touches a court: nobody starts
+   playing, no timer starts, no reveal animation runs.
+
+   Assign to court is the only thing that starts a match, and staff do it group
+   by group. Finishing a match dissolves those four back to Available — there is
+   no re-queue and no RE-QUEUED state.
    ───────────────────────────────────────────── */
 
 // Eight players, all the same skill so nothing but the matcher decides:
@@ -65,8 +69,17 @@ const queuedGroups = (s) => (s?.queue ?? []).map((g) => g.players ?? []);
 // The Auto button deliberately pauses for ~550ms before it commits, so every
 // click has to be followed by a wait on the outcome rather than on the click.
 async function pressAuto(page) {
-  await page.getByRole('button', { name: 'Auto', exact: true }).click();
+  await page.getByRole('button', { name: 'Auto-group Available' }).click();
 }
+
+// Assign the Nth queued group to a court through the real dialog.
+async function assignGroup(page, index = 0) {
+  await page.getByRole('button', { name: 'Assign to court' }).nth(index).click();
+  const dialog = page.getByRole('dialog', { name: 'Assign to court' });
+  await dialog.getByRole('button', { name: 'Open', exact: true }).first().click();
+}
+
+const busyCourts = (s) => (s?.courts ?? []).filter((c) => c.match).length;
 
 test.beforeEach(async ({ page }) => {
   await signIn(page);
@@ -93,43 +106,141 @@ test('finishing a match dissolves the four to the roster instead of re-queueing 
   expect(s.courts.every((c) => !c.match)).toBe(true);
 });
 
-test('there is no Auto ON/OFF switch in the toolbar any more', async ({ page }) => {
+test('there is one Auto action and it does not mention courts', async ({ page }) => {
   await stubRest(page, { players: ROSTER, session: midMatchSession() });
   await stubRealtime(page);
   await page.goto('/');
 
   await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
   await expect(page.getByRole('button', { name: /Auto (ON|OFF)/ })).toHaveCount(0);
-  // Exactly one Auto button, and it lives in the Queue panel.
-  await expect(page.getByRole('button', { name: 'Auto', exact: true })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: 'Auto-group Available' })).toHaveCount(1);
+  await expect(
+    page.getByText('Creates all possible 4-player matchups. Staff assigns groups to open courts.')
+  ).toBeVisible();
 });
 
-test('Auto fills the free court and parks one waiting group behind it', async ({ page }) => {
-  // Court 1 is mid-match with players who are not on the roster, Court 2 is
-  // free, and eight are on the bench: four for the court, four to wait.
+/* ─────────────────────────────────────────────
+   THE SCREENSHOT REGRESSION
+   Two courts playing, one complete group already queued, eight on the bench.
+   This is the exact state that used to answer "Nothing to do — courts are busy
+   and a group is already waiting".
+   ───────────────────────────────────────────── */
+test('Auto groups all eight benched players even with both courts busy and a group waiting', async ({ page }) => {
+  const roster = Array.from({ length: 20 }, (_, i) => ({
+    ...ROSTER[0],
+    id: `r${String(i + 1).padStart(2, '0')}`,
+    name: `R${i + 1}`,
+  }));
   const session = midMatchSession();
-  session.courts[0].match.players = ['x1', 'x2', 'x3', 'x4'];
+  // Eight on court, four already queued, eight free.
+  session.courts[0].match.players = ['r01', 'r02', 'r03', 'r04'];
+  session.courts[1] = {
+    id: 2,
+    name: 'Court 2',
+    type: 'open',
+    match: { players: ['r05', 'r06', 'r07', 'r08'], startedAt, endsAt: null },
+  };
+  session.queue = [
+    { id: 'existing', players: ['r09', 'r10', 'r11', 'r12'], type: 'auto', createdAt: 1 },
+  ];
+
+  const calls = await stubRest(page, { players: roster, session });
+  await stubRealtime(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+
+  await pressAuto(page);
+
+  // Three complete groups: the one that was already there, plus two new ones.
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(3);
+
+  const s = calls.lastSessionWrite;
+  expect(queuedGroups(s).every((g) => g.length === 4)).toBe(true);
+  // The existing group keeps its place at the head of the queue, untouched.
+  expect(s.queue[0].id).toBe('existing');
+  expect(s.queue[0].players).toEqual(['r09', 'r10', 'r11', 'r12']);
+  // Every one of the twenty is now either playing or queued — nobody is left.
+  expect(queuedGroups(s).flat().sort()).toEqual(roster.slice(8).map((p) => p.id).sort());
+  // The courts were not touched: same players, same clock.
+  expect(newCourtGroups(s)).toEqual([]);
+  expect(s.courts[0].match.players).toEqual(['r01', 'r02', 'r03', 'r04']);
+  expect(s.courts[1].match.players).toEqual(['r05', 'r06', 'r07', 'r08']);
+  // And it says what it did, without a blocking dialog.
+  await expect(page.getByRole('status')).toContainText('Courts were not changed');
+});
+
+test('Auto never starts a match, even with every court free', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match = null;
   const calls = await stubRest(page, { players: ROSTER, session });
+  await stubRealtime(page);
+  await page.goto('/');
+
+  const alerts = [];
+  page.on('dialog', (d) => { alerts.push(d.message()); d.dismiss(); });
+
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  await pressAuto(page);
+
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(2);
+
+  const s = calls.lastSessionWrite;
+  // Two groups waiting, both courts still empty, no reveal, no dialog.
+  expect(queuedGroups(s).every((g) => g.length === 4)).toBe(true);
+  expect(busyCourts(s)).toBe(0);
+  expect(alerts).toEqual([]);
+  await expect(page.getByText('Matched!')).toHaveCount(0);
+});
+
+test('Auto leaves a remainder of fewer than four on the bench and says so', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  const calls = await stubRest(page, { players: ROSTER.slice(0, 7), session });
   await stubRealtime(page);
   await page.goto('/');
 
   await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
   await pressAuto(page);
 
-  await expect
-    .poll(() => newCourtGroups(calls.lastSessionWrite).length, { timeout: 10_000 })
-    .toBe(1);
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(1);
+  expect(queuedGroups(calls.lastSessionWrite)[0]).toHaveLength(4);
+  await expect(page.getByRole('status')).toContainText('3 players still Available');
+});
 
-  const s = calls.lastSessionWrite;
-  const onCourt = newCourtGroups(s)[0];
-  const waiting = queuedGroups(s);
-  expect(onCourt).toHaveLength(4);
-  expect(waiting).toHaveLength(1);
-  expect(waiting[0]).toHaveLength(4);
-  // Every one of the eight is accounted for exactly once.
-  expect([...onCourt, ...waiting[0]].sort()).toEqual(
-    ['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7', 'p8']
-  );
+test('Auto reports honestly when it cannot build anything', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  const calls = await stubRest(page, { players: ROSTER.slice(0, 3), session });
+  await stubRealtime(page);
+  await page.goto('/');
+
+  const alerts = [];
+  page.on('dialog', (d) => { alerts.push(d.message()); d.dismiss(); });
+
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  await pressAuto(page);
+
+  await expect(page.getByRole('status')).toContainText('No additional full groups can be created');
+  expect(alerts).toEqual([]);
+  expect(queuedGroups(calls.lastSessionWrite)).toEqual([]);
+  expect(busyCourts(calls.lastSessionWrite)).toBe(0);
+});
+
+test('pressing Auto twice changes nothing the second time', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  const calls = await stubRest(page, { players: ROSTER, session });
+  await stubRealtime(page);
+  await page.goto('/');
+
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  await pressAuto(page);
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(2);
+  const first = JSON.stringify(calls.lastSessionWrite.queue);
+
+  await pressAuto(page);
+  await expect(page.getByRole('status')).toContainText('No additional full groups can be created');
+  expect(JSON.stringify(calls.lastSessionWrite.queue)).toBe(first);
 });
 
 test('every group Auto creates carries its own formation timestamp', async ({ page }) => {
@@ -143,60 +254,46 @@ test('every group Auto creates carries its own formation timestamp', async ({ pa
   const before = Date.now();
   await pressAuto(page);
 
-  await expect
-    .poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 })
-    .toBe(1);
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(2);
 
-  const group = calls.lastSessionWrite.queue[0];
-  expect(typeof group.createdAt).toBe('number');
-  expect(group.createdAt).toBeGreaterThanOrEqual(before);
+  for (const g of calls.lastSessionWrite.queue) {
+    expect(typeof g.createdAt).toBe('number');
+    expect(g.createdAt).toBeGreaterThanOrEqual(before);
+  }
   // A group that has only just been made reads as "Just now", never "~1347 min".
   await expect(page.getByText('Just now').first()).toBeVisible();
 });
 
-test('Auto never puts fewer than four players on a court', async ({ page }) => {
-  // Five free players, two empty courts: one court fills, the other waits.
+/* ─────────────────────────────────────────────
+   MANUAL COURT ASSIGNMENT — the only way to start a match
+   ───────────────────────────────────────────── */
+test('assigning a queued group starts exactly that match and leaves the rest queued', async ({ page }) => {
   const session = midMatchSession();
   session.courts[0].match = null;
-  const calls = await stubRest(page, { players: ROSTER.slice(0, 5), session });
+  const calls = await stubRest(page, { players: ROSTER, session });
   await stubRealtime(page);
   await page.goto('/');
 
   await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
   await pressAuto(page);
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(2);
 
-  await expect
-    .poll(() => (calls.lastSessionWrite?.courts ?? []).filter((c) => c.match).length, {
-      timeout: 10_000,
-    })
-    .toBe(1);
+  const queued = queuedGroups(calls.lastSessionWrite);
+  const [first, second] = queued;
 
+  await assignGroup(page, 0);
+
+  await expect.poll(() => busyCourts(calls.lastSessionWrite), { timeout: 10_000 }).toBe(1);
   const s = calls.lastSessionWrite;
-  expect(s.courts.filter((c) => c.match).every((c) => c.match.players.length === 4)).toBe(true);
-  expect(queuedGroups(s)).toEqual([]);
+  const playing = s.courts.find((c) => c.match).match;
+  // Exactly those four, in exactly that order — no re-matching on the way out.
+  expect(playing.players).toEqual(first);
+  expect(typeof playing.startedAt).toBe('number');
+  // The other group is untouched and still waiting.
+  expect(queuedGroups(s)).toEqual([second]);
 });
 
-test('Auto refuses to group at all with fewer than four players', async ({ page }) => {
-  const session = midMatchSession();
-  session.courts[0].match = null;
-  const calls = await stubRest(page, { players: ROSTER.slice(0, 3), session });
-  await stubRealtime(page);
-  await page.goto('/');
-
-  const alerts = [];
-  page.on('dialog', (d) => { alerts.push(d.message()); d.dismiss(); });
-
-  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
-  await pressAuto(page);
-
-  await expect.poll(() => alerts.length, { timeout: 10_000 }).toBe(1);
-  expect(alerts[0]).toContain('4 players');
-  const s = calls.lastSessionWrite;
-  expect(queuedGroups(s)).toEqual([]);
-  expect((s?.courts ?? []).every((c) => !c.match)).toBe(true);
-});
-
-test('24 players rotate through six Auto passes without repeating a partnership', async ({ page }) => {
+test('24 players group in one press and rotate through six staff-assigned rounds', async ({ page }) => {
   const roster = Array.from({ length: 24 }, (_, i) => ({
     ...ROSTER[0],
     id: `q${String(i + 1).padStart(2, '0')}`,
@@ -212,26 +309,22 @@ test('24 players rotate through six Auto passes without repeating a partnership'
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
 
+  // One press turns all 24 into six waiting groups. No court moves.
+  await pressAuto(page);
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(6);
+  expect(busyCourts(calls.lastSessionWrite)).toBe(0);
+
   const groups = new Map();
-  const record = (s) => {
-    for (const g of s?.queue ?? []) {
-      if (g.players?.length === 4) groups.set(g.players.join('|'), g.players);
-    }
-    for (const c of s?.courts ?? []) {
-      if (c.match?.players?.length === 4) groups.set(c.match.players.join('|'), c.match.players);
-    }
-  };
+  for (const g of calls.lastSessionWrite.queue) groups.set(g.players.join('|'), g.players);
 
-  for (let round = 0; round < 6; round++) {
-    await pressAuto(page);
-    await expect
-      .poll(() => (calls.lastSessionWrite?.courts ?? []).filter((c) => c.match).length, {
-        timeout: 10_000,
-      })
-      .toBe(2);
-    record(calls.lastSessionWrite);
-
-    // Finish both matches so the floor turns over.
+  for (let round = 0; round < 3; round++) {
+    // Staff put the front two groups on the two courts, by hand.
+    for (let court = 0; court < 2; court++) {
+      await assignGroup(page, 0);
+      await expect
+        .poll(() => busyCourts(calls.lastSessionWrite), { timeout: 10_000 })
+        .toBe(court + 1);
+    }
     for (let court = 0; court < 2; court++) {
       await page.getByRole('button', { name: 'FINISH MATCH' }).first().click();
       await page.getByRole('button', { name: /MARK AS WINNER/ }).first().click();
@@ -241,6 +334,7 @@ test('24 players rotate through six Auto passes without repeating a partnership'
     }
   }
 
+  // Every partnership the session produced, as an order-independent key.
   const seen = new Set();
   let repeats = 0;
   const uniquePlayers = new Set();
@@ -252,9 +346,8 @@ test('24 players rotate through six Auto passes without repeating a partnership'
     }
     g.forEach((id) => uniquePlayers.add(id));
   }
-
   expect(repeats).toBe(0);
-  expect(uniquePlayers.size).toBeGreaterThanOrEqual(12);
+  expect(uniquePlayers.size).toBe(24);
 });
 
 /* ─────────────────────────────────────────────
