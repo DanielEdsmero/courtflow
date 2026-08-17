@@ -239,7 +239,10 @@ test('the court is committed before the animation finishes', async ({ page }) =>
   await expect(overlay(page)).toBeVisible();
 
   await expect
-    .poll(() => calls.lastSessionWrite?.courts?.[0]?.match?.players, { timeout: 5000 })
+    // The four are asserted as a SET: staff-assigning a group runs the same snake
+    // draft Auto does (spec §3, §5), so the stored order is the team order the
+    // engine chose, not the order the group happened to be built in.
+    .poll(() => [...(calls.lastSessionWrite?.courts?.[0]?.match?.players ?? [])].sort())
     .toEqual(['p1', 'p2', 'p3', 'p4']);
   expect(calls.lastSessionWrite.queue).toEqual([]);
 });
@@ -253,7 +256,10 @@ test('reloading mid-sequence shows the true state, not the overlay', async ({ pa
   // the server before reloading — otherwise this measures the debounce. Still
   // comfortably mid-sequence.
   await expect
-    .poll(() => calls.lastSessionWrite?.courts?.[0]?.match?.players, { timeout: 5000 })
+    // The four are asserted as a SET: staff-assigning a group runs the same snake
+    // draft Auto does (spec §3, §5), so the stored order is the team order the
+    // engine chose, not the order the group happened to be built in.
+    .poll(() => [...(calls.lastSessionWrite?.courts?.[0]?.match?.players ?? [])].sort())
     .toEqual(['p1', 'p2', 'p3', 'p4']);
 
   await page.reload();
@@ -272,7 +278,10 @@ test('with animations off the court fills instantly and no overlay appears', asy
   await expect(overlay(page)).toHaveCount(0);
   await expect(courtCard(page).locator('[data-flight-player]')).toHaveCount(4);
   await expect
-    .poll(() => calls.lastSessionWrite?.courts?.[0]?.match?.players, { timeout: 5000 })
+    // The four are asserted as a SET: staff-assigning a group runs the same snake
+    // draft Auto does (spec §3, §5), so the stored order is the team order the
+    // engine chose, not the order the group happened to be built in.
+    .poll(() => [...(calls.lastSessionWrite?.courts?.[0]?.match?.players ?? [])].sort())
     .toEqual(['p1', 'p2', 'p3', 'p4']);
 });
 

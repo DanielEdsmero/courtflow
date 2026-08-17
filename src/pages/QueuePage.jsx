@@ -88,17 +88,6 @@ export default function QueuePage() {
   const courts = useMemo(() => hydrateCourts(state.courts ?? []), [state.courts]);
   const history = state.history ?? [];
 
-  const avgGameDurationMs = useMemo(() => {
-    const completed = history.filter((h) => h.duration > 0);
-    if (completed.length === 0) return 15 * 60 * 1000;
-    return completed.reduce((sum, h) => sum + h.duration, 0) / completed.length;
-  }, [history]);
-
-  const openPlayCourtCount = useMemo(
-    () => courts.filter((c) => c.type === 'open').length,
-    [courts]
-  );
-
   // Error copy differs from the TV's on purpose: this link came off a poster or a
   // QR code, so the reader is a player standing in the club, not staff.
   if (error === 'NOT_FOUND') return <Message title={clubBoard.notFoundTitle} body={clubBoard.notFoundBody} />;
@@ -113,8 +102,6 @@ export default function QueuePage() {
         queue={state.queue ?? []}
         history={history}
         announcement={state.announcement ?? ''}
-        avgGameDurationMs={avgGameDurationMs}
-        openPlayCourtCount={openPlayCourtCount}
         playerById={playerById}
       />
       {!live && (

@@ -6,12 +6,6 @@ export const toolbar = {
   viewStaff: 'Staff',
   viewPreview: 'Preview',
 
-  // Auto-assign: feeds finished groups onto free courts by itself.
-  autoOn: 'Auto ON',
-  autoOff: 'Auto OFF',
-  autoTitleOn: 'Auto-assign ON — queue groups feed open-play courts automatically',
-  autoTitleOff: 'Auto-assign OFF — staff manually assigns every group',
-
   // Default session length applied when a court is auto-filled.
   durationTitle: 'Default open-play session time — applied when auto-assigning',
   durationNone: 'No timer',

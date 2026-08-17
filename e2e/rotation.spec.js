@@ -2,11 +2,12 @@ import { test, expect } from '@playwright/test';
 import { stubRest, stubRealtime, signIn, VENUE } from './stub-supabase.js';
 
 /* ─────────────────────────────────────────────
-   MATCH ROTATION — regression cover for the reported bug
-   Finishing a match with Auto-Filling on used to push the same four straight
-   back onto the queue in their original team order, bypassing buildAutoGroup
-   entirely. That is the path that produces almost every group on a busy floor,
-   so repeat-partner avoidance and the Winners/Losers style never got a say.
+   MATCH ROTATION
+   Group formation is manual only (spec §2, §8, §12.11). Finishing a match
+   dissolves its four players to the back of Available and stops there — no
+   re-queue, no auto-assign, no RE-QUEUED state. Nothing moves until staff press
+   the single Auto button in the Queue panel, and when they do it fills every
+   court it legally can and parks at most one waiting group behind them.
    ───────────────────────────────────────────── */
 
 // Eight players, all the same skill so nothing but the matcher decides:
@@ -34,7 +35,6 @@ const midMatchSession = () => {
   startedAt = Date.now() - 10 * 60_000;
   return {
     competitiveMode: true,
-    autoAssign: true,
     announcement: '',
     onboarded: true,
     matchingStyle: 'balanced',
@@ -52,33 +52,27 @@ const midMatchSession = () => {
   };
 };
 
-/* The newly formed group, read out of the staff app's own session writes rather
-   than scraped from the DOM.
+/* Read the staff app's own session writes rather than scraping the DOM.
+   A court match counts as NEW only when its startedAt differs from the one that
+   was already running when the fixture loaded. */
+const newCourtGroups = (s) =>
+  (s?.courts ?? [])
+    .filter((c) => c.match?.players?.length === 4 && c.match.startedAt !== startedAt)
+    .map((c) => c.match.players);
 
-   It is deliberately looked for in two places: with Auto-Filling on — which is
-   the default, and the configuration the bug was reported under — a requeued
-   group is picked straight off the queue by the auto-assign effect and put on
-   the free court, so the queue is usually empty by the time anything settles.
-   A court match is only "new" if its startedAt differs from the one that was
-   already running. */
-async function nextGroup(calls) {
-  const find = () => {
-    const s = calls.lastSessionWrite;
-    if (!s) return null;
-    const queued = s.queue?.find((g) => g.players?.length === 4);
-    if (queued) return queued.players;
-    const court = s.courts?.find((c) => c.match && c.match.startedAt !== startedAt);
-    return court ? court.match.players : null;
-  };
-  await expect.poll(() => find()?.length ?? 0, { timeout: 10_000 }).toBe(4);
-  return find();
+const queuedGroups = (s) => (s?.queue ?? []).map((g) => g.players ?? []);
+
+// The Auto button deliberately pauses for ~550ms before it commits, so every
+// click has to be followed by a wait on the outcome rather than on the click.
+async function pressAuto(page) {
+  await page.getByRole('button', { name: 'Auto', exact: true }).click();
 }
 
 test.beforeEach(async ({ page }) => {
   await signIn(page);
 });
 
-test('finishing a match re-matches through the matcher instead of re-queueing the same four', async ({ page }) => {
+test('finishing a match dissolves the four to the roster instead of re-queueing them', async ({ page }) => {
   const calls = await stubRest(page, { players: ROSTER, session: midMatchSession() });
   await stubRealtime(page);
   await page.goto('/');
@@ -87,59 +81,122 @@ test('finishing a match re-matches through the matcher instead of re-queueing th
   await page.getByRole('button', { name: 'FINISH MATCH' }).click();
   await page.getByRole('button', { name: /MARK AS WINNER/ }).first().click();
 
-  const group = await nextGroup(calls);
-  expect(group).toHaveLength(4);
+  // The result lands...
+  await expect
+    .poll(() => calls.lastSessionWrite?.history?.length ?? 0, { timeout: 10_000 })
+    .toBe(1);
 
-  // The four who just came off court are the tired ones; p5-p8 have been
-  // waiting. With nothing else to separate them, the rested four get the court.
-  expect([...group].sort()).toEqual(['p5', 'p6', 'p7', 'p8']);
+  // ...and nothing else happens. Both courts are empty and the queue is bare.
+  const s = calls.lastSessionWrite;
+  expect(queuedGroups(s)).toEqual([]);
+  expect(newCourtGroups(s)).toEqual([]);
+  expect(s.courts.every((c) => !c.match)).toBe(true);
 });
 
-test('the requeued group never reproduces the partnerships that just played', async ({ page }) => {
-  // Only the four who just played are available, so they must come back — but
-  // split differently. This is the case the old code got exactly wrong.
-  const onlyFour = ROSTER.slice(0, 4);
-  const calls = await stubRest(page, { players: onlyFour, session: midMatchSession() });
+test('there is no Auto ON/OFF switch in the toolbar any more', async ({ page }) => {
+  await stubRest(page, { players: ROSTER, session: midMatchSession() });
   await stubRealtime(page);
   await page.goto('/');
 
-  await page.getByRole('button', { name: 'FINISH MATCH' }).click();
-  await page.getByRole('button', { name: /MARK AS WINNER/ }).first().click();
-
-  const group = await nextGroup(calls);
-  expect([...group].sort()).toEqual(['p1', 'p2', 'p3', 'p4']);
-
-  // They played as [p1,p2] vs [p3,p4]; neither pairing may survive.
-  const partnered = (a, b) =>
-    Math.floor(group.indexOf(a) / 2) === Math.floor(group.indexOf(b) / 2);
-  expect(partnered('p1', 'p2')).toBe(false);
-  expect(partnered('p3', 'p4')).toBe(false);
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Auto (ON|OFF)/ })).toHaveCount(0);
+  // Exactly one Auto button, and it lives in the Queue panel.
+  await expect(page.getByRole('button', { name: 'Auto', exact: true })).toHaveCount(1);
 });
 
-test('the Winners / Losers style changes who gets grouped on rotation', async ({ page }) => {
+test('Auto fills the free court and parks one waiting group behind it', async ({ page }) => {
+  // Court 1 is mid-match with players who are not on the roster, Court 2 is
+  // free, and eight are on the bench: four for the court, four to wait.
   const session = midMatchSession();
-  session.matchingStyle = 'winnersLosers';
-  // A prior result so the ladder has form to sort on: p5/p6 won last, p7/p8 lost.
-  session.history = [
-    { id: 1, courtId: 2, players: ['p5', 'p6', 'p7', 'p8'], winners: ['p5', 'p6'], losers: ['p7', 'p8'], duration: 600000 },
-  ];
+  session.courts[0].match.players = ['x1', 'x2', 'x3', 'x4'];
   const calls = await stubRest(page, { players: ROSTER, session });
   await stubRealtime(page);
   await page.goto('/');
 
-  await page.getByRole('button', { name: 'FINISH MATCH' }).click();
-  await page.getByRole('button', { name: /MARK AS WINNER/ }).first().click();
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  await pressAuto(page);
 
-  const group = await nextGroup(calls);
-  // Ladder ranks by recent form, so the two most recent winners head the draft
-  // and are placed on opposite teams — never both on the balanced-draft bench.
-  expect(group).toContain('p5');
-  expect(group).toContain('p6');
+  await expect
+    .poll(() => newCourtGroups(calls.lastSessionWrite).length, { timeout: 10_000 })
+    .toBe(1);
+
+  const s = calls.lastSessionWrite;
+  const onCourt = newCourtGroups(s)[0];
+  const waiting = queuedGroups(s);
+  expect(onCourt).toHaveLength(4);
+  expect(waiting).toHaveLength(1);
+  expect(waiting[0]).toHaveLength(4);
+  // Every one of the eight is accounted for exactly once.
+  expect([...onCourt, ...waiting[0]].sort()).toEqual(
+    ['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7', 'p8']
+  );
 });
 
-test('24 players rotate through six consecutive matches without repeating partners', async ({ page }) => {
-  // The scale the bug was reported at, driven through the real UI: finish a
-  // match, let the app re-match and auto-assign, finish the next, and so on.
+test('every group Auto creates carries its own formation timestamp', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match.players = ['x1', 'x2', 'x3', 'x4'];
+  const calls = await stubRest(page, { players: ROSTER, session });
+  await stubRealtime(page);
+  await page.goto('/');
+
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  const before = Date.now();
+  await pressAuto(page);
+
+  await expect
+    .poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 })
+    .toBe(1);
+
+  const group = calls.lastSessionWrite.queue[0];
+  expect(typeof group.createdAt).toBe('number');
+  expect(group.createdAt).toBeGreaterThanOrEqual(before);
+  // A group that has only just been made reads as "Just now", never "~1347 min".
+  await expect(page.getByText('Just now').first()).toBeVisible();
+});
+
+test('Auto never puts fewer than four players on a court', async ({ page }) => {
+  // Five free players, two empty courts: one court fills, the other waits.
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  const calls = await stubRest(page, { players: ROSTER.slice(0, 5), session });
+  await stubRealtime(page);
+  await page.goto('/');
+
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  await pressAuto(page);
+
+  await expect
+    .poll(() => (calls.lastSessionWrite?.courts ?? []).filter((c) => c.match).length, {
+      timeout: 10_000,
+    })
+    .toBe(1);
+
+  const s = calls.lastSessionWrite;
+  expect(s.courts.filter((c) => c.match).every((c) => c.match.players.length === 4)).toBe(true);
+  expect(queuedGroups(s)).toEqual([]);
+});
+
+test('Auto refuses to group at all with fewer than four players', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  const calls = await stubRest(page, { players: ROSTER.slice(0, 3), session });
+  await stubRealtime(page);
+  await page.goto('/');
+
+  const alerts = [];
+  page.on('dialog', (d) => { alerts.push(d.message()); d.dismiss(); });
+
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  await pressAuto(page);
+
+  await expect.poll(() => alerts.length, { timeout: 10_000 }).toBe(1);
+  expect(alerts[0]).toContain('4 players');
+  const s = calls.lastSessionWrite;
+  expect(queuedGroups(s)).toEqual([]);
+  expect((s?.courts ?? []).every((c) => !c.match)).toBe(true);
+});
+
+test('24 players rotate through six Auto passes without repeating a partnership', async ({ page }) => {
   const roster = Array.from({ length: 24 }, (_, i) => ({
     ...ROSTER[0],
     id: `q${String(i + 1).padStart(2, '0')}`,
@@ -147,33 +204,43 @@ test('24 players rotate through six consecutive matches without repeating partne
     skill: ['Beginner', 'Novice', 'Intermediate', 'Advanced', 'Pro'][i % 5],
   }));
   const session = midMatchSession();
-  session.courts[0].match.players = ['q01', 'q02', 'q03', 'q04'];
+  session.courts[0].match = null;
+  session.courts[1].match = null;
 
   const calls = await stubRest(page, { players: roster, session });
   await stubRealtime(page);
   await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
 
-  // Keyed by the line-up itself. A group is written to the session twice — once
-  // when it lands on the queue and again when auto-assign moves it to a court —
-  // and a court still mid-game reappears in every write. Both would read as
-  // repeats. With 24 players an identical re-draft is not a realistic collision.
   const groups = new Map();
-  for (let round = 0; round < 6; round++) {
-    await page.getByRole('button', { name: 'FINISH MATCH' }).first().click();
-    await page.getByRole('button', { name: /MARK AS WINNER/ }).first().click();
-    await expect
-      .poll(() => calls.lastSessionWrite?.history?.length ?? 0, { timeout: 10_000 })
-      .toBe(round + 1);
-    const s = calls.lastSessionWrite;
-    for (const g of s.queue ?? []) {
+  const record = (s) => {
+    for (const g of s?.queue ?? []) {
       if (g.players?.length === 4) groups.set(g.players.join('|'), g.players);
     }
-    for (const c of s.courts ?? []) {
+    for (const c of s?.courts ?? []) {
       if (c.match?.players?.length === 4) groups.set(c.match.players.join('|'), c.match.players);
+    }
+  };
+
+  for (let round = 0; round < 6; round++) {
+    await pressAuto(page);
+    await expect
+      .poll(() => (calls.lastSessionWrite?.courts ?? []).filter((c) => c.match).length, {
+        timeout: 10_000,
+      })
+      .toBe(2);
+    record(calls.lastSessionWrite);
+
+    // Finish both matches so the floor turns over.
+    for (let court = 0; court < 2; court++) {
+      await page.getByRole('button', { name: 'FINISH MATCH' }).first().click();
+      await page.getByRole('button', { name: /MARK AS WINNER/ }).first().click();
+      await expect
+        .poll(() => calls.lastSessionWrite?.history?.length ?? 0, { timeout: 10_000 })
+        .toBe(round * 2 + court + 1);
     }
   }
 
-  // Every partnership ever formed, as an order-independent key.
   const seen = new Set();
   let repeats = 0;
   const uniquePlayers = new Set();
@@ -186,10 +253,7 @@ test('24 players rotate through six consecutive matches without repeating partne
     g.forEach((id) => uniquePlayers.add(id));
   }
 
-  // A pairing may recur once the window has aged out, but across six rounds of
-  // a 24-strong roster there is no excuse for it.
   expect(repeats).toBe(0);
-  // And the floor should actually be rotating, not cycling the same eight.
   expect(uniquePlayers.size).toBeGreaterThanOrEqual(12);
 });
 
