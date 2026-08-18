@@ -23,46 +23,46 @@ describe('prefs', () => {
   });
 
   it('defaults both toggles on', () => {
-    expect(DEFAULT_PREFS).toEqual({ animations: true, sound: true });
-    expect(loadPrefs()).toEqual({ animations: true, sound: true });
+    expect(DEFAULT_PREFS).toEqual({ animations: true, sound: true, matcherDiagnostics: false });
+    expect(loadPrefs()).toEqual({ animations: true, sound: true, matcherDiagnostics: false });
   });
 
   it('round-trips what was saved', () => {
     savePrefs({ animations: false, sound: true });
-    expect(loadPrefs()).toEqual({ animations: false, sound: true });
+    expect(loadPrefs()).toEqual({ animations: false, sound: true, matcherDiagnostics: false });
   });
 
   it('keeps the two toggles independent', () => {
     savePrefs({ animations: true, sound: false });
-    expect(loadPrefs()).toEqual({ animations: true, sound: false });
+    expect(loadPrefs()).toEqual({ animations: true, sound: false, matcherDiagnostics: false });
   });
 
   it('coerces whatever it is handed to booleans', () => {
     savePrefs({ animations: 1, sound: 0 });
-    expect(loadPrefs()).toEqual({ animations: true, sound: false });
+    expect(loadPrefs()).toEqual({ animations: true, sound: false, matcherDiagnostics: false });
   });
 
   it('falls back to defaults on corrupt JSON rather than throwing', () => {
     window.localStorage.setItem(KEY, '{not json');
     expect(() => loadPrefs()).not.toThrow();
-    expect(loadPrefs()).toEqual({ animations: true, sound: true });
+    expect(loadPrefs()).toEqual({ animations: true, sound: true, matcherDiagnostics: false });
   });
 
   it('falls back to defaults when the stored value is not an object', () => {
     window.localStorage.setItem(KEY, '"off"');
-    expect(loadPrefs()).toEqual({ animations: true, sound: true });
+    expect(loadPrefs()).toEqual({ animations: true, sound: true, matcherDiagnostics: false });
   });
 
   it('fills in a missing key from an older saved shape', () => {
     // A blob written before the sound toggle existed.
     window.localStorage.setItem(KEY, JSON.stringify({ animations: false }));
-    expect(loadPrefs()).toEqual({ animations: false, sound: true });
+    expect(loadPrefs()).toEqual({ animations: false, sound: true, matcherDiagnostics: false });
   });
 
   it('starts with animations off when the OS asks for reduced motion', () => {
     stubMatchMedia(true);
     expect(prefersReducedMotion()).toBe(true);
-    expect(loadPrefs()).toEqual({ animations: false, sound: true });
+    expect(loadPrefs()).toEqual({ animations: false, sound: true, matcherDiagnostics: false });
   });
 
   it('lets an explicit choice override the reduced-motion default', () => {
@@ -76,7 +76,7 @@ describe('prefs', () => {
     vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
       throw new Error('SecurityError');
     });
-    expect(loadPrefs()).toEqual({ animations: true, sound: true });
+    expect(loadPrefs()).toEqual({ animations: true, sound: true, matcherDiagnostics: false });
   });
 
   it('survives a localStorage that throws on write', () => {
@@ -84,6 +84,16 @@ describe('prefs', () => {
       throw new Error('QuotaExceededError');
     });
     expect(() => savePrefs({ animations: false, sound: false })).not.toThrow();
+  });
+
+  it('keeps matcher diagnostics off unless they were deliberately switched on', () => {
+    // Staff-only, and the sort of thing that must never come back on by itself.
+    expect(loadPrefs().matcherDiagnostics).toBe(false);
+    savePrefs({ animations: true, sound: true, matcherDiagnostics: true });
+    expect(loadPrefs().matcherDiagnostics).toBe(true);
+    // A blob written before the toggle existed reads as off, not undefined.
+    window.localStorage.setItem(KEY, JSON.stringify({ animations: true, sound: true }));
+    expect(loadPrefs().matcherDiagnostics).toBe(false);
   });
 
   it('treats a missing matchMedia as no preference', () => {

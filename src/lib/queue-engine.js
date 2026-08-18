@@ -210,12 +210,37 @@ export function draftTeams(four, order) {
 export function violationsOf(drafted, H) {
   const t1 = [drafted[0], drafted[1]];
   const t2 = [drafted[2], drafted[3]];
+  // Named pairs, not just a boolean: when the ladder has to accept a rematch,
+  // staff diagnostics need to say WHICH one, and a test needs to assert on it.
+  const opponentPairs = [];
+  for (const a of t1) {
+    for (const b of t2) if (H.opponentBlocked(a.id, b.id)) opponentPairs.push([a.id, b.id]);
+  }
+  const partnerPairs = [];
+  if (H.partnerBlocked(t1[0].id, t1[1].id)) partnerPairs.push([t1[0].id, t1[1].id]);
+  if (H.partnerBlocked(t2[0].id, t2[1].id)) partnerPairs.push([t2[0].id, t2[1].id]);
   return {
     quad: H.quadBlocked(drafted.map((p) => p.id)),
-    opponent: t1.some((a) => t2.some((b) => H.opponentBlocked(a.id, b.id))),
-    partner:
-      H.partnerBlocked(t1[0].id, t1[1].id) || H.partnerBlocked(t2[0].id, t2[1].id),
+    opponent: opponentPairs.length > 0,
+    partner: partnerPairs.length > 0,
+    opponentPairs,
+    partnerPairs,
   };
+}
+
+/* Can these two be put on opposite sides of a net again?
+
+   The cooldown is counted in MATCHES, never in wall-clock time: each of them has
+   to have finished two matches since they last faced each other. Sitting out for
+   an hour burns none of it — the point is that you get different opponents, not
+   that you wait. `now` is accepted so callers can pass the same clock they pass
+   everywhere else, but it is deliberately unused: time cannot clear a cooldown. */
+export function canFaceAsOpponents(playerAId, playerBId, history, now = null) {
+  void now;
+  const H = history && typeof history.opponentBlocked === 'function'
+    ? history            // an already-built index
+    : buildHistoryIndex(history);
+  return !H.opponentBlocked(playerAId, playerBId);
 }
 
 export const passesRung = (v, rung) => {
@@ -358,7 +383,12 @@ export function selectGroupForSeed(seed, pool, ctx) {
 const QUAD_COST = 1000;
 const OPPONENT_COST = 100;
 const PARTNER_COST = 10;
-const MAX_SWEEPS = 6;
+/* The swap search takes the FIRST improving trade it finds and then rescans from
+   the top, so one pass of the loop applies exactly one swap. A batch of six
+   groups routinely needs a dozen trades to untangle, so this bound has to be a
+   budget rather than a sweep count — at six it stopped half-finished and left
+   rematches on the floor that a strict solution existed for. */
+const MAX_SWAPS = 400;
 
 function groupCost(four, H, order) {
   const drafted = draftTeams(four, order);
@@ -379,13 +409,55 @@ function groupCost(four, H, order) {
 export const rungFor = (v) =>
   v.quad ? 'giveUp' : v.opponent ? 'relax2' : v.partner ? 'relax1' : 'strict';
 
+/* The same four outcomes, named for what they mean rather than for how far down
+   the search went. This is the vocabulary that leaves the engine — diagnostics,
+   the activity log and tests all speak it; `rung` stays internal. */
+export const CONSTRAINT_LEVELS = [
+  'strict',
+  'same-teammate-relaxed',
+  'opponent-cooldown-relaxed',
+  'same-four-relaxed',
+];
+
+const LEVEL_BY_RUNG = {
+  strict: 'strict',
+  relax1: 'same-teammate-relaxed',
+  relax2: 'opponent-cooldown-relaxed',
+  relax3: 'same-four-relaxed',
+  giveUp: 'same-four-relaxed',
+};
+
+const FALLBACK_REASON = {
+  'same-teammate-relaxed':
+    'no group without a repeated partnership was available from the players left',
+  'opponent-cooldown-relaxed':
+    'every remaining group put at least one pair back against each other inside the two-match cooldown',
+  'same-four-relaxed':
+    'the players left could only form a four that has already played together',
+};
+
+/* What the matcher decided, in a shape staff and tests can both read. Carries no
+   player Value and no history — only which rules had to give, and for whom. */
+export function decisionFor(violations) {
+  const level = LEVEL_BY_RUNG[rungFor(violations)] ?? 'strict';
+  const cooldownSatisfied = !violations.opponent;
+  return {
+    constraintLevel: level,
+    cooldownSatisfied,
+    // Never claim a clean cooldown after falling back: the pairs are listed.
+    cooldownConflictPairs: violations.opponentPairs ?? [],
+    repeatedPartnerPairs: violations.partnerPairs ?? [],
+    fallbackReason: level === 'strict' ? null : FALLBACK_REASON[level],
+  };
+}
+
 /* Swap single players between the given groups while that strictly improves the
    pair. Scans in a fixed index order and takes the first improvement it finds,
    so the result is the same every time for the same input. */
 export function repairGroups(groups, { H, order }) {
   let state = groups.map((four) => groupCost(four, H, order));
 
-  for (let sweep = 0; sweep < MAX_SWEEPS; sweep++) {
+  for (let swap = 0; swap < MAX_SWAPS; swap++) {
     let swapped = false;
     outer:
     for (let i = 0; i < state.length; i++) {
@@ -415,7 +487,70 @@ export function repairGroups(groups, { H, order }) {
     four: s.drafted,
     rung: rungFor(s.violations),
     violations: s.violations,
+    decision: decisionFor(s.violations),
   }));
+}
+
+/* ─────────────────────────────────────────────
+   EXACT PARTITION
+   Swapping players between finished groups fixes most of what greedy building
+   gets wrong, but it is a local search: it only ever considers moving one player
+   at a time, so it settles into arrangements that no single trade improves and
+   yet are not the best available. Measured on a 24-player floor over 20 rounds
+   that left eleven groups carrying a rematch — and a brute-force check confirmed
+   a clean split existed every one of those eleven times.
+
+   So when the local search finishes with a repeat still in it, this runs: a
+   backtracking search for a partition where EVERY group clears the strict rung.
+   It explores in the same order the greedy builder would (longest waiter first,
+   then companions by value proximity), so the first clean partition it finds is
+   also a sensible one — it is not trading fairness for tidiness, it is finding
+   the arrangement the greedy pass was reaching for and missed.
+
+   Bounded on both axes so a pathological pool cannot hang the front desk: a
+   companion window per seed, and a node budget across the whole search. Running
+   out of either returns null and the local-search result stands.
+   ───────────────────────────────────────────── */
+const PARTITION_WINDOW = 12;
+const PARTITION_NODE_BUDGET = 4000;
+
+export function strictPartition(pool, { H, order, avail }) {
+  const failed = new Set();
+  let nodes = 0;
+
+  const walk = (rest) => {
+    // Fewer than four left is success: the remainder stays on the bench, which
+    // is exactly what the greedy builder would have done with them.
+    if (rest.length < 4) return [];
+    if (nodes++ > PARTITION_NODE_BUDGET) return null;
+    const key = rest.map((p) => p.id).join(',');
+    if (failed.has(key)) return null;
+
+    const head = rest[0]; // longest waiter seeds, same as the greedy builder
+    const seedValue = playerValue(head);
+    const near = rest
+      .slice(1)
+      .sort(
+        (a, b) =>
+          Math.abs(playerValue(a) - seedValue) - Math.abs(playerValue(b) - seedValue) ||
+          avail(a) - avail(b)
+      )
+      .slice(0, PARTITION_WINDOW);
+
+    for (const three of combinations(near, 3)) {
+      const four = draftTeams([head, ...three], order);
+      const v = violationsOf(four, H);
+      if (v.quad || v.opponent || v.partner) continue;
+      const taken = new Set(four.map((p) => String(p.id)));
+      const tail = walk(rest.filter((p) => !taken.has(String(p.id))));
+      if (tail) return [four, ...tail];
+    }
+
+    failed.add(key);
+    return null;
+  };
+
+  return walk([...pool].sort((a, b) => avail(a) - avail(b)));
 }
 
 /* Top up a manual partial group (1–3 players) from the pool. Who joins is
@@ -503,6 +638,7 @@ export function generateAutoQueueGroups({
   const log = [];
   const created = [];
   const toppedUp = [];
+  const decisions = {};
   const nextId = makeIds(now);
 
   const byId = new Map(players.map((p) => [String(p.id), p]));
@@ -557,7 +693,14 @@ export function generateAutoQueueGroups({
         : x
     );
     toppedUp.push(g.id);
-    log.push({ step: 'topUp', groupId: g.id, rung: picked.rung, preferredCourt });
+    decisions[g.id] = decisionFor(picked.violations);
+    log.push({
+      step: 'topUp',
+      groupId: g.id,
+      rung: picked.rung,
+      preferredCourt,
+      ...decisions[g.id],
+    });
   }
 
   /* ── 2. Build new groups until the bench cannot make another four ─────── */
@@ -589,12 +732,31 @@ export function generateAutoQueueGroups({
      goes into the queue first, and so on down the bench. That is the half of FIFO
      staff actually see — who plays next — and it leaves composition to the rules
      that keep matches fresh. */
-  const repairedGroups = repairGroups(built, { H, order })
-    .map((g, i) => ({
-      ...g,
-      seed: seeds[i],
-      wait: Math.min(...g.four.map((p) => startAvail(p))),
-    }))
+  /* Local search first — it is cheap and fixes most of it. If anything still
+     carries a repeat, ask for an exact clean partition of the same players; that
+     answers "was a strict grouping actually available?" rather than guessing. */
+  let repaired = repairGroups(built, { H, order });
+  if (repaired.some((g) => g.violations.quad || g.violations.opponent || g.violations.partner)) {
+    const everyone = built.flat();
+    const clean = strictPartition(everyone, { H, order, avail: startAvail });
+    if (clean && clean.length === built.length) {
+      repaired = clean.map((four) => {
+        const v = violationsOf(four, H);
+        return { four, rung: rungFor(v), violations: v, decision: decisionFor(v) };
+      });
+      log.push({ step: 'repartition', groups: clean.length });
+    }
+  }
+
+  const repairedGroups = repaired
+    .map((g) => {
+      // The group's own longest waiter, recomputed: players move between groups
+      // during repair, so the seed the greedy pass started from may not be in
+      // this group any more. This is what orders the queue.
+      const wait = Math.min(...g.four.map((p) => startAvail(p)));
+      const seed = g.four.find((p) => startAvail(p) === wait);
+      return { ...g, seed: seed?.id ?? null, wait };
+    })
     .sort((a, b) => a.wait - b.wait);
 
   for (const repaired of repairedGroups) {
@@ -608,12 +770,14 @@ export function generateAutoQueueGroups({
     };
     work = [...work, group];
     created.push(group.id);
+    decisions[group.id] = repaired.decision;
     log.push({
       step: 'create',
       groupId: group.id,
       rung: repaired.rung,
       preferredCourt,
       seed: repaired.seed,
+      ...repaired.decision,
     });
   }
 
@@ -624,6 +788,12 @@ export function generateAutoQueueGroups({
     queue: work,
     created,
     toppedUp,
+    /* Which rules each new group had to bend, keyed by group id.
+       Returned SEPARATELY from the queue on purpose. The queue is persisted and
+       broadcast to the TV and the public club board; this is staff-only
+       reasoning about hidden Values and past opponents, so it must never ride
+       along inside a group object where it would be published by accident. */
+    decisions,
     // What is still on the bench — always 0–3 when anything was built.
     remaining: pool.length,
     startedWith,

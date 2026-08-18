@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Settings2, Sparkles, Volume2, VolumeX, Check } from 'lucide-react';
+import { Settings2, Sparkles, Volume2, VolumeX, Check, Stethoscope } from 'lucide-react';
 import { settings as t } from '../copy';
 
 /* ─────────────────────────────────────────────
@@ -70,6 +70,16 @@ export default function SettingsMenu({ prefs, onChange }) {
             hint={t.soundHint}
             value={prefs.sound}
             onToggle={() => onChange({ ...prefs, sound: !prefs.sound })}
+          />
+          {/* Staff-only. Lives with the other device preferences rather than in
+              the session, so turning it on at the desk cannot leak it to the TV
+              — nothing here is ever written to the shared session blob. */}
+          <ToggleRow
+            icon={<Stethoscope className="w-4 h-4" />}
+            label={t.diagnosticsLabel}
+            hint={t.diagnosticsHint}
+            value={!!prefs.matcherDiagnostics}
+            onToggle={() => onChange({ ...prefs, matcherDiagnostics: !prefs.matcherDiagnostics })}
           />
 
           <p className="px-2 pt-2 pb-1 text-[11px] text-zinc-600 border-t border-zinc-800 mt-1">

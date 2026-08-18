@@ -8,7 +8,10 @@
 
 const KEY = 'courtflow:prefs';
 
-export const DEFAULT_PREFS = { animations: true, sound: true };
+// matcherDiagnostics is staff-only and off by default: it explains WHY the
+// matcher grouped people the way it did, which is exactly the sort of thing
+// that must never be on screen when the tablet is turned round to a player.
+export const DEFAULT_PREFS = { animations: true, sound: true, matcherDiagnostics: false };
 
 // Someone who has asked their OS to reduce motion has already answered the
 // animations question. Used only to pick the FIRST-RUN default — once they
@@ -35,6 +38,8 @@ export function loadPrefs() {
     return {
       animations: typeof saved.animations === 'boolean' ? saved.animations : fallback.animations,
       sound: typeof saved.sound === 'boolean' ? saved.sound : fallback.sound,
+      matcherDiagnostics:
+        typeof saved.matcherDiagnostics === 'boolean' ? saved.matcherDiagnostics : false,
     };
   } catch {
     return fallback; // private mode, quota, or corrupt value
@@ -49,6 +54,7 @@ export function savePrefs(prefs) {
     window.localStorage.setItem(KEY, JSON.stringify({
       animations: !!prefs.animations,
       sound: !!prefs.sound,
+      matcherDiagnostics: !!prefs.matcherDiagnostics,
     }));
   } catch {
     /* ignore */

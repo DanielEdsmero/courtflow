@@ -351,6 +351,92 @@ test('24 players group in one press and rotate through six staff-assigned rounds
 });
 
 /* ─────────────────────────────────────────────
+   MATCHER DIAGNOSTICS — staff only, and off by default
+   The badge explains which matching rules a group had to bend. That is staff
+   reasoning about hidden Values and past opponents, so it must never reach the
+   Preview tab, the TV or the public club board.
+   ───────────────────────────────────────────── */
+async function setDiagnostics(page, on) {
+  await page.getByRole('button', { name: 'Settings' }).click();
+  const row = page.getByRole('menuitemcheckbox', { name: /Matcher diagnostics/ });
+  if ((await row.getAttribute('aria-checked')) !== String(on)) await row.click();
+  await expect(row).toHaveAttribute('aria-checked', String(on));
+  await page.keyboard.press('Escape');
+}
+
+test('matcher diagnostics are off until staff turn them on', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  await stubRest(page, { players: ROSTER, session });
+  await stubRealtime(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+
+  await pressAuto(page);
+  await expect(page.getByText('Auto-grouped').first()).toBeVisible();
+  // Nothing about the matcher on screen until it is asked for.
+  await expect(page.getByText(/^Matcher:/)).toHaveCount(0);
+
+  await setDiagnostics(page, true);
+  await expect(page.getByText(/^Matcher:/).first()).toBeVisible();
+  await expect(page.getByText('Matcher: strict — cooldown clear').first()).toBeVisible();
+});
+
+test('diagnostics never appear in Preview, and never reach the shared session', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  const calls = await stubRest(page, { players: ROSTER, session });
+  await stubRealtime(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+
+  await setDiagnostics(page, true);
+  await pressAuto(page);
+  await expect(page.getByText(/^Matcher:/).first()).toBeVisible();
+
+  // Preview renders exactly what the TV and the club board render.
+  await page.getByRole('button', { name: 'Preview' }).click();
+  await expect(page.getByText(/^Matcher:/)).toHaveCount(0);
+
+  // And the blob that is written and broadcast carries none of it either —
+  // not the badge text, not the constraint level, not the conflicting pairs.
+  const blob = JSON.stringify(calls.lastSessionWrite ?? {});
+  expect(blob).not.toMatch(/Matcher:/);
+  expect(blob).not.toMatch(/constraintLevel/);
+  expect(blob).not.toMatch(/cooldownConflictPairs/);
+  expect(blob).not.toMatch(/fallbackReason/);
+  // The queue groups themselves carry only what the public board needs.
+  for (const g of calls.lastSessionWrite.queue ?? []) {
+    expect(Object.keys(g).sort()).toEqual(['createdAt', 'id', 'players', 'preferredCourt', 'type']);
+  }
+});
+
+test('a fresh group reads "Just now", never a four-digit minute count', async ({ page }) => {
+  // A group carried over from a previous day used to render "1139 min"; the
+  // relative-time ladder now rolls anything past an hour up.
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  session.queue = [
+    {
+      id: 'overnight',
+      players: ['p5', 'p6', 'p7', 'p8'],
+      type: 'auto',
+      createdAt: Date.now() - 19 * 60 * 60 * 1000,
+    },
+  ];
+  await stubRest(page, { players: ROSTER, session });
+  await stubRealtime(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+
+  await expect(page.getByText('19h 0m')).toBeVisible();
+  await expect(page.getByText(/\d{3,} min/)).toHaveCount(0);
+
+  await pressAuto(page);
+  await expect(page.getByText('Just now').first()).toBeVisible();
+});
+
+/* ─────────────────────────────────────────────
    FAILURE VISIBILITY
    Both of these used to fail silently, which is what made them read as missing
    features rather than an out-of-date database.

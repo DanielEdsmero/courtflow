@@ -106,18 +106,27 @@ describe('fmtWaiting', () => {
   });
 
   it('floors to whole elapsed minutes', () => {
-    expect(fmtWaiting(t + 60_000, t)).toBe('1 min');
-    expect(fmtWaiting(t + 119_000, t)).toBe('1 min');
-    expect(fmtWaiting(t + 12 * 60_000, t)).toBe('12 min');
+    expect(fmtWaiting(t + 60_000, t)).toBe('1m');
+    expect(fmtWaiting(t + 119_000, t)).toBe('1m');
+    expect(fmtWaiting(t + 12 * 60_000, t)).toBe('12m');
   });
 
-  it('falls back to "Just now" for a group saved before createdAt existed', () => {
-    expect(fmtWaiting(t, undefined)).toBe('Just now');
-    expect(fmtWaiting(t, null)).toBe('Just now');
+  it('rolls a long wait up rather than printing a four-digit minute count', () => {
+    // The reported bug: a group left over from the night before read "1139 min".
+    expect(fmtWaiting(t + 1139 * 60_000, t)).toBe('18h 59m');
+    expect(fmtWaiting(t + 26 * 3_600_000, t)).toBe('1d 2h');
+  });
+
+  it('shows — rather than a guess when there is no usable createdAt', () => {
+    // A group saved before createdAt existed has no age to report. Saying
+    // "Just now" about it would be a lie that reads as fact.
+    expect(fmtWaiting(t, undefined)).toBe('—');
+    expect(fmtWaiting(t, null)).toBe('—');
+    expect(fmtWaiting(t, 'nonsense')).toBe('—');
   });
 
   it('never reads a clock of its own — a stale group is measured, not predicted', () => {
-    expect(fmtWaiting(t, t - 3 * 60_000)).toBe('3 min');
+    expect(fmtWaiting(t, t - 3 * 60_000)).toBe('3m');
   });
 });
 

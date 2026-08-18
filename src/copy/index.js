@@ -13,7 +13,7 @@ export { wizard } from './wizard';
 export { sessionRank, leaderboardModal, allTime } from './rankings';
 export { auth, activate } from './auth';
 export { tvDisplay, clubBoard, connection, qrPoster } from './board';
-export { settings, matchReveal } from './settings';
+export { settings, matchReveal, matcherDiagnostics } from './settings';
 export { matchingStyles, payments } from './matching';
 export { queue } from './queue';
 

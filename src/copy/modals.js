@@ -115,6 +115,7 @@ export const activityLog = {
     checkout: 'Checked out',
     result: 'Match won',
     payment: 'Payment updated',
+    autoGroup: 'Auto-grouped',
     // Nothing writes this any more; kept so old saved sessions still read right.
     noshow: 'No-show removed',
   },
@@ -125,5 +126,17 @@ export const activityLog = {
   checkoutHere: (duration) => `here ${duration}`,
   resultDefeated: (loserNames) => `def. ${loserNames}`,
   paymentChange: (label) => `→ ${label}`,
+  /* One line per Auto press. Staff-only, like the whole log — it names how
+     many groups came out and which rules had to give, never who faced whom
+     and never a hidden Value. */
+  autoGroupRun: (created, before, after) =>
+    `${created} group${created === 1 ? '' : 's'} from ${before} available · ${after} left`,
+  autoGroupLevels: (levels) => {
+    const fallbacks = levels.filter((l) => l !== 'strict').length;
+    if (levels.length === 0) return 'nothing to build';
+    return fallbacks === 0
+      ? 'all strict'
+      : `${fallbacks} fallback${fallbacks === 1 ? '' : 's'}`;
+  },
   noshowFrom: (courtName) => `from ${courtName}`,
 };

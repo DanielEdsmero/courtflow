@@ -25,6 +25,7 @@ import {
   confirms, alerts, statsWriteBanner,
   sessionRank as sessionRankCopy, leaderboardModal as leaderboardCopy,
   queue as queueCopy,
+  matcherDiagnostics as diagCopy,
   modals,
 } from './copy';
 import ModalShell from './components/ModalShell';
@@ -52,6 +53,11 @@ import {
 import {
   generateAutoQueueGroups, assignQueuedGroupToCourt, suggestCourtFor, courtRoles,
 } from './lib/queue-engine';
+// One canonical timestamp shape (epoch ms) and one place that does the
+// arithmetic — see lib/time.js.
+import {
+  durationBetween, matchEndsAt, formatDuration, normalizeTimestamp, TIME_UNAVAILABLE,
+} from './lib/time';
 export { SKILL_TIERS, skillRank, fmtElapsed, fmtWaiting, balancedGroup };
 
 // Bounds the in-memory activity log carried in the session blob.
@@ -305,6 +311,12 @@ export default function App() {
   // modal on every press would be unusable. Cleared on its own after a few
   // seconds by the Queue panel.
   const [autoStatus, setAutoStatus]           = useState(null);
+  /* Why the matcher grouped people the way it did, keyed by group id.
+     Deliberately React-only: it is NOT written into the session blob, so it
+     cannot reach the TV display or the public club board, which read that blob.
+     The cost is that it does not survive a reload — correct, since it describes
+     a particular Auto run rather than the group itself. */
+  const [matcherRuns, setMatcherRuns]         = useState({});
   const [showRental, setShowRental]           = useState(null);
   const [showAnnouncementBar, setShowAnnouncementBar] = useState(false);
   const [pendingPhotoPlayerId, setPendingPhotoPlayerId] = useState(null);
@@ -553,6 +565,23 @@ export default function App() {
     const now = Date.now();
     const result = generateAutoQueueGroups({ players, courts, queue, history, matchingStyle, now });
     setQueue(result.queue);
+    // Kept alongside earlier runs so a group built two presses ago still explains
+    // itself; groups that have since left the queue are pruned on render.
+    setMatcherRuns(prev => ({ ...prev, ...result.decisions }));
+    /* One staff-only audit line per press. Records the shape of the run — how
+       many were on the bench, what was built, and which rule each group had to
+       bend — without naming an opponent or a Value. */
+    logEvent({
+      type: 'autoGroup',
+      availableBefore: result.startedWith,
+      availableAfter: result.remaining,
+      createdCount: result.created.length,
+      toppedUpCount: result.toppedUp.length,
+      levels: result.created.map(id => result.decisions[id]?.constraintLevel ?? 'strict'),
+      fallbackReasons: Object.values(result.decisions)
+        .map(d => d.fallbackReason)
+        .filter(Boolean),
+    });
     setAutoStatus({
       at: now,
       text: result.reason === 'noFullGroupPossible'
@@ -583,7 +612,7 @@ export default function App() {
         players: [hostId],
         host: hostId,
         startedAt: now,
-        endsAt: durationMin ? now + durationMin * 60 * 1000 : null,
+        endsAt: matchEndsAt(now, durationMin, { now }),
         durationMin,
       },
     } : c));
@@ -600,10 +629,16 @@ export default function App() {
     const p = playerById(checkoutPlayerId);
     if (!p) { setCheckoutPlayerId(null); return; }
     const now = Date.now();
+    // Normalised rather than subtracted raw: a check-in time that came back from
+    // an older row in epoch SECONDS used to turn a five-minute visit into a
+    // fifty-year one. An untrustworthy pair records no duration at all.
+    const session = durationBetween(p.checkedInAt, now, { now });
     logEvent({
       type: 'checkout', playerName: p.name,
       checkedInAt: p.checkedInAt, checkoutAt: now,
-      sessionMs: now - p.checkedInAt, payment: p.payment,
+      sessionMs: session.ok ? session.ms : null,
+      sessionUnavailableReason: session.ok ? null : session.reason,
+      payment: p.payment,
     });
     setPlayers(prev => prev.map(pl => pl.id === p.id ? { ...pl, checkedOut: true } : pl));
     setCheckoutPlayerId(null);
@@ -1225,6 +1260,10 @@ export default function App() {
           instead of growing to fit its content — without it the 100vh lock on
           the wrapper above silently does nothing. */}
       <main className="lg:flex-1 lg:min-h-0">
+      {/* Only StaffView receives matcherRuns/showDiagnostics. DisplayView — which
+          renders both the Preview tab and the public /d and /queue pages — is
+          never handed them, so matcher reasoning cannot reach a player-facing
+          screen even if the staff toggle is on. */}
       {view === 'staff' ? (
         <StaffView
           competitiveMode={competitiveMode}
@@ -1254,6 +1293,8 @@ export default function App() {
           setShowValues={setShowValues}
           autoStatus={autoStatus}
           clearAutoStatus={clearAutoStatus}
+          matcherRuns={matcherRuns}
+          showDiagnostics={!!prefs.matcherDiagnostics}
           reveal={reveal}
           setShowAssign={setShowAssign}
           setShowRental={setShowRental}
@@ -1732,6 +1773,7 @@ function StaffView(props) {
     addCourt, removeCourt, toggleCourtType, renameCourt, playerById,
     showValues, setShowValues, reveal,
     autoStatus, clearAutoStatus,
+    matcherRuns, showDiagnostics,
   } = props;
 
   // Framer positions a travelling element inside its DESTINATION, so without
@@ -2018,6 +2060,14 @@ function StaffView(props) {
               const isImmediateNext = idx === 0 && hasFreeCourt && groupPlayers.length >= 4;
               const unpaidCount = groupPlayers.filter(p => !isPaid(p.payment)).length;
               const courtHint = queueCopy.hint[g.preferredCourt] ?? null;
+              /* Staff-only: which matching rules this group had to bend. Says the
+                 rule that gave and how many pairs it affected — never a hidden
+                 Value, never who played whom. */
+              const decision = showDiagnostics ? matcherRuns?.[g.id] : null;
+              const diagText = !decision ? null
+                : decision.constraintLevel === 'opponent-cooldown-relaxed'
+                ? diagCopy['opponent-cooldown-relaxed'](decision.cooldownConflictPairs.length)
+                : diagCopy[decision.constraintLevel];
               // Teams only exist once a group is complete; the snake draft put
               // slots [0,1] on one side and [2,3] on the other.
               const showTeams = groupPlayers.length === 4;
@@ -2080,11 +2130,23 @@ function StaffView(props) {
                           Now
                         </span>
                       )}
-                      {/* How long this group has actually been waiting (spec §9),
-                          measured from its own createdAt — not an estimate. */}
+                      {/* How long this group has actually been waiting, measured
+                          from its own createdAt — elapsed, never an estimate. */}
                       <span className="text-xs text-zinc-400 bg-zinc-800 px-2 py-0.5 rounded-full flex items-center gap-1">
                         <Clock className="w-3 h-3" /> {fmtWaiting(now, g.createdAt)}
                       </span>
+                      {diagText && (
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded-full border ${
+                            decision.constraintLevel === 'strict'
+                              ? 'text-zinc-400 bg-zinc-950 border-zinc-700'
+                              : 'text-amber-300 bg-amber-950 border-amber-900'
+                          }`}
+                          title={decision.fallbackReason ?? diagCopy.staffOnly}
+                        >
+                          {diagText}
+                        </span>
+                      )}
                     </div>
                     <button onClick={() => removeFromQueue(g.id)} className="text-zinc-600 hover:text-rose-400 transition-colors duration-150">
                       <X className="w-4 h-4" />
@@ -2928,8 +2990,14 @@ function CheckoutModal({ player, onSetPayment, onComplete, onClose }) {
   // after checkout clears the id — bail cleanly.
   if (!player) return null;
   const paid = isPaid(player.payment);
-  const sessionMs = Date.now() - player.checkedInAt;
-  const checkedIn = new Date(player.checkedInAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // Same normalisation the logged event uses, so the number on this screen and
+  // the number in the activity log can never disagree.
+  const now = Date.now();
+  const session = durationBetween(player.checkedInAt, now, { now });
+  const checkedInMs = normalizeTimestamp(player.checkedInAt, { now });
+  const checkedIn = checkedInMs.ok
+    ? new Date(checkedInMs.ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : TIME_UNAVAILABLE;
 
   return (
     <ModalShell onClose={onClose} title={modals.checkout.title(player.name)}>
@@ -2952,7 +3020,9 @@ function CheckoutModal({ player, onSetPayment, onComplete, onClose }) {
           <span className="text-zinc-400 flex items-center gap-1.5">
             <Clock className="w-4 h-4 text-zinc-500" /> {modals.checkout.sessionLengthLabel}
           </span>
-          <span className="font-semibold text-lime-400">{fmtDuration(sessionMs)}</span>
+          <span className="font-semibold text-lime-400">
+            {session.ok ? formatDuration(session.ms) : TIME_UNAVAILABLE}
+          </span>
         </div>
       </div>
 
@@ -3161,6 +3231,7 @@ const AUDIT_META = {
   checkout: { icon: LogOut,        color: 'text-zinc-300',  label: modals.activityLog.labels.checkout },
   result:   { icon: Trophy,        color: 'text-lime-400',  label: modals.activityLog.labels.result },
   payment:  { icon: DollarSign,    color: 'text-amber-400', label: modals.activityLog.labels.payment },
+  autoGroup:{ icon: Shuffle,       color: 'text-zinc-400',  label: modals.activityLog.labels.autoGroup },
   // Legacy: nothing writes `noshow` any more, but saved sessions can still
   // carry entries from before the no-show nudge was removed.
   noshow:   { icon: AlertTriangle, color: 'text-rose-400',  label: modals.activityLog.labels.noshow },
@@ -3175,11 +3246,15 @@ function ActivityLogModal({ auditLog, onClose }) {
       case 'checkin':
         return `${e.returning ? c.returning : c.newPlayer} · ${paymentInfo(e.payment).label}`;
       case 'checkout':
-        return `${e.courtName ? e.courtName + ' · ' : ''}${c.checkoutHere(fmtDuration(e.sessionMs ?? 0))} · ${paymentInfo(e.payment).label}`;
+        return `${e.courtName ? e.courtName + ' · ' : ''}${c.checkoutHere(
+          e.sessionMs == null ? TIME_UNAVAILABLE : formatDuration(e.sessionMs)
+        )} · ${paymentInfo(e.payment).label}`;
       case 'result':
         return `${c.resultDefeated(e.loserNames)}${e.courtName ? ' · ' + e.courtName : ''} · ${fmtDuration(e.durationMs ?? 0)}`;
       case 'payment':
         return c.paymentChange(paymentInfo(e.payment).label);
+      case 'autoGroup':
+        return `${c.autoGroupRun(e.createdCount ?? 0, e.availableBefore ?? 0, e.availableAfter ?? 0)} · ${c.autoGroupLevels(e.levels ?? [])}`;
       case 'noshow':
         return e.courtName ? c.noshowFrom(e.courtName) : '';
       default:

@@ -7,6 +7,9 @@
 // Wording lives in ../copy — this module owns behaviour, not text.
 import { matchingStyles, payments } from '../copy/matching';
 import { allTime } from '../copy/rankings';
+// One canonical timestamp representation, and one place that does the
+// arithmetic. See ./time.js for why the screens no longer each do their own.
+import { formatRelative, formatDuration } from './time';
 
 export const SKILL_TIERS = ['Beginner', 'Novice', 'Intermediate', 'Advanced', 'Pro'];
 export const skillRank = (s) => SKILL_TIERS.indexOf(s);
@@ -17,24 +20,15 @@ export const fmtElapsed = (ms) => {
   return `${m}:${String(s % 60).padStart(2, '0')}`;
 };
 
-// How long a queue group has been waiting (spec §9). Elapsed, never estimated:
-// the old "~N min" chip multiplied a queue position by the average game length,
-// which one long-running court turned into "~1347 min". `now` is passed in so
-// this stays pure and the caller owns the clock.
-export const fmtWaiting = (now, createdAt) => {
-  if (createdAt == null || !Number.isFinite(Number(createdAt))) return 'Just now';
-  const m = Math.floor((now - Number(createdAt)) / 60000);
-  return m < 1 ? 'Just now' : `${m} min`;
-};
+// How long a queue group has been waiting. Elapsed, never estimated — and never
+// a flat minute count: a group left over from last night read as "1139 min",
+// which is technically true and completely unreadable, so ./time.js rolls it up
+// to "18h 59m". A timestamp it cannot trust renders as — rather than a number.
+export const fmtWaiting = (now, createdAt) => formatRelative(now, createdAt).text;
 
 // Total elapsed time in a human "1h 15m" / "15m" shape — used for session length
 // on the checkout screen and in the activity log.
-export const fmtDuration = (ms) => {
-  const totalMin = Math.max(0, Math.round(ms / 60000));
-  const h = Math.floor(totalMin / 60);
-  const m = totalMin % 60;
-  return h === 0 ? `${m}m` : `${h}h ${m}m`;
-};
+export const fmtDuration = formatDuration;
 
 /* ─────────────────────────────────────────────
    PAYMENT STATUS

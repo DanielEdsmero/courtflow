@@ -9,6 +9,8 @@ import {
   draftTeams,
   checkInOrder,
   combinations,
+  canFaceAsOpponents,
+  CONSTRAINT_LEVELS,
   COOLDOWN_MATCHES,
 } from './queue-engine.js';
 import { playerValue } from './logic.js';
@@ -718,5 +720,273 @@ describe('session: 5 players / 2 courts / 10 rounds', () => {
   it('rotates who sits out rather than benching one person all night', () => {
     const games = run().state.players.map((p) => p.wins + p.losses);
     expect(Math.min(...games)).toBeGreaterThan(4);
+  });
+});
+
+/* ─────────────────────────────────────────────
+   COOLDOWN: BEHAVIOUR AND EVIDENCE
+   The rule is counted in MATCHES, not minutes, and the engine has to be able to
+   say afterwards whether it held — and if not, for exactly which pair.
+   ───────────────────────────────────────────── */
+describe('canFaceAsOpponents', () => {
+  const first = result('h1', ['p1', 'p2', 'p3', 'p4']); // p1,p2 vs p3,p4
+
+  it('blocks a rematch immediately after they faced each other', () => {
+    expect(canFaceAsOpponents('p1', 'p3', [first])).toBe(false);
+    expect(canFaceAsOpponents('p2', 'p4', [first])).toBe(false);
+  });
+
+  it('does not block two people who were teammates', () => {
+    expect(canFaceAsOpponents('p1', 'p2', [first])).toBe(true);
+    expect(canFaceAsOpponents('p3', 'p4', [first])).toBe(true);
+  });
+
+  it('clears only after each of them has finished two more matches', () => {
+    const one = [result('h2', ['p1', 'p3', 'p5', 'p6']), first];
+    expect(canFaceAsOpponents('p1', 'p3', one)).toBe(false); // one match each
+    const two = [result('h3', ['p1', 'p3', 'p7', 'p8']), ...one];
+    expect(canFaceAsOpponents('p1', 'p3', two)).toBe(true);
+  });
+
+  it('is counted in matches, not minutes — sitting out clears nothing', () => {
+    const othersPlayed = [
+      result('h3', ['p5', 'p6', 'p7', 'p8']),
+      result('h2', ['p5', 'p6', 'p7', 'p8']),
+      first,
+    ];
+    expect(canFaceAsOpponents('p1', 'p3', othersPlayed)).toBe(false);
+  });
+
+  it('takes an already-built index as readily as a raw history', () => {
+    const H = buildHistoryIndex([first]);
+    expect(canFaceAsOpponents('p1', 'p3', H)).toBe(false);
+  });
+
+  it('ignores the `now` it is handed — time cannot burn a cooldown', () => {
+    const later = Date.parse('2030-01-01T00:00:00Z');
+    expect(canFaceAsOpponents('p1', 'p3', [first], later)).toBe(false);
+  });
+});
+
+describe('decision metadata', () => {
+  it('reports a strict group as strict with no conflict pairs', () => {
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(8), courts: mkCourts(2), queue: [], history: [], now: 0,
+    });
+    for (const id of res.created) {
+      expect(res.decisions[id]).toMatchObject({
+        constraintLevel: 'strict',
+        cooldownSatisfied: true,
+        cooldownConflictPairs: [],
+        fallbackReason: null,
+      });
+    }
+  });
+
+  it('names the fallback and the exact pair when a rematch is unavoidable', () => {
+    // Only the four who just played are free, so every option repeats.
+    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(4), courts: mkCourts(1), queue: [], history, now: 0,
+    });
+    const d = res.decisions[res.created[0]];
+    expect(d.constraintLevel).toBe('same-four-relaxed');
+    expect(d.cooldownSatisfied).toBe(false);
+    expect(d.cooldownConflictPairs.length).toBeGreaterThan(0);
+    expect(d.fallbackReason).toBeTruthy();
+    // Every named pair really is a blocked matchup, not a guess.
+    const H = buildHistoryIndex(history);
+    for (const [a, b] of d.cooldownConflictPairs) {
+      expect(canFaceAsOpponents(a, b, H)).toBe(false);
+    }
+  });
+
+  it('never claims a clean cooldown after falling back', () => {
+    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(4), courts: mkCourts(1), queue: [], history, now: 0,
+    });
+    for (const d of Object.values(res.decisions)) {
+      if (d.constraintLevel !== 'strict') expect(d.cooldownSatisfied).toBe(false);
+      if (d.cooldownSatisfied) expect(d.cooldownConflictPairs).toEqual([]);
+    }
+  });
+
+  it('keeps the decision OUT of the queue, so it cannot reach the public board', () => {
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(8), courts: mkCourts(2), queue: [], history: [], now: 0,
+    });
+    const published = JSON.stringify(res.queue);
+    expect(published).not.toMatch(/constraintLevel|cooldown|fallbackReason|Matcher/i);
+    for (const g of res.queue) {
+      expect(g).not.toHaveProperty('decision');
+      // Nothing resembling a hidden Value or a history rides along either.
+      expect(Object.keys(g).sort()).toEqual(
+        ['createdAt', 'id', 'players', 'preferredCourt', 'type']
+      );
+    }
+  });
+});
+
+/* ─────────────────────────────────────────────
+   REGRESSION GUARD — Auto builds groups and never touches a court
+   ───────────────────────────────────────────── */
+describe('Auto is group-only', () => {
+  it('20 Available and two empty courts → five groups, courts untouched, nobody left', () => {
+    const players = mkPlayers(20);
+    const courts = mkCourts(2);
+    const res = generateAutoQueueGroups({ players, courts, queue: [], history: [], now: 0 });
+    expect(res.created).toHaveLength(5);
+    expect(res.queue.every((g) => g.players.length === 4)).toBe(true);
+    expect(allQueued(res.queue)).toHaveLength(20);
+    expect(courts.every((c) => !c.match)).toBe(true);
+    expect(availableAfter(players, courts, res.queue)).toHaveLength(0);
+  });
+
+  it('with zero Available it creates nothing and disturbs nothing', () => {
+    const players = mkPlayers(8);
+    const courts = [withMatch(mkCourts(2)[0], ['p1', 'p2', 'p3', 'p4'], 500), mkCourts(2)[1]];
+    const queue = [group('waiting', ['p5', 'p6', 'p7', 'p8'], { type: 'auto' })];
+    const before = JSON.stringify({ courts, queue });
+    const res = generateAutoQueueGroups({ players, courts, queue, history: [], now: 7 });
+    expect(res.created).toEqual([]);
+    expect(res.queue).toEqual(queue);
+    expect(JSON.stringify({ courts, queue })).toBe(before);
+    expect(res.reason).toBe('noFullGroupPossible');
+  });
+
+  it('after a match ends it queues the four again and leaves the empty court empty', () => {
+    // Court 1 has just been cleared; Court 2 is still playing.
+    const players = mkPlayers(12);
+    const courts = [mkCourts(2)[0], withMatch(mkCourts(2)[1], ['p5', 'p6', 'p7', 'p8'], 500)];
+    const queue = [group('older', ['p9', 'p10', 'p11', 'p12'], { type: 'auto', createdAt: 5 })];
+    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
+    const res = generateAutoQueueGroups({ players, courts, queue, history, now: 900 });
+
+    expect(res.created).toHaveLength(1);
+    expect(courts[0].match).toBeNull();          // the free court stays free
+    expect(courts[1].match.startedAt).toBe(500); // the live one is not disturbed
+    expect(res.queue.find((g) => g.id === 'older')).toEqual(queue[0]);
+  });
+
+  it('the eight-Available screenshot case: three groups in, five out, courts busy', () => {
+    const onCourtAndQueued = mkPlayers(20);
+    const bench = mkPlayers(8, 21);
+    const courts = [
+      withMatch(mkCourts(2)[0], ['p1', 'p2', 'p3', 'p4'], 500),
+      withMatch(mkCourts(2)[1], ['p5', 'p6', 'p7', 'p8'], 600),
+    ];
+    const queue = [
+      group('g1', ['p9', 'p10', 'p11', 'p12'], { type: 'auto', createdAt: 10 }),
+      group('g2', ['p13', 'p14', 'p15', 'p16'], { type: 'auto', createdAt: 20 }),
+      group('g3', ['p17', 'p18', 'p19', 'p20'], { type: 'auto', createdAt: 30 }),
+    ];
+    const res = generateAutoQueueGroups({
+      players: [...onCourtAndQueued, ...bench], courts, queue, history: [], now: 4_000,
+    });
+
+    expect(res.created).toHaveLength(2);
+    expect(res.queue).toHaveLength(5);
+    // The three that were already there keep their ids, members and order.
+    expect(res.queue.slice(0, 3)).toEqual(queue);
+    expect(res.remaining).toBe(0);
+    expect(courts.every((c) => c.match)).toBe(true);
+  });
+
+  it('produces Winners/Losers hints without moving anything onto a court', () => {
+    const history = [
+      result('h2', ['p5', 'p6', 'p7', 'p8']),
+      result('h1', ['p1', 'p2', 'p3', 'p4']),
+    ];
+    const courts = mkCourts(2); // both empty, and both must stay empty
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(8), courts, queue: [], history, now: 0,
+      matchingStyle: 'winnersLosers',
+    });
+    expect(res.queue.map((g) => g.preferredCourt).sort()).toEqual(['high', 'low']);
+    expect(courts.every((c) => !c.match)).toBe(true);
+
+    // Only an explicit assignment moves one, and then only the one asked for.
+    const next = assignQueuedGroupToCourt({
+      groupId: res.queue[0].id, courtId: 'c1', courts, queue: res.queue, now: 10, durationMin: 10,
+    });
+    expect(next.courts[0].match.players).toEqual(res.queue[0].players);
+    expect(next.courts[0].match.endsAt - 10).toBe(600_000);
+    expect(next.courts[1].match).toBeNull();
+  });
+});
+
+/* ── the busy floor, checked for rematches ───── */
+describe('cooldown across a 24-player session', () => {
+  const run = () => simulate({ players: mkPlayers(24), courts: mkCourts(3), rounds: 20 });
+
+  // Opponent pairs that met again before both had played two more matches.
+  const opponentViolations = (history) => {
+    const out = [];
+    const played = new Map();
+    const lastMet = new Map();
+    [...history].reverse().forEach((h, i) => {
+      const t1 = [h.players[0], h.players[1]];
+      const t2 = [h.players[2], h.players[3]];
+      for (const a of t1) {
+        for (const b of t2) {
+          const key = [a, b].sort().join('|');
+          if (lastMet.has(key)) {
+            const at = lastMet.get(key);
+            const gapA = (played.get(a) ?? []).filter((j) => j > at).length;
+            const gapB = (played.get(b) ?? []).filter((j) => j > at).length;
+            if (gapA < COOLDOWN_MATCHES || gapB < COOLDOWN_MATCHES) out.push({ key, gapA, gapB });
+          }
+          lastMet.set(key, i);
+        }
+      }
+      h.players.forEach((id) => {
+        if (!played.has(id)) played.set(id, []);
+        played.get(id).push(i);
+      });
+    });
+    return out;
+  };
+
+  it('never repeats an opponent pair inside the cooldown when the pool allows it', () => {
+    expect(opponentViolations(run().state.history)).toEqual([]);
+  });
+
+  it('reports every group it built as strict, because strict was always possible', () => {
+    const levels = run().passes
+      .flatMap((p) => Object.values(p.decisions ?? {}))
+      .map((d) => d.constraintLevel);
+    expect(levels.length).toBeGreaterThan(50);
+    expect([...new Set(levels)]).toEqual(['strict']);
+  });
+
+  it('records the exact fallback level instead of silently repeating, in a tiny pool', () => {
+    // Five players cannot avoid rematches forever; the engine must admit it.
+    const { passes } = simulate({ players: mkPlayers(5), courts: mkCourts(2), rounds: 10 });
+    const decisions = passes.flatMap((p) => Object.values(p.decisions ?? {}));
+    expect(decisions).toHaveLength(10);
+    const relaxed = decisions.filter((d) => d.constraintLevel !== 'strict');
+    expect(relaxed.length).toBeGreaterThan(0);
+    for (const d of relaxed) {
+      expect(CONSTRAINT_LEVELS).toContain(d.constraintLevel);
+      expect(d.fallbackReason).toBeTruthy();
+      if (!d.cooldownSatisfied) expect(d.cooldownConflictPairs.length).toBeGreaterThan(0);
+    }
+    // Not a single group was refused: a small pool still gets to play.
+    for (const p of passes) expect(p.created).toHaveLength(1);
+  });
+
+  it('does not hand the same two teams back after a match when an alternative exists', () => {
+    const players = mkPlayers(8);
+    const history = [result('h1', ['p1', 'p2', 'p3', 'p4'])];
+    const res = generateAutoQueueGroups({
+      players, courts: mkCourts(2), queue: [], history, now: 0,
+    });
+    const partnerships = res.queue.flatMap((g) => [
+      [g.players[0], g.players[1]].sort().join('|'),
+      [g.players[2], g.players[3]].sort().join('|'),
+    ]);
+    expect(partnerships).not.toContain('p1|p2');
+    expect(partnerships).not.toContain('p3|p4');
   });
 });
