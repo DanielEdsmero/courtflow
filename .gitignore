@@ -17,3 +17,7 @@ playwright/.cache/
 .DS_Store
 Thumbs.db
 *.log
+
+# Claude Code — share the agents, keep per-machine settings out. This only works
+# on the machine that wrote it (absolute paths, one person's approved commands).
+.claude/settings.local.json
