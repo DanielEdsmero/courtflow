@@ -9,8 +9,6 @@ export const assign = {
   pickPrompt: 'Pick a court and duration:',
   rentalTag: 'RENTAL',
   openPlayTag: 'OPEN PLAY',
-  // Winners / Losers only, and never binding — any court can still be picked.
-  suggestedTag: 'SUGGESTED',
   autoWillUse: (minutes) => `auto will use ${minutes}m`,
   defaultDurationTitle: 'This is your default session time',
 };

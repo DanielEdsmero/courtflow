@@ -50,9 +50,11 @@ import {
 } from './lib/logic';
 // Group formation, court filling and the repeat ladder (spec §1–§7). Pure and
 // clock-free: every call below hands it `now`.
-import {
-  generateAutoQueueGroups, assignQueuedGroupToCourt, suggestCourtFor, courtRoles,
-} from './lib/queue-engine';
+import { generateAutoQueueGroups, assignQueuedGroupToCourt } from './lib/queue-engine';
+// When a waiting group is likely to be called. Pure and clock-free; every
+// caller hands it `now`. See lib/wait-estimate.js for why it would rather say
+// nothing than say a number it cannot stand behind.
+import { callEstimate } from './lib/wait-estimate';
 // One canonical timestamp shape (epoch ms) and one place that does the
 // arithmetic — see lib/time.js.
 import {
@@ -1295,6 +1297,7 @@ export default function App() {
           clearAutoStatus={clearAutoStatus}
           matcherRuns={matcherRuns}
           showDiagnostics={!!prefs.matcherDiagnostics}
+          defaultOpenDuration={defaultOpenDuration}
           reveal={reveal}
           setShowAssign={setShowAssign}
           setShowRental={setShowRental}
@@ -1320,6 +1323,7 @@ export default function App() {
           history={history}
           announcement={announcement}
           playerById={playerById}
+          defaultOpenDuration={defaultOpenDuration}
         />
       )}
       </main>
@@ -1774,6 +1778,7 @@ function StaffView(props) {
     showValues, setShowValues, reveal,
     autoStatus, clearAutoStatus,
     matcherRuns, showDiagnostics,
+    defaultOpenDuration,
   } = props;
 
   // Framer positions a travelling element inside its DESTINATION, so without
@@ -1800,6 +1805,17 @@ function StaffView(props) {
     const t = setTimeout(clearAutoStatus, 7000);
     return () => clearTimeout(t);
   }, [statusAt, clearAutoStatus]);
+
+  /* How many complete groups sit in front of position `idx`. This is the queue
+     position the estimate projects from — incomplete groups are skipped, because
+     they cannot be assigned and so do not hold anyone up. */
+  const readyGroupsBefore = (idx) =>
+    queue.slice(0, idx).filter(g => g.players.length === 4).length;
+
+  /* The duration the next assignment will use. Competitive matches are played to
+     a score rather than a clock, so there is no length to project from and the
+     estimator correctly declines to guess. */
+  const matchMinutes = competitiveMode ? null : defaultOpenDuration;
 
   // Checked-out players stay in `players` for re-check-in but are not part of the
   // active roster: they're counted separately and shown in their own box below.
@@ -2059,7 +2075,19 @@ function StaffView(props) {
               const hasFreeCourt = courts.some(c => c.type === 'open' && !c.match);
               const isImmediateNext = idx === 0 && hasFreeCourt && groupPlayers.length >= 4;
               const unpaidCount = groupPlayers.filter(p => !isPaid(p.payment)).length;
-              const courtHint = queueCopy.hint[g.preferredCourt] ?? null;
+              /* Roughly when this group gets called. Only complete groups get one
+                 — a group still being built has no place in the running order to
+                 project from. The estimator returns nothing rather than guessing
+                 when the floor cannot support an answer. */
+              const estimate = groupPlayers.length === 4
+                ? callEstimate({
+                    attendance: 'queued',
+                    groupsAhead: readyGroupsBefore(idx),
+                    courts,
+                    durationMin: matchMinutes,
+                    now,
+                  })
+                : null;
               /* Staff-only: which matching rules this group had to bend. Says the
                  rule that gave and how many pairs it affected — never a hidden
                  Value, never who played whom. */
@@ -2114,17 +2142,6 @@ function StaffView(props) {
                           {queueCopy.allPaid}
                         </span>
                       )}
-                      {/* The Winners/Losers routing hint. Staff view only, and
-                          purely a suggestion — Assign to court offers it first
-                          but any court can be chosen. */}
-                      {courtHint && (
-                        <span
-                          className="text-xs text-cyan-300 bg-cyan-950 border border-cyan-900 px-2 py-0.5 rounded-full"
-                          title={queueCopy.hintTitle}
-                        >
-                          {courtHint}
-                        </span>
-                      )}
                       {isImmediateNext && (
                         <span className="text-xs font-bold text-lime-400 bg-lime-950 border border-lime-800 px-2 py-0.5 rounded-full">
                           Now
@@ -2135,6 +2152,16 @@ function StaffView(props) {
                       <span className="text-xs text-zinc-400 bg-zinc-800 px-2 py-0.5 rounded-full flex items-center gap-1">
                         <Clock className="w-3 h-3" /> {fmtWaiting(now, g.createdAt)}
                       </span>
+                      {/* Waited, then likely to be called. Two different facts. */}
+                      {estimate?.text && (
+                        <span className={`text-xs px-2 py-0.5 rounded-full border ${
+                          estimate.status === 'ready'
+                            ? 'text-lime-300 bg-lime-950 border-lime-800'
+                            : 'text-zinc-400 bg-zinc-950 border-zinc-800'
+                        }`}>
+                          {estimate.text}
+                        </span>
+                      )}
                       {diagText && (
                         <span
                           className={`text-xs px-2 py-0.5 rounded-full border ${
@@ -2469,7 +2496,12 @@ function CourtCardStaff({ index = 0, competitiveMode, court, playerById, onFinis
    DISPLAY VIEW (customer-facing)
    ───────────────────────────────────────────── */
 // Exported so the public /d/:token route can render it with data from the RPC.
-export function DisplayView({ competitiveMode, courts, queue, history, announcement, playerById }) {
+/* The public board: the TV at /d/:token, the poster-linked club page at
+   /queue/:slug, and the staff Preview tab. Everything rendered here is visible to
+   anyone standing in the building, so it deliberately shows no payment status, no
+   win/loss counters (the hidden Value is derived from them), and none of the
+   staff-only reasoning. It is never handed matcherRuns or showDiagnostics. */
+export function DisplayView({ competitiveMode, courts, queue, history, announcement, playerById, defaultOpenDuration = null }) {
   const now = new Date();
   const nowMs = now.getTime();
   const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -2711,6 +2743,17 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                 const groupPlayers = g.players.map(playerById).filter(Boolean);
                 const hasFreeCourt = courts.some(c => c.type === 'open' && !c.match);
                 const isImmediateNext = idx === 0 && hasFreeCourt && groupPlayers.length >= 4;
+                // The approximate call window, for people reading this across a
+                // room and deciding whether they have time to get a drink.
+                const estimate = groupPlayers.length === 4
+                  ? callEstimate({
+                      attendance: 'queued',
+                      groupsAhead: queue.slice(0, idx).filter(x => x.players.length === 4).length,
+                      courts,
+                      durationMin: competitiveMode ? null : defaultOpenDuration,
+                      now: nowMs,
+                    })
+                  : null;
                 // Every complete group is snake-drafted into two teams, however
                 // it was built, so the board can always show the sides.
                 const isAutoBalanced = groupPlayers.length === 4;
@@ -2738,11 +2781,19 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                           STEPPING ON
                         </span>
                       ) : (
-                        /* Time waited, not time predicted (spec §9). */
-                        <span className="text-sm text-zinc-300 bg-zinc-800 px-3 py-1.5 rounded-full flex items-center gap-1.5 mt-1">
-                          <Clock className="w-3.5 h-3.5 text-zinc-500" />
-                          {fmtWaiting(nowMs, g.createdAt)}
-                        </span>
+                        <div className="flex flex-col items-end gap-1 mt-1">
+                          {/* Time waited — measured, never predicted. */}
+                          <span className="text-sm text-zinc-300 bg-zinc-800 px-3 py-1.5 rounded-full flex items-center gap-1.5">
+                            <Clock className="w-3.5 h-3.5 text-zinc-500" />
+                            {fmtWaiting(nowMs, g.createdAt)}
+                          </span>
+                          {/* Roughly when they are called — a range, on purpose. */}
+                          {estimate?.text && (
+                            <span className="text-xs text-zinc-400 text-right max-w-[14rem]">
+                              {estimate.text}
+                            </span>
+                          )}
+                        </div>
                       )}
                     </div>
 
@@ -2756,7 +2807,6 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                               <div key={p.id} className="flex items-center gap-1.5 mb-1.5 last:mb-0">
                                 <div className={`w-2 h-2 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
                                 <span className="font-display text-xl leading-tight flex-1">{p.name}</span>
-                                <PaymentBadge payment={p.payment} dot title={paymentInfo(p.payment).label} />
                               </div>
                             ))}
                           </div>
@@ -2768,7 +2818,6 @@ export function DisplayView({ competitiveMode, courts, queue, history, announcem
                           <div key={p.id} className="flex items-center gap-2">
                             <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${skillStyleSolid(p.skill)}`} />
                             <span className="font-display text-2xl flex-1">{p.name}</span>
-                            <PaymentBadge payment={p.payment} dot title={paymentInfo(p.payment).label} />
                           </div>
                         ))}
                       </div>
@@ -2806,26 +2855,15 @@ const RENTAL_DURATIONS = [
 
 function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDuration, onAssign, onClose }) {
   if (!group) return null;
+  /* Every open court, presented as an equal choice: no preselection, no
+     highlight, no reordering, no colour that marks one out. Where a group plays
+     is entirely staff's call, and the app deliberately has no opinion. */
   const openCourts = courts.filter(c => !c.match);
-  // Winners/Losers suggests an end of the ladder; it is only ever a suggestion,
-  // so the suggested court is highlighted and every other court still works.
-  const suggestedId = suggestCourtFor(group, courts);
-  const hint = queueCopy.hint[group.preferredCourt] ?? null;
 
   return (
     <ModalShell onClose={onClose} title={modals.assign.title} wide>
       <div className="mb-4">
-        <div className="flex items-center justify-between gap-2 mb-2">
-          <p className="text-sm text-zinc-400">{modals.assign.groupLabel}</p>
-          {hint && (
-            <span
-              className="text-xs text-cyan-300 bg-cyan-950 border border-cyan-900 px-2 py-0.5 rounded-full"
-              title={queueCopy.hintTitle}
-            >
-              {hint}
-            </span>
-          )}
-        </div>
+        <p className="text-sm text-zinc-400 mb-2">{modals.assign.groupLabel}</p>
         {/* The four in their team order — the same split the queue card shows,
             so what staff confirm here is what walks onto the court. */}
         <div className="bg-zinc-950 rounded-lg p-2 grid grid-cols-2 gap-2">
@@ -2853,12 +2891,11 @@ function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDu
           {openCourts.map(c => {
             const isRental = c.type === 'rental';
             const durations = isRental ? RENTAL_DURATIONS : OPEN_DURATIONS;
-            const suggested = !isRental && c.id === suggestedId && !!hint;
             return (
               <div key={c.id} className={`rounded-lg p-3 border-2 ${
-                isRental ? 'bg-amber-950 bg-opacity-30 border-amber-800 border-dashed'
-                : suggested ? 'bg-zinc-950 border-cyan-700'
-                : 'bg-zinc-950 border-zinc-800'
+                isRental
+                  ? 'bg-amber-950 bg-opacity-30 border-amber-800 border-dashed'
+                  : 'bg-zinc-950 border-zinc-800'
               }`}>
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
@@ -2867,9 +2904,6 @@ function AssignModal({ competitiveMode, group, courts, playerById, defaultOpenDu
                       <span className="text-[10px] font-bold tracking-widest bg-amber-500 text-zinc-950 px-1.5 py-0.5 rounded">{modals.assign.rentalTag}</span>
                     ) : (
                       <span className="text-[10px] font-bold tracking-widest text-zinc-500">{modals.assign.openPlayTag}</span>
-                    )}
-                    {suggested && (
-                      <span className="text-[10px] font-bold tracking-widest text-cyan-300">{modals.assign.suggestedTag}</span>
                     )}
                   </div>
                   {!isRental && !competitiveMode && defaultOpenDuration && (

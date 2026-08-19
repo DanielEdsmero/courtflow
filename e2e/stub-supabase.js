@@ -79,12 +79,36 @@ export function queueState() {
   };
 }
 
+/* What the PUBLIC display RPCs actually return per player, and nothing more.
+   get_display_state / get_display_state_by_slug are granted to anon and keyed on
+   a poster-printed slug, so they redact payment (a payment ledger), wins/losses
+   (the hidden Value is derived from them: +1 a win, -0.5 a loss) and the
+   auditLog key inside state (names + payment + method + session length).
+
+   The stub mirrors that redaction deliberately. A fixture richer than the real
+   payload would let a leak pass every test in this suite. */
+const REDACTED_FROM_PUBLIC = ['payment', 'wins', 'losses', 'total_wins', 'total_losses', 'total_games'];
+
+export function publicPlayers(players = PLAYERS) {
+  return players.map((p) => {
+    const out = { ...p };
+    for (const key of REDACTED_FROM_PUBLIC) delete out[key];
+    return out;
+  });
+}
+
+export function publicState(state = queueState()) {
+  const { auditLog, ...rest } = state;
+  void auditLog;
+  return rest;
+}
+
 export function displayPayload(overrides = {}) {
   return {
     venueName: VENUE.name,
     slug: VENUE.slug,
-    state: queueState(),
-    players: PLAYERS,
+    state: publicState(),
+    players: publicPlayers(),
     ...overrides,
   };
 }

@@ -6,11 +6,12 @@
 
    Two entry points, and the split between them is the whole design:
 
-     generateAutoQueueGroups()  builds matchups. It reads the courts only to
-                                know whether a Winners/Losers hint is meaningful,
-                                and it NEVER returns a court change. Staff press
-                                Auto, every Available player who can be grouped
-                                is grouped, and everyone stays off court.
+     generateAutoQueueGroups()  builds matchups. It reads the courts for one
+                                reason — to know who is already on one — and it
+                                NEVER returns a court change or names a court for
+                                a group. Staff press Auto, every Available player
+                                who can be grouped is grouped, and everyone stays
+                                off court.
 
      assignQueuedGroupToCourt() is the only function in the app that can move
                                 four queued players onto a court. It takes the
@@ -26,7 +27,7 @@
      1. preserve what staff built  — complete groups and manual members are fixed
      2. availability / FIFO        — the longest-waiting player seeds each group
      3. repeat-opponent ladder     — strict → relax1 → relax2 → relax3 → give up
-     4. winners/losers             — cluster by recent form, then hint a court
+     4. winners/losers             — cluster by recent form (never a court)
      5. value proximity            — who joins the seed, and what breaks a tie
      6. check-in order             — the final tiebreak; never random
    ───────────────────────────────────────────── */
@@ -252,51 +253,25 @@ export const passesRung = (v, rung) => {
 
 /* ─────────────────────────────────────────────
    WINNERS / LOSERS
-   Two things, and separating them is the point of this rewrite.
+   A matching style, and only that: it changes WHO ends up in a group together,
+   by clustering players on what they did in their last match, so a group of
+   recent winners and a group of recent losers fall out of the pool naturally.
 
-   Composition: groups are clustered by recent form, so a group of recent
-   winners and a group of recent losers emerge naturally out of the pool.
+   It does NOT choose a court. An earlier version of this engine tagged each group
+   'high' / 'low' / 'any' and the assign dialog offered that end first. The whole
+   idea is gone: there is no court-routing value produced, persisted or rendered
+   anywhere, and the replacement is no recommendation at all rather than a softer
+   one. Every open court is an equal choice and the decision is entirely staff's.
 
-   Routing: each auto-built group carries a NON-BINDING `preferredCourt` hint —
-   'high', 'low' or 'any'. It is a suggestion the assign dialog surfaces and
-   staff can ignore. The engine never acts on it, and a group never waits for a
-   particular court to free up.
+   Groups persisted by that earlier version still carry a `preferredCourt` key.
+   It is left alone — deleting fields out of a live queue is not worth the risk —
+   and simply never read.
    ───────────────────────────────────────────── */
-
-// Court 1 is the high court, the highest-numbered court is the low court, and
-// everything between is neutral. "Numbered" is the order the courts are held in,
-// which is the order they are displayed and named in — so removing or renaming a
-// court re-derives the ends rather than stranding them. With a single court
-// there is no ladder to speak of and every court is neutral.
-export function courtRoles(openCourts) {
-  const roles = new Map();
-  if (openCourts.length < 2) {
-    openCourts.forEach((c) => roles.set(c.id, 'neutral'));
-    return roles;
-  }
-  openCourts.forEach((c, i) =>
-    roles.set(c.id, i === 0 ? 'high' : i === openCourts.length - 1 ? 'low' : 'neutral')
-  );
-  return roles;
-}
 
 // A player's standing for clustering: what they did in their immediately
 // previous match. Newcomers are their own class rather than being lumped in
 // with either end of the ladder.
 const formOf = (p, H) => H.lastResult(p.id);
-
-/* The hint, derived from the group that was actually built. A group that leans
-   towards recent winners suggests the high court, one that leans towards recent
-   losers suggests the low court, and anything mixed or new suggests neither.
-   Balanced mode and single-court floors always return 'any'. */
-export function preferredCourtFor(four, H, { wl = false } = {}) {
-  if (!wl) return 'any';
-  const wins = four.filter((p) => formOf(p, H) === 'W').length;
-  const losses = four.filter((p) => formOf(p, H) === 'L').length;
-  if (wins > losses) return 'high';
-  if (losses > wins) return 'low';
-  return 'any';
-}
 
 /* ─────────────────────────────────────────────
    SELECTION
@@ -661,10 +636,11 @@ export function generateAutoQueueGroups({
   );
   const startedWith = pool.length;
 
-  // The courts are read for one reason only: with a single open court there is
-  // no high or low end, so there is no meaningful hint to attach.
-  const wl = matchingStyle === 'winnersLosers'
-    && courts.filter((c) => c.type === 'open').length >= 2;
+  /* Winners/Losers changes who is grouped together, nothing else. It used to be
+     gated on having two or more open courts, because it needed a high end and a
+     low end to route between; with routing gone, the number of courts is simply
+     irrelevant to how a group is built. */
+  const wl = matchingStyle === 'winnersLosers';
 
   let avail = availableOrder(pool, H, order);
   const ctx = () => ({ H, order, avail, wl });
@@ -686,21 +662,12 @@ export function generateAutoQueueGroups({
     if (!picked) continue;
     const already = new Set(g.players.map(String));
     consume(picked.four.filter((p) => !already.has(String(p.id))));
-    const preferredCourt = preferredCourtFor(picked.four, H, { wl });
     work = work.map((x) =>
-      x.id === g.id
-        ? { ...x, players: picked.four.map((p) => p.id), preferredCourt }
-        : x
+      x.id === g.id ? { ...x, players: picked.four.map((p) => p.id) } : x
     );
     toppedUp.push(g.id);
     decisions[g.id] = decisionFor(picked.violations);
-    log.push({
-      step: 'topUp',
-      groupId: g.id,
-      rung: picked.rung,
-      preferredCourt,
-      ...decisions[g.id],
-    });
+    log.push({ step: 'topUp', groupId: g.id, rung: picked.rung, ...decisions[g.id] });
   }
 
   /* ── 2. Build new groups until the bench cannot make another four ─────── */
@@ -760,13 +727,14 @@ export function generateAutoQueueGroups({
     .sort((a, b) => a.wait - b.wait);
 
   for (const repaired of repairedGroups) {
-    const preferredCourt = preferredCourtFor(repaired.four, H, { wl });
+    /* A group carries who is in it, what order they play in, and when it was
+       made. It deliberately carries no court: nothing about how these four were
+       matched implies where they should play, and staff choose that freely. */
     const group = {
       id: nextId(),
       players: repaired.four.map((p) => p.id),
       type: 'auto',
       createdAt: now,
-      preferredCourt,
     };
     work = [...work, group];
     created.push(group.id);
@@ -775,7 +743,6 @@ export function generateAutoQueueGroups({
       step: 'create',
       groupId: group.id,
       rung: repaired.rung,
-      preferredCourt,
       seed: repaired.seed,
       ...repaired.decision,
     });
@@ -834,18 +801,4 @@ export function assignQueuedGroupToCourt({
     queue: queue.filter((g) => g.id !== groupId),
     assigned: { courtId, groupId, playerIds: match.players },
   };
-}
-
-/* Which court the assign dialog should offer first: the group's own hint when it
-   points somewhere and that end is free, otherwise the first open court. */
-export function suggestCourtFor(group, courts) {
-  const open = courts.filter((c) => c.type === 'open' && !c.match);
-  if (open.length === 0) return null;
-  const hint = group?.preferredCourt;
-  if (hint === 'high' || hint === 'low') {
-    const roles = courtRoles(courts.filter((c) => c.type === 'open'));
-    const match = open.find((c) => roles.get(c.id) === hint);
-    if (match) return match.id;
-  }
-  return open[0].id;
 }

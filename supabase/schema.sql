@@ -269,6 +269,25 @@ begin
 end;
 $$;
 
+-- ── The two public reads ────────────────────────────────────────────────────
+-- Both are granted to anon, and get_display_state_by_slug is keyed on a slug that
+-- is printed on a poster and guessable by design. So both are REDACTED
+-- PROJECTIONS, not "the state": they return only what a screen in the room needs.
+--
+-- Three things were removed after they shipped, and none of them may come back:
+--
+--   payment        a payment ledger. Anyone who scanned the poster QR could read
+--                  who had and had not paid, by name.
+--   wins / losses  the hidden player Value is DERIVED from these, not stored:
+--                  +1 a win, -0.5 a loss (see playerValue in src/lib/logic.js).
+--                  Publishing the counters published the Value.
+--   auditLog       stripped out of the state blob with the `- 'auditLog'`
+--                  operator below. Its entries carry name, payment, payment
+--                  method and session length.
+--
+-- The display reads only name, skill and photo. If you add a field here, check
+-- first whether it can be used to reconstruct one of the three above.
+
 -- Public read for the TV display. Takes the display token from the URL and returns
 -- exactly what the display needs — nothing else, and nothing about any other venue.
 -- Anonymous callers are fine; the token is the credential.
@@ -281,17 +300,14 @@ set search_path = public
 as $$
   select jsonb_build_object(
     'venueName', v.name,
-    'state',     coalesce(s.state, '{}'::jsonb),
+    'state',     coalesce(s.state, '{}'::jsonb) - 'auditLog',
     'players',   coalesce(
                    (select jsonb_agg(
                       jsonb_build_object(
                         'id',      p.id,
                         'name',    p.name,
                         'skill',   p.skill,
-                        'wins',    p.wins,
-                        'losses',  p.losses,
-                        'photo',   p.photo_url,
-                        'payment', p.payment))
+                        'photo',   p.photo_url))
                       from players p where p.venue_id = v.id), '[]'::jsonb))
     from venues v
     left join sessions s on s.venue_id = v.id
@@ -312,17 +328,14 @@ as $$
   select jsonb_build_object(
     'venueName', v.name,
     'slug',      v.slug,
-    'state',     coalesce(s.state, '{}'::jsonb),
+    'state',     coalesce(s.state, '{}'::jsonb) - 'auditLog',
     'players',   coalesce(
                    (select jsonb_agg(
                       jsonb_build_object(
                         'id',      p.id,
                         'name',    p.name,
                         'skill',   p.skill,
-                        'wins',    p.wins,
-                        'losses',  p.losses,
-                        'photo',   p.photo_url,
-                        'payment', p.payment))
+                        'photo',   p.photo_url))
                       from players p where p.venue_id = v.id), '[]'::jsonb))
     from venues v
     left join sessions s on s.venue_id = v.id

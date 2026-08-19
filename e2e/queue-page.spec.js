@@ -149,3 +149,95 @@ test.describe('live updates', () => {
     await expect.poll(() => calls.queueRpc).toBe(before + 1);
   });
 });
+
+test.describe('privacy', () => {
+  /* This board is reachable by anyone who can read a poster, so staff-only data
+     must be ABSENT from the payload, not merely unrendered. The stub mirrors the
+     RPC's redaction on purpose — a fixture richer than the real payload would let
+     a leak pass every test in this file. */
+
+  test('shows no payment status anywhere', async ({ page }) => {
+    await stubRest(page);
+    await stubRealtime(page);
+    await page.goto('/queue/demo-club');
+    await expect(page.getByText('Ada Lovelace').first()).toBeVisible();
+
+    for (const label of ['Unpaid', 'Paid — Cash', 'Paid — Online', 'Cash', 'Online']) {
+      await expect(page.getByText(label, { exact: true })).toHaveCount(0);
+    }
+    await expect(page.locator('[title*="Unpaid"], [title*="Paid"]')).toHaveCount(0);
+  });
+
+  test('leaks no staff-only vocabulary into the rendered page', async ({ page }) => {
+    await stubRest(page);
+    await stubRealtime(page);
+    await page.goto('/queue/demo-club');
+    await expect(page.getByText('Ada Lovelace').first()).toBeVisible();
+
+    const body = (await page.locator('body').innerText()).toLowerCase();
+    for (const forbidden of [
+      'unpaid', 'matcher:', 'suggested', 'high court', 'low court', 'cooldown', 'diagnostic',
+    ]) {
+      expect(body).not.toContain(forbidden);
+    }
+  });
+
+  test('the payload itself carries no payment, no W/L and no audit log', async ({ page }) => {
+    // The strongest form of the assertion: check what actually crosses the wire,
+    // not what happens to be painted. Anything present here is one render away
+    // from being public.
+    await stubRest(page);
+    await stubRealtime(page);
+
+    const response = page.waitForResponse((r) => r.url().includes('get_display_state_by_slug'));
+    await page.goto('/queue/demo-club');
+    const payload = await (await response).json();
+
+    expect(payload.players.length).toBeGreaterThan(0);
+    for (const player of payload.players) {
+      expect(player).not.toHaveProperty('payment');
+      // The hidden Value is derived from these: +1 a win, -0.5 a loss.
+      expect(player).not.toHaveProperty('wins');
+      expect(player).not.toHaveProperty('losses');
+    }
+    // Audit entries carry name + payment + method + session length.
+    expect(payload.state).not.toHaveProperty('auditLog');
+  });
+});
+
+test.describe('call windows', () => {
+  test('a waiting group shows an approximate range, never a promised minute', async ({ page }) => {
+    const state = queueState();
+    state.defaultOpenDuration = 15;
+    state.competitiveMode = false;
+    // Both courts running, so the next group has to wait for a turnover.
+    const startedAt = Date.now() - 10 * 60_000;
+    state.courts = state.courts.map((c, i) => ({
+      ...c,
+      match: {
+        players: ['p1', 'p2', 'p3', 'p4'],
+        startedAt: startedAt - i * 60_000,
+        endsAt: startedAt + 15 * 60_000,
+        durationMin: 15,
+      },
+    }));
+    await stubRest(page, { queueRpc: displayPayload({ state }) });
+    await stubRealtime(page);
+    await page.goto('/queue/demo-club');
+
+    await expect(page.getByText(/approx\. \d+–\d+ min/i).first()).toBeVisible();
+    // A range, not a single number dressed up as a fact.
+    await expect(page.getByText(/^about \d+ min$/)).toHaveCount(0);
+  });
+
+  test('says nothing rather than guessing when there is no duration to project from', async ({ page }) => {
+    const state = queueState();
+    state.defaultOpenDuration = null;
+    await stubRest(page, { queueRpc: displayPayload({ state }) });
+    await stubRealtime(page);
+    await page.goto('/queue/demo-club');
+
+    await expect(page.getByRole('heading', { name: /UP NEXT/ })).toBeVisible();
+    await expect(page.getByText(/approx\./i)).toHaveCount(0);
+  });
+});

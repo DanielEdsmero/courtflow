@@ -103,6 +103,7 @@ export default function QueuePage() {
         history={history}
         announcement={state.announcement ?? ''}
         playerById={playerById}
+        defaultOpenDuration={state.defaultOpenDuration ?? null}
       />
       {!live && (
         <div className="fixed bottom-3 right-3 text-[11px] text-zinc-600 bg-zinc-900/90 border border-zinc-800 rounded-full px-3 py-1">

@@ -407,7 +407,7 @@ test('diagnostics never appear in Preview, and never reach the shared session', 
   expect(blob).not.toMatch(/fallbackReason/);
   // The queue groups themselves carry only what the public board needs.
   for (const g of calls.lastSessionWrite.queue ?? []) {
-    expect(Object.keys(g).sort()).toEqual(['createdAt', 'id', 'players', 'preferredCourt', 'type']);
+    expect(Object.keys(g).sort()).toEqual(['createdAt', 'id', 'players', 'type']);
   }
 });
 
@@ -434,6 +434,110 @@ test('a fresh group reads "Just now", never a four-digit minute count', async ({
 
   await pressAuto(page);
   await expect(page.getByText('Just now').first()).toBeVisible();
+});
+
+/* ─────────────────────────────────────────────
+   PUBLIC PAYLOAD PRIVACY AND COURT NEUTRALITY
+   The club board at /queue/:slug is reachable by anyone who can read a poster.
+   Everything staff-only must be absent from it — not hidden by CSS, absent.
+   ───────────────────────────────────────────── */
+test('the staff app still shows payment — only the public surfaces lost it', async ({ page }) => {
+  await stubRest(page, { players: ROSTER, session: midMatchSession() });
+  await stubRealtime(page);
+  await page.goto('/');
+
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+  // The roster is staff-only and must keep the payment controls it always had.
+  await expect(page.getByTitle(/Unpaid|Paid/).first()).toBeVisible();
+});
+
+test('the Preview tab matches the public board and drops payment too', async ({ page }) => {
+  await stubRest(page, { players: ROSTER, session: midMatchSession() });
+  await stubRealtime(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Preview' }).click();
+  const body = (await page.locator('body').innerText()).toLowerCase();
+  expect(body).not.toContain('matcher:');
+  expect(body).not.toContain('suggested');
+});
+
+test('no court is recommended, highlighted or preselected when assigning', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  session.matchingStyle = 'winnersLosers'; // the mode that used to route courts
+  const calls = await stubRest(page, { players: ROSTER, session });
+  await stubRealtime(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+
+  await pressAuto(page);
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(2);
+
+  // No routing label anywhere on the queue cards.
+  await expect(page.getByText(/Suggested:|high court|low court/i)).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Assign to court' }).first().click();
+  const dialog = page.getByRole('dialog', { name: 'Assign to court' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText('SUGGESTED')).toHaveCount(0);
+
+  // Both courts are offered, and neither is marked out from the other.
+  const cards = dialog.locator('div.border-2');
+  await expect(cards).toHaveCount(2);
+  const classes = await cards.evaluateAll((els) => els.map((e) => e.className));
+  expect(classes[0]).toBe(classes[1]);
+
+  // And the group carries no routing field into the session blob.
+  for (const g of calls.lastSessionWrite.queue ?? []) {
+    expect(Object.keys(g).sort()).toEqual(['createdAt', 'id', 'players', 'type']);
+  }
+});
+
+test('a queued group shows an approximate call window, not a fake exact time', async ({ page }) => {
+  // Court 1 mid-match with a 15-minute clock, Court 2 free, eight on the bench.
+  const session = midMatchSession();
+  session.defaultOpenDuration = 15;
+  session.competitiveMode = false;
+  session.courts[0].match = {
+    players: ['x1', 'x2', 'x3', 'x4'],
+    startedAt: Date.now() - 10 * 60_000,
+    endsAt: Date.now() + 5 * 60_000,
+    durationMin: 15,
+  };
+  session.courts[1].match = {
+    players: ['x5', 'x6', 'x7', 'x8'],
+    startedAt: Date.now() - 3 * 60_000,
+    endsAt: Date.now() + 12 * 60_000,
+    durationMin: 15,
+  };
+  const calls = await stubRest(page, { players: ROSTER, session });
+  await stubRealtime(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+
+  await pressAuto(page);
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(2);
+
+  // A range, never a single promised minute.
+  await expect(page.getByText(/approx\. \d+–\d+ min/i).first()).toBeVisible();
+  await expect(page.getByText(/^Next up —/).first()).toBeVisible();
+});
+
+test('a queued group with a court standing free reads as Ready now', async ({ page }) => {
+  const session = midMatchSession();
+  session.courts[0].match = null;
+  session.defaultOpenDuration = 15;
+  const calls = await stubRest(page, { players: ROSTER, session });
+  await stubRealtime(page);
+  await page.goto('/');
+  await expect(page.getByRole('heading', { name: 'ROSTER' })).toBeVisible();
+
+  await pressAuto(page);
+  await expect.poll(() => queuedGroups(calls.lastSessionWrite).length, { timeout: 10_000 }).toBe(2);
+
+  await expect(page.getByText('Ready now — awaiting staff assignment').first()).toBeVisible();
 });
 
 /* ─────────────────────────────────────────────

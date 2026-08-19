@@ -44,11 +44,4 @@ export const queue = {
   incomplete: (n) => `Incomplete — ${plural(n, 'more player', 'more players')} needed`,
   dropHere: (n) => `Drop to add here · ${plural(n, 'spot', 'spots')} left`,
 
-  /* The Winners/Losers routing hint (staff view only). Non-binding: it is what
-     the group's recent form suggests, not where it has to go. */
-  hint: {
-    high: 'Suggested: high court',
-    low: 'Suggested: low court',
-  },
-  hintTitle: 'Winners / Losers suggestion based on how these four last played. Staff can assign any court.',
 };

@@ -2,10 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   generateAutoQueueGroups,
   assignQueuedGroupToCourt,
-  suggestCourtFor,
-  preferredCourtFor,
   buildHistoryIndex,
-  courtRoles,
   draftTeams,
   checkInOrder,
   combinations,
@@ -461,75 +458,120 @@ describe('FIFO', () => {
   });
 });
 
-/* ── Winners / Losers hints ──────────────────── */
+/* -- Winners / Losers, and court neutrality -- */
 describe('Winners / Losers', () => {
   const history = [
     result('h2', ['p5', 'p6', 'p7', 'p8']), // p5,p6 won  p7,p8 lost
     result('h1', ['p1', 'p2', 'p3', 'p4']), // p1,p2 won  p3,p4 lost
   ];
 
-  it('reads court roles off the floor, with no ladder on a single court', () => {
-    const roles = courtRoles(mkCourts(3));
-    expect(roles.get('c1')).toBe('high');
-    expect(roles.get('c2')).toBe('neutral');
-    expect(roles.get('c3')).toBe('low');
-    expect(courtRoles(mkCourts(1)).get('c1')).toBe('neutral');
-  });
+  // What a group is made of, in last-result terms. This is how clustering is
+  // asserted now that no group carries a court label to read it off.
+  const formsOf = (g, H) => [...new Set(g.players.map((id) => H.lastResult(id)))].sort();
 
-  it('hints high for a winners group and low for a losers group', () => {
+  it('still clusters recent winners together and recent losers together', () => {
     const H = buildHistoryIndex(history);
-    const winners = mkPlayers(8).filter((p) => ['p1', 'p2', 'p5', 'p6'].includes(p.id));
-    const losers = mkPlayers(8).filter((p) => ['p3', 'p4', 'p7', 'p8'].includes(p.id));
-    expect(preferredCourtFor(winners, H, { wl: true })).toBe('high');
-    expect(preferredCourtFor(losers, H, { wl: true })).toBe('low');
-    expect(preferredCourtFor(winners, H, { wl: false })).toBe('any');
-  });
-
-  it('hints only — it never puts a group on a court', () => {
-    const players = mkPlayers(8);
-    const courts = mkCourts(2); // both empty, and both must stay empty
-    const res = generateAutoQueueGroups({
-      players, courts, queue: [], history, now: 0, matchingStyle: 'winnersLosers',
-    });
-    expect(res.created).toHaveLength(2);
-    expect(courts.every((c) => !c.match)).toBe(true);
-    expect(res.queue.every((g) => ['high', 'low', 'any'].includes(g.preferredCourt))).toBe(true);
-  });
-
-  it('clusters recent winners together and recent losers together', () => {
     const res = generateAutoQueueGroups({
       players: mkPlayers(8), courts: mkCourts(2), queue: [], history, now: 0,
       matchingStyle: 'winnersLosers',
     });
-    expect(res.queue.map((g) => g.preferredCourt).sort()).toEqual(['high', 'low']);
+    expect(res.created).toHaveLength(2);
+    // One group of four winners, one of four losers - each internally uniform.
+    expect(res.queue.map((g) => formsOf(g, H)).sort()).toEqual([['L'], ['W']]);
   });
 
-  it('uses "any" on a one-court floor, where there is no ladder', () => {
+  it('clusters on a one-court floor too, because court count is irrelevant to grouping', () => {
+    // This used to be gated on having two courts, because the ladder needed a
+    // high end and a low end. With routing gone, that gate made no sense.
+    const H = buildHistoryIndex(history);
     const res = generateAutoQueueGroups({
       players: mkPlayers(8), courts: mkCourts(1), queue: [], history, now: 0,
       matchingStyle: 'winnersLosers',
     });
-    expect(res.queue.every((g) => g.preferredCourt === 'any')).toBe(true);
+    expect(res.queue.map((g) => formsOf(g, H)).sort()).toEqual([['L'], ['W']]);
   });
 
-  it('leaves a pre-existing complete group untouched, hint or not', () => {
-    const players = mkPlayers(12);
+  it('produces no court-routing value of any kind', () => {
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(8), courts: mkCourts(3), queue: [], history, now: 0,
+      matchingStyle: 'winnersLosers',
+    });
+    for (const g of res.queue) {
+      expect(Object.keys(g).sort()).toEqual(['createdAt', 'id', 'players', 'type']);
+    }
+    // Nothing in the whole result names a court for a group, in any spelling.
+    const serialised = JSON.stringify({ queue: res.queue, log: res.log });
+    expect(serialised).not.toMatch(/preferredCourt|suggestedCourt|targetCourt|recommendedCourt/i);
+    expect(serialised).not.toMatch(/"high"|"low"/);
+  });
+
+  it('never moves a group onto a court, even with every court free', () => {
+    const courts = mkCourts(2);
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(8), courts, queue: [], history, now: 0,
+      matchingStyle: 'winnersLosers',
+    });
+    expect(res.created).toHaveLength(2);
+    expect(courts.every((c) => !c.match)).toBe(true);
+    expect(res).not.toHaveProperty('assignments');
+
+    // Only an explicit staff assignment moves one, and only the one asked for.
+    const next = assignQueuedGroupToCourt({
+      groupId: res.queue[0].id, courtId: 'c2', courts, queue: res.queue, now: 10, durationMin: 10,
+    });
+    expect(next.courts[1].match.players).toEqual(res.queue[0].players);
+    expect(next.courts[0].match).toBeNull();
+  });
+
+  it('lets any complete group go to any open court', () => {
+    const courts = mkCourts(3);
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(8), courts, queue: [], history, now: 0,
+      matchingStyle: 'winnersLosers',
+    });
+    // Every group x every court is a legal assignment. Nothing is preferred and
+    // nothing is refused.
+    for (const g of res.queue) {
+      for (const court of courts) {
+        const next = assignQueuedGroupToCourt({
+          groupId: g.id, courtId: court.id, courts, queue: res.queue, now: 0,
+        });
+        expect(next).not.toBeNull();
+        expect(next.assigned.courtId).toBe(court.id);
+        expect(next.assigned.playerIds).toEqual(g.players);
+      }
+    }
+  });
+
+  it('ignores a legacy preferredCourt on a persisted group rather than acting on it', () => {
+    // A group written by the build that still tagged courts. It must assign
+    // normally, keep its members, and never have the stale field read.
+    const legacy = group('legacy', ['p1', 'p2', 'p3', 'p4'], {
+      type: 'auto', createdAt: 5, preferredCourt: 'high',
+    });
+    const courts = mkCourts(2);
+    const res = generateAutoQueueGroups({
+      players: mkPlayers(12), courts, queue: [legacy], history, now: 0,
+      matchingStyle: 'winnersLosers',
+    });
+    // Passed through untouched - not rewritten, not stripped, not acted on.
+    expect(res.queue[0]).toEqual(legacy);
+
+    // And it can still go to the LOW court despite claiming to prefer the high one.
+    const next = assignQueuedGroupToCourt({
+      groupId: 'legacy', courtId: 'c2', courts, queue: res.queue, now: 0,
+    });
+    expect(next.assigned.playerIds).toEqual(['p1', 'p2', 'p3', 'p4']);
+    expect(next.assigned.courtId).toBe('c2');
+  });
+
+  it('leaves a pre-existing complete group untouched', () => {
     const queue = [group('existing', ['p1', 'p2', 'p3', 'p4'], { type: 'auto', createdAt: 5 })];
     const res = generateAutoQueueGroups({
-      players, courts: mkCourts(2), queue, history, now: 0, matchingStyle: 'winnersLosers',
+      players: mkPlayers(12), courts: mkCourts(2), queue, history, now: 0,
+      matchingStyle: 'winnersLosers',
     });
     expect(res.queue[0]).toEqual(queue[0]);
-  });
-
-  it('suggests the hinted end of the floor but never forces it', () => {
-    const courts = mkCourts(3);
-    expect(suggestCourtFor({ preferredCourt: 'high' }, courts)).toBe('c1');
-    expect(suggestCourtFor({ preferredCourt: 'low' }, courts)).toBe('c3');
-    expect(suggestCourtFor({ preferredCourt: 'any' }, courts)).toBe('c1');
-    // The hinted court is busy — fall back to whatever is actually open.
-    const busyLow = [courts[0], courts[1], withMatch(courts[2], ['x1', 'x2', 'x3', 'x4'])];
-    expect(suggestCourtFor({ preferredCourt: 'low' }, busyLow)).toBe('c1');
-    expect(suggestCourtFor({ preferredCourt: 'high' }, [])).toBeNull();
   });
 });
 
@@ -821,9 +863,7 @@ describe('decision metadata', () => {
     for (const g of res.queue) {
       expect(g).not.toHaveProperty('decision');
       // Nothing resembling a hidden Value or a history rides along either.
-      expect(Object.keys(g).sort()).toEqual(
-        ['createdAt', 'id', 'players', 'preferredCourt', 'type']
-      );
+      expect(Object.keys(g).sort()).toEqual(['createdAt', 'id', 'players', 'type']);
     }
   });
 });
@@ -893,7 +933,7 @@ describe('Auto is group-only', () => {
     expect(courts.every((c) => c.match)).toBe(true);
   });
 
-  it('produces Winners/Losers hints without moving anything onto a court', () => {
+  it('groups in Winners/Losers style without moving anything onto a court', () => {
     const history = [
       result('h2', ['p5', 'p6', 'p7', 'p8']),
       result('h1', ['p1', 'p2', 'p3', 'p4']),
@@ -903,7 +943,7 @@ describe('Auto is group-only', () => {
       players: mkPlayers(8), courts, queue: [], history, now: 0,
       matchingStyle: 'winnersLosers',
     });
-    expect(res.queue.map((g) => g.preferredCourt).sort()).toEqual(['high', 'low']);
+    expect(res.created).toHaveLength(2);
     expect(courts.every((c) => !c.match)).toBe(true);
 
     // Only an explicit assignment moves one, and then only the one asked for.
